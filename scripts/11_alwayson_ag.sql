@@ -6,6 +6,7 @@
  Note    : Run on the PRIMARY to see every replica. On a secondary you only
            see local state. Azure VM AG: listener uses an Azure Load Balancer
            or a Distributed Network Name (DNN) - see 11.8.
+ See also: 25_alwayson_advanced.sql (alert query, troubleshooting, templates)
 *******************************************************************************/
 
 /*=============================================================================

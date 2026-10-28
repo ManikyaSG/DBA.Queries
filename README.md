@@ -48,6 +48,12 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 18 | `18_extended_events.sql` | List sessions; ready-made XE for blocked process report, long queries, errors/timeouts; Azure DB-scoped session |
 | 19 | `19_maintenance_helpers.sql` | Index & stats maintenance generators, safe log shrink, find object/column/code, row counts, recent changes, DB owner fix, migrate logins |
 | 20 | `20_version_specific_features.sql` | 2017+ / 2019+ (ADR, page decode, last actual plan, missing-index→query) / 2022+ (contained AG, PSP, ledger) / 2025 (optimized locking), version decoder |
+| 21 | `21_cdc_change_tracking.sql` | CDC: enabled DBs/tables, capture instances, captured vs missing columns, **capture latency & errors**, jobs & retention, log held by CDC, change table sizes, read-changes / enable / tune templates, CDC + AG notes; Change Tracking versions & side-table sizes |
+| 22 | `22_tde_encryption.sql` | TDE status & scan progress, unencrypted DBs, **cert expiry & private-key backup**, DMK/SMK, encrypted backups, **AG cert consistency**, EKM/Key Vault, Always Encrypted inventory, enable / restore-elsewhere / rotate / disable templates |
+| 23 | `23_data_masking_rls_classification.sql` | Masked columns, **who can UNMASK**, test-as-user, unmasked sensitive-column finder, mask/unmask templates (incl. 2022 granular UNMASK), Row-Level Security, sensitivity classification, per-table protection summary |
+| 24 | `24_index_tuning.sql` | Missing indexes consolidated per table, **key lookups & scans in plans**, **unindexed foreign keys**, clustered key review (wide/GUID/non-unique), over-indexed tables, page splits, fill factor, compression candidates, partition map, disabled/hypothetical indexes, before/after test |
+| 25 | `25_alwayson_advanced.sql` | **One-shot AG alert query**, "not synchronizing" checklist, **redo blocked on readable secondary**, version store impact, commit latency, distributed & contained AGs, login/job drift, primary-only job guard, backup preference, build/add/remove templates, Azure VM notes |
+| 26 | `26_filestream_filetable.sql` | FILESTREAM level (configured vs effective), containers & filegroups, FILESTREAM columns, FileTables + UNC paths, open handles, garbage collection, waits, setup templates, AG/backup notes |
 
 ## Symptom → where to look
 
@@ -69,6 +75,17 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | Corruption suspected | `15` 15.3, 15.2 → `15` 15.10 CHECKDB |
 | Security audit | `13` top to bottom |
 | Azure SQL DB "hitting limits" | `16` 16.2 → 16.5 (LOG_RATE_GOVERNOR etc.) |
+| Log full with `log_reuse_wait = REPLICATION` | `21` 21.8 → 21.6 CDC errors → 21.7 capture job |
+| CDC consumers getting stale data | `21` 21.5 latency → 21.2 max LSN time |
+| TDE audit / cert about to expire | `22` 22.1 → 22.3 |
+| TDE DB won't come online on AG secondary | `22` 22.7 → 22.11 |
+| "Who can see unmasked data?" | `23` 23.2 → 23.8 |
+| Which index should I add? | `03`/`04` find query → `24` 24.3/24.4 → 24.1 → `05` 5.7 |
+| Deletes on parent table slow / blocking | `24` 24.5 unindexed FKs |
+| AG monitoring job | `25` 25.1 (0 rows = healthy) |
+| Redo queue growing on readable secondary | `25` 25.3 → 25.4 |
+| FILESTREAM disk not freed after deletes | `26` 26.7 |
+| Can't alter FileTable DB (open handles) | `26` 26.6 |
 | MI storage / IO | `17` 17.4, 17.5, 17.6 |
 
 ## Push to Git
