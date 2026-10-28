@@ -54,6 +54,12 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 24 | `24_index_tuning.sql` | Missing indexes consolidated per table, **key lookups & scans in plans**, **unindexed foreign keys**, clustered key review (wide/GUID/non-unique), over-indexed tables, page splits, fill factor, compression candidates, partition map, disabled/hypothetical indexes, before/after test |
 | 25 | `25_alwayson_advanced.sql` | **One-shot AG alert query**, "not synchronizing" checklist, **redo blocked on readable secondary**, version store impact, commit latency, distributed & contained AGs, login/job drift, primary-only job guard, backup preference, build/add/remove templates, Azure VM notes |
 | 26 | `26_filestream_filetable.sql` | FILESTREAM level (configured vs effective), containers & filegroups, FILESTREAM columns, FileTables + UNC paths, open handles, garbage collection, waits, setup templates, AG/backup notes |
+| 27 | `27_inplace_upgrade.sql` | Source version/OS, **deprecated features in use**, compat levels, blockers (CLR strict security, startup procs, server triggers, SSIS/SSRS/replication/mirroring, text/ntext), pre-upgrade backups & config snapshot, post-upgrade validation, **Query-Store-guided compat level raise**, AG rolling upgrade order |
+| 28 | `28_version_control_schema_changes.sql` | Recent changes across all DBs, **who changed what (default trace)**, DDL audit table + trigger, SchemaVersion table, **object hash baseline for drift**, dump module definitions for git, SSDT/sqlpackage/Flyway/DbUp cheat sheet |
+| 29 | `29_migration.sql` | DB & **instance-level inventory** (logins, jobs, linked servers, credentials, certs…), cross-DB/server dependencies, risky code (xp_cmdshell, OPENROWSET, hard-coded server), **Azure SQL DB / MI blocker check**, cutover backup/restore generator, log shipping status, post-migration validation, cutover checklist |
+| 30 | `30_patching.sql` | Build/CU/**last patched date**, **pre-patch health check (one result set)**, system DB backup generator, pause/resume jobs, **AG rolling patch** checks & order, FCI notes, post-patch validation, Azure VM / MI / SQL DB patching notes |
+| 31 | `31_schema_validation.sql` | **Schema & index fingerprints** for env-to-env compare, **two-DB object & column diff**, broken references / modules that fail to refresh, untrusted/disabled constraints, row-count diff, collation mismatches, inconsistent data types, identity exhaustion, object counts |
+| 32 | `32_database_refresh.sql` | PROD → DEV/UAT refresh: target snapshot, **capture users/roles/permissions/settings as a re-apply script**, locate backup, **RESTORE WITH MOVE generator**, AG handling, drop PROD users / fix orphans / NEW_BROKER / remove CDC & replication, **static data sanitization**, log shrink, validation |
 
 ## Symptom → where to look
 
@@ -87,17 +93,19 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | FILESTREAM disk not freed after deletes | `26` 26.7 |
 | Can't alter FileTable DB (open handles) | `26` 26.6 |
 | MI storage / IO | `17` 17.4, 17.5, 17.6 |
+| Planning a version upgrade | `27` 27.1 → 27.2 → 27.4 → 27.5 → (upgrade) → 27.6 → 27.7 |
+| "Who changed this proc / dropped this table?" | `28` 28.2 → 28.1 → 28.3 (set up for next time) |
+| PROD differs from what's in git | `28` 28.5 baseline → `31` 31.1 |
+| Migrating to a new server / Azure | `29` 29.1 → 29.2 → 29.3/29.4 → 29.5 → 29.7 |
+| Monthly CU patching | `30` 30.1 → 30.2 → 30.3/30.4 → 30.5 (AG) → 30.7 |
+| UAT doesn't match PROD / post-deploy check | `31` 31.2 → 31.3 → 31.4 → 31.5 |
+| Refresh UAT from PROD | `32` 32.1 → **32.2 save output** → 32.4 → 32.5 → 32.6 → 32.7 → 32.9 |
 
-## Push to Git
+## Get / update the kit
 
 ```bash
-cd sql-dba-toolkit
-git init
-git add .
-git commit -m "Initial DBA toolkit"
-git branch -M main
-git remote add origin https://github.com/<you>/sql-dba-toolkit.git   # or Azure DevOps URL
-git push -u origin main
+git clone https://github.com/ManikyaSG/DBA.Queries.git    # first time
+git pull                                                  # later, to get new scripts
 ```
 
 **Tip:** In SSMS, add the `scripts` folder via *File → Open → Folder* (SSMS 21+) or keep the repo in your Templates/Snippets path; in Azure Data Studio / VS Code, open the repo folder for instant search across all scripts (`Ctrl+Shift+F` → search "VLF", "deadlock", …).
