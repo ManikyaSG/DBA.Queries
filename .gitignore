@@ -1,0 +1,8 @@
+# Downloaded third-party scripts (fetched by Install-CommunityTools.ps1 - not redistributed here)
+community-tools/GlennBerry/
+
+# Local outputs
+*.xel
+*.bak
+*.trn
+Reports/

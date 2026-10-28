@@ -60,6 +60,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 30 | `30_patching.sql` | Build/CU/**last patched date**, **pre-patch health check (one result set)**, system DB backup generator, pause/resume jobs, **AG rolling patch** checks & order, FCI notes, post-patch validation, Azure VM / MI / SQL DB patching notes |
 | 31 | `31_schema_validation.sql` | **Schema & index fingerprints** for env-to-env compare, **two-DB object & column diff**, broken references / modules that fail to refresh, untrusted/disabled constraints, row-count diff, collation mismatches, inconsistent data types, identity exhaustion, object counts |
 | 32 | `32_database_refresh.sql` | PROD → DEV/UAT refresh: target snapshot, **capture users/roles/permissions/settings as a re-apply script**, locate backup, **RESTORE WITH MOVE generator**, AG handling, drop PROD users / fix orphans / NEW_BROKER / remove CDC & replication, **static data sanitization**, log shrink, validation |
+| 33 | `33_community_tools.sql` | Ready-to-run calls for **sp_WhoIsActive**, **sp_Blitz / BlitzFirst / BlitzCache / BlitzIndex / BlitzLock / BlitzWho**, **Ola Hallengren** backups/CHECKDB/IndexOptimize + CommandLog checks, logging WhoIsActive/BlitzFirst to tables, Glenn Berry via dbatools |
 
 ## Symptom → where to look
 
@@ -99,6 +100,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | Migrating to a new server / Azure | `29` 29.1 → 29.2 → 29.3/29.4 → 29.5 → 29.7 |
 | Monthly CU patching | `30` 30.1 → 30.2 → 30.3/30.4 → 30.5 (AG) → 30.7 |
 | UAT doesn't match PROD / post-deploy check | `31` 31.2 → 31.3 → 31.4 → 31.5 |
+| Second opinion / quick triage | `33` sp_BlitzFirst → sp_WhoIsActive → sp_BlitzCache → sp_Blitz |
 | Refresh UAT from PROD | `32` 32.1 → **32.2 save output** → 32.4 → 32.5 → 32.6 → 32.7 → 32.9 |
 
 ## Get / update the kit
@@ -110,13 +112,15 @@ git pull                                                  # later, to get new sc
 
 **Tip:** In SSMS, add the `scripts` folder via *File → Open → Folder* (SSMS 21+) or keep the repo in your Templates/Snippets path; in Azure Data Studio / VS Code, open the repo folder for instant search across all scripts (`Ctrl+Shift+F` → search "VLF", "deadlock", …).
 
-## Recommended community tools (complement this kit)
+## Community tools (`/community-tools`)
 
-- **sp_WhoIsActive** (Adam Machanic) — live activity
-- **First Responder Kit** (Brent Ozar: sp_Blitz, sp_BlitzFirst, sp_BlitzCache, sp_BlitzIndex)
-- **Ola Hallengren Maintenance Solution** — backups, CHECKDB, index/stats maintenance
-- **dbatools** (PowerShell) — migrations, login/job sync across AG replicas, mass checks
-- **Glenn Berry's Diagnostic Information Queries** — version-specific deep health checks
+sp_WhoIsActive, the First Responder Kit, Ola Hallengren's Maintenance Solution, dbatools and Glenn Berry's Diagnostic Information Queries — installed from their official sources (not copied here):
+
+```powershell
+.\community-tools\Install-CommunityTools.ps1 -SqlInstance SQLVM1,SQLVM2 -BackupDirectory '\\backup\sql' -CreateOlaJobs
+```
+
+See [`community-tools/README.md`](community-tools/README.md) for links, licences and how they map to the DMV scripts, `scripts/33_community_tools.sql` for T-SQL usage and `community-tools/dbatools-cheatsheet.ps1` for dbatools by scenario.
 
 ## Disclaimer
 
