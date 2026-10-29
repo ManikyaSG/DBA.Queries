@@ -22,9 +22,11 @@ Ready-to-run DMV queries for day-to-day DBA work and incident troubleshooting, o
 
 **Daily / shift handover:** `41` 41.1 (0 rows = healthy) and `40` 40.1 (RPO/RTO vs SLA).
 
+**Before / after any change (patch, upgrade, failover test):** `43` 43.3 PRE → change → 43.3 POST → 43.4 diff → 43.5 go/no-go.
+
 **Weekly:** `40` 40.3/40.4 (backup chain), `40` 40.6 (backup files exist), `40` 40.9 (restore tests), `41` 41.2 (disk forecast).
 
-**Set up once:** Agent alerts `41` 41.4, health-check email job `41` 41.8, evidence capture proc `42` 42.2, baseline collector `38` 38.2, SLA table `40` 40.12, remote DAC `35` 35.10.
+**Set up once:** Agent alerts `41` 41.4, health-check email job `41` 41.8, evidence capture proc `42` 42.2, baseline collector `38` 38.2, SLA table `40` 40.12, change snapshot proc `43` 43.2, remote DAC `35` 35.10.
 
 ## Compatibility tags
 
@@ -85,6 +87,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 40 | `40_rpo_rto_compliance.sql` | **RPO/RTO scorecard vs SLA** (data you'd lose now, worst real gap, estimated restore time), gap detail, **broken log chains**, **chain-breaking / rogue backups** (NUL, VSS/VM snapshots, other users, recovery model flips), backup quality, **do the backup files still exist**, restore chain length, crash-recovery RTO, restore-test evidence (dbatools `Test-DbaLastBackup`), **HA/DR coverage per DB**, **AG failover verdict (data loss / readiness)**, SLA table template |
 | 41 | `41_proactive_monitoring_alerts.sql` | **Problems-only health check** (backups, CHECKDB, AG, jobs, disk, log, tempdb, blocking, memory, certs, sev 17+ errors, DB Mail), **days-until-disk-full forecast**, files that will fail next autogrowth, **SQL Agent alert generator** (sev 17–25, 823/824/825, AG 1480/35264/41404/41405, 9002…), verify alerts/jobs notify someone, restart & config-change history, scheduled email template |
 | 42 | `42_incident_response.sql` | **First-60-seconds triage**, **evidence capture proc before restart/failover**, **incident timeline** (error log, jobs, backups, autogrowth/DDL, AG changes, deadlocks, CPU, memory, new Query Store plans), **safety checks before KILL** (rollback estimate, decodes Agent job name) / restart / failover / cache clears, status-update & RCA templates |
+| 43 | `43_pre_post_change_snapshot.sql` | **Pre/post change health-check snapshot**: quick 10-grid report (instance & build, services, DB states, recovery model, last full/diff/log + backup paths, AG roles / replicas / nodes / listeners / DB sync, cluster & quorum, disks, file paths & sizes, jobs, trace flags, endpoints, linked servers), **snapshot procedure storing PRE/POST in DBAdmin**, **automatic PRE vs POST diff (unexpected changes first)**, **go / no-go verdict** |
 
 ## Symptom → where to look
 
@@ -147,6 +150,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | Auditor / manager asks "are we meeting RPO/RTO?" | `40` 40.1 → 40.2 → 40.9 |
 | Restore failed / chain broken | `40` 40.3 → 40.4 → 40.6 |
 | Avoid surprises tomorrow | `41` 41.1 → 41.2 → 41.3 |
+| Patching / in-place upgrade / failover test | `43` 43.3 PRE → change → 43.3 POST → 43.4 diff → 43.5 go/no-go |
 | Refresh UAT from PROD | `32` 32.1 → **32.2 save output** → 32.4 → 32.5 → 32.6 → 32.7 → 32.9 |
 
 ## Get / update the kit

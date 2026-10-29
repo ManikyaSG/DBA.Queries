@@ -84,6 +84,8 @@ SELECT name, is_default, is_accent_sensitivity_on FROM sys.fulltext_catalogs;
 
 /*=============================================================================
   27.5 PRE-UPGRADE SAFETY NET                                          [BOX]
+  FULL SNAPSHOT: EXEC DBAdmin.dbo.usp_DBA_ChangeSnapshot @Label = 'PRE' (43.3) -> after: 'POST' + 43.4 / 43.5
+
 =============================================================================*/
 -- Last CHECKDB + last full backup per DB (both should be recent)
 SELECT d.name,
