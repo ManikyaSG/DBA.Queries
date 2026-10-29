@@ -6,3 +6,8 @@ community-tools/GlennBerry/
 *.bak
 *.trn
 Reports/
+
+# One-click health check: local outputs and environment-specific server list
+automation/health-check/Reports/
+automation/health-check/Logs/
+automation/health-check/servers.txt
