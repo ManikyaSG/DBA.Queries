@@ -11,3 +11,7 @@ Reports/
 automation/health-check/Reports/
 automation/health-check/Logs/
 automation/health-check/servers.txt
+automation/pre-post-check/Snapshots/
+automation/pre-post-check/Reports/
+automation/pre-post-check/Logs/
+automation/pre-post-check/servers.txt

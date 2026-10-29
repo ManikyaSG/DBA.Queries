@@ -1,0 +1,8 @@
+# OPTIONAL - rename to servers.txt to ADD instances to the local discovery
+# (e.g. AG replicas on other VMs, or an instance reached through a listener / alias).
+# One instance per line. Lines starting with # are ignored.
+# Windows authentication is used, so your account needs a login on each one.
+#
+# SQLVM2
+# SQLVM3\INST2
+# SQLVM4,14330
