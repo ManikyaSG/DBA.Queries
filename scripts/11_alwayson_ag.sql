@@ -14,11 +14,10 @@
 =============================================================================*/
 SELECT ag.name AS ag_name, ags.primary_replica, ags.primary_recovery_health_desc,
        ags.synchronization_health_desc,
-       ag.cluster_type_desc,                   -- WSFC / NONE / EXTERNAL
        ag.automated_backup_preference_desc,
        ag.failure_condition_level, ag.health_check_timeout,
-       ag.db_failover, ag.dtc_support, ag.is_distributed,
-       ag.required_synchronized_secondaries_to_commit   -- 2017+ (remove this line on 2016)
+       ag.db_failover, ag.dtc_support, ag.is_distributed
+       -- 2017+: , ag.cluster_type_desc  (WSFC / NONE / EXTERNAL), ag.required_synchronized_secondaries_to_commit
 FROM sys.availability_groups AS ag
 JOIN sys.dm_hadr_availability_group_states AS ags ON ags.group_id = ag.group_id;
 
