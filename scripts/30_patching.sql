@@ -31,6 +31,8 @@ SELECT SERVERPROPERTY('MachineName')                 AS machine,
 /*=============================================================================
   30.2 PRE-PATCH HEALTH CHECK - ONE RESULT SET                          [BOX]
   Anything returned here should be fixed / understood before patching.
+  FULL SNAPSHOT: EXEC DBAdmin.dbo.usp_DBA_ChangeSnapshot @Label = 'PRE' (43.3) -> after: 'POST' + 43.4 / 43.5
+
 =============================================================================*/
 SELECT 'DB not online' AS check_item, name AS detail FROM sys.databases WHERE state_desc <> N'ONLINE'
 UNION ALL
