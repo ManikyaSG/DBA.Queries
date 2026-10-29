@@ -7,11 +7,26 @@ Ready-to-run DMV queries for day-to-day DBA work and incident troubleshooting, o
 ## How to use
 
 1. Open the file for the area you are investigating in SSMS / Azure Data Studio / VS Code (mssql).
-2. Every file is split into numbered sections (`5.3`, `11.4` …). **Highlight one section and execute it** — sections are independent.
+2. Every file is split into numbered sections (`5.3`, `11.4` …). **Highlight one section and execute it.** Sections are independent unless the header says "highlight together with …".
 3. Values you need to change are marked `-- <== change`.
 4. Statements that change things (KILL, failover, ALTER, DROP) are **commented out** or only *generated* as text. Review before running.
 
-### Compatibility tags
+## On-call quick card
+
+**Paged for a P1:**
+1. `42` 42.1: first 60 seconds (vitals, waits now, head blockers, top requests, red flags, error log).
+2. `42` 42.2: capture evidence **before** any restart, failover or KILL.
+3. Fix it with the specific script (blocking `02`, CPU `07`/`03`, I/O `08`, memory `06`, log full `08` 8.7, AG `25`, recovery `34`/`35`).
+4. `42` 42.4: safety check before KILL / restart / failover / cache clears.
+5. Post status updates every 15–30 min (`42` 42.5). Afterwards: timeline `42` 42.3, then RCA.
+
+**Daily / shift handover:** `41` 41.1 (0 rows = healthy) and `40` 40.1 (RPO/RTO vs SLA).
+
+**Weekly:** `40` 40.3/40.4 (backup chain), `40` 40.6 (backup files exist), `40` 40.9 (restore tests), `41` 41.2 (disk forecast).
+
+**Set up once:** Agent alerts `41` 41.4, health-check email job `41` 41.8, evidence capture proc `42` 42.2, baseline collector `38` 38.2, SLA table `40` 40.12, remote DAC `35` 35.10.
+
+## Compatibility tags
 
 Every section header carries tags showing where it runs:
 
@@ -67,6 +82,9 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 37 | `37_replication.sql` | Topology, publications/articles, one-shot subscription health, **agent status & latency**, **undistributed commands**, **errors + the failing command** (`sp_browsereplcmds`), fix options (skip errors / skip transaction / reinitialize), tracer tokens, log reader & publisher log, distribution DB size/retention, AG notes |
 | 38 | `38_performance_baseline.sql` | **Live perfmon dashboard with correct per-sec / ratio maths** and hints, **baseline collector** (waits, file I/O, counters → DBAdmin, 15-min job), trend queries, **last hour vs same hour last 7 days** |
 | 39 | `39_advanced_tuning.sql` | **Stats histograms**, ascending-key problem, stats past auto-update threshold, **estimated vs actual rows (live)**, parallelism & skew, compile cost & optimizer timeouts, plan guides, **Resource Governor**, **In-Memory OLTP** (memory, hash buckets), spinlocks, query hint quick reference |
+| 40 | `40_rpo_rto_compliance.sql` | **RPO/RTO scorecard vs SLA** (data you'd lose now, worst real gap, estimated restore time), gap detail, **broken log chains**, **chain-breaking / rogue backups** (NUL, VSS/VM snapshots, other users, recovery model flips), backup quality, **do the backup files still exist**, restore chain length, crash-recovery RTO, restore-test evidence (dbatools `Test-DbaLastBackup`), **HA/DR coverage per DB**, **AG failover verdict (data loss / readiness)**, SLA table template |
+| 41 | `41_proactive_monitoring_alerts.sql` | **Problems-only health check** (backups, CHECKDB, AG, jobs, disk, log, tempdb, blocking, memory, certs, sev 17+ errors, DB Mail), **days-until-disk-full forecast**, files that will fail next autogrowth, **SQL Agent alert generator** (sev 17–25, 823/824/825, AG 1480/35264/41404/41405, 9002…), verify alerts/jobs notify someone, restart & config-change history, scheduled email template |
+| 42 | `42_incident_response.sql` | **First-60-seconds triage**, **evidence capture proc before restart/failover**, **incident timeline** (error log, jobs, backups, autogrowth/DDL, AG changes, deadlocks, CPU, memory, new Query Store plans), **safety checks before KILL** (rollback estimate, decodes Agent job name) / restart / failover / cache clears, status-update & RCA templates |
 
 ## Symptom → where to look
 
@@ -122,6 +140,13 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | Replication latency / errors | `37` 37.3 → 37.4 → 37.5 → 37.6 → 37.7 |
 | "Is this normal for this server?" | `38` 38.1 live → 38.4 vs baseline (set up 38.2 first) |
 | Estimates way off / bad plan shape | `39` 39.4 → 39.1/39.2 histogram → 39.3 |
+| Paged / P1 just started | `42` 42.1 → 42.2 → (fix) → 42.4 |
+| "What changed at 10:05?" | `42` 42.3 timeline |
+| Need to KILL a session — safe? | `42` 42.4 (a) |
+| Restart or fail over? | `42` 42.4 (b) → `40` 40.11 |
+| Auditor / manager asks "are we meeting RPO/RTO?" | `40` 40.1 → 40.2 → 40.9 |
+| Restore failed / chain broken | `40` 40.3 → 40.4 → 40.6 |
+| Avoid surprises tomorrow | `41` 41.1 → 41.2 → 41.3 |
 | Refresh UAT from PROD | `32` 32.1 → **32.2 save output** → 32.4 → 32.5 → 32.6 → 32.7 → 32.9 |
 
 ## Get / update the kit

@@ -10,7 +10,7 @@
 
 /*=============================================================================
   22.1 TDE STATUS PER DATABASE + PROTECTING CERTIFICATE        [BOX][MI][SQLDB]
-  encryption_scan_state_desc needs 2019+ (remove that column on older builds).
+  On 2019+ also select dek.encryption_scan_state_desc / encryption_scan_modify_date.
   tempdb shows as encrypted automatically once any user DB uses TDE.
 =============================================================================*/
 SELECT DB_NAME(dek.database_id) AS database_name,
@@ -20,7 +20,7 @@ SELECT DB_NAME(dek.database_id) AS database_name,
             WHEN 4 THEN 'Key change in progress' WHEN 5 THEN 'Decryption in progress'
             WHEN 6 THEN 'Protection change in progress' END AS encryption_state_desc,
        dek.percent_complete,
-       dek.encryption_scan_state_desc, dek.encryption_scan_modify_date,      -- 2019+
+       -- 2019+: dek.encryption_scan_state_desc, dek.encryption_scan_modify_date,
        dek.key_algorithm, dek.key_length,
        dek.encryptor_type,                          -- CERTIFICATE / ASYMMETRIC KEY (EKM / Azure Key Vault)
        c.name AS certificate_name, c.expiry_date AS cert_expiry, c.pvt_key_last_backup_date,
@@ -75,8 +75,8 @@ WHERE name IN (N'##MS_DatabaseMasterKey##', N'##MS_ServiceMasterKey##');
 /*=============================================================================
   22.5 TDE PROGRESS (encryption / decryption scan)              [BOX][MI][SQLDB]
 =============================================================================*/
-SELECT DB_NAME(database_id) AS database_name, encryption_state, percent_complete,
-       encryption_scan_state_desc        -- 2019+: RUNNING / SUSPENDED / COMPLETE
+SELECT DB_NAME(database_id) AS database_name, encryption_state, percent_complete
+       -- 2019+: add  , encryption_scan_state_desc   (RUNNING / SUSPENDED / COMPLETE)
 FROM sys.dm_database_encryption_keys
 WHERE encryption_state IN (2, 4, 5, 6);
 -- 2019+: ALTER DATABASE [YourDB] SET ENCRYPTION SUSPEND;   / ... RESUME;
