@@ -20,7 +20,7 @@ Ready-to-run DMV queries for day-to-day DBA work and incident troubleshooting, o
 4. `42` 42.4: safety check before KILL / restart / failover / cache clears.
 5. Post status updates every 15–30 min (`42` 42.5). Afterwards: timeline `42` 42.3, then RCA.
 
-**Daily / shift handover:** `41` 41.1 (0 rows = healthy) and `40` 40.1 (RPO/RTO vs SLA).
+**Daily / shift handover:** `44` (emailed HC report — schedule it as an Agent job), `41` 41.1 (0 rows = healthy) and `40` 40.1 (RPO/RTO vs SLA).
 
 **Before / after any change (patch, upgrade, failover test):** `43` 43.3 PRE → change → 43.3 POST → 43.4 diff → 43.5 go/no-go.
 
@@ -88,6 +88,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 41 | `41_proactive_monitoring_alerts.sql` | **Problems-only health check** (backups, CHECKDB, AG, jobs, disk, log, tempdb, blocking, memory, certs, sev 17+ errors, DB Mail), **days-until-disk-full forecast**, files that will fail next autogrowth, **SQL Agent alert generator** (sev 17–25, 823/824/825, AG 1480/35264/41404/41405, 9002…), verify alerts/jobs notify someone, restart & config-change history, scheduled email template |
 | 42 | `42_incident_response.sql` | **First-60-seconds triage**, **evidence capture proc before restart/failover**, **incident timeline** (error log, jobs, backups, autogrowth/DDL, AG changes, deadlocks, CPU, memory, new Query Store plans), **safety checks before KILL** (rollback estimate, decodes Agent job name) / restart / failover / cache clears, status-update & RCA templates |
 | 43 | `43_pre_post_change_snapshot.sql` | **Pre/post change health-check snapshot**: quick 10-grid report (instance & build, services, DB states, recovery model, last full/diff/log + backup paths, AG roles / replicas / nodes / listeners / DB sync, cluster & quorum, disks, file paths & sizes, jobs, trace flags, endpoints, linked servers), **snapshot procedure storing PRE/POST in DBAdmin**, **automatic PRE vs POST diff (unexpected changes first)**, **go / no-go verdict** |
+| 44 | `44_health_check_report_email.sql` | **Single-file health check — run with F5, no setup.** Instance & build, services, vitals (CPU, PLE, grants, blocking, open tran, tempdb), databases (state, recovery model, compat, owner, size, log %, last full/diff/log + paths, last CHECKDB, AG role), AG replicas/nodes/roles/listeners + DB sync per replica, cluster & quorum, disks, file paths/size/used/growth, failed jobs, severe error log entries, certificates → **'Needs attention' summary** → **colour-coded HTML email via Database Mail** (profile, recipients, thresholds in the config block; Agent-job ready) |
 
 ## Symptom → where to look
 
@@ -151,6 +152,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | Restore failed / chain broken | `40` 40.3 → 40.4 → 40.6 |
 | Avoid surprises tomorrow | `41` 41.1 → 41.2 → 41.3 |
 | Patching / in-place upgrade / failover test | `43` 43.3 PRE → change → 43.3 POST → 43.4 diff → 43.5 go/no-go |
+| Need a health-check report / email for the team | `44` — set `@MailProfile`, `@Recipients`, run (F5) |
 | Refresh UAT from PROD | `32` 32.1 → **32.2 save output** → 32.4 → 32.5 → 32.6 → 32.7 → 32.9 |
 
 ## Get / update the kit
