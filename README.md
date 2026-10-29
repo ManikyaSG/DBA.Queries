@@ -61,6 +61,12 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 31 | `31_schema_validation.sql` | **Schema & index fingerprints** for env-to-env compare, **two-DB object & column diff**, broken references / modules that fail to refresh, untrusted/disabled constraints, row-count diff, collation mismatches, inconsistent data types, identity exhaustion, object counts |
 | 32 | `32_database_refresh.sql` | PROD → DEV/UAT refresh: target snapshot, **capture users/roles/permissions/settings as a re-apply script**, locate backup, **RESTORE WITH MOVE generator**, AG handling, drop PROD users / fix orphans / NEW_BROKER / remove CDC & replication, **static data sanitization**, log shrink, validation |
 | 33 | `33_community_tools.sql` | Ready-to-run calls for **sp_WhoIsActive**, **sp_Blitz / BlitzFirst / BlitzCache / BlitzIndex / BlitzLock / BlitzWho**, **Ola Hallengren** backups/CHECKDB/IndexOptimize + CommandLog checks, logging WhoIsActive/BlitzFirst to tables, Glenn Berry via dbatools |
+| 34 | `34_point_in_time_recovery.sql` | **Accidental DELETE/UPDATE/DROP runbook**: find the bad transaction with `fn_dblog` / `fn_dump_dblog`, hex→decimal LSN, **which backups do I need for time X**, inspect backup files, restore copy with STOPAT / STOPBEFOREMARK, step through with STANDBY, copy rows back, **page restore**, tail-log of damaged DB, **database snapshots** (create/revert), Azure PITR / deleted DB / LTR / geo-restore |
+| 35 | `35_corruption_emergency_recovery.sql` | Corruption triage (823/824/825), CHECKDB options, **map bad page → object/index**, fix-by-type decision guide, **SUSPECT / RECOVERY_PENDING / EMERGENCY repair**, lost log file, crash recovery progress, **system DB recovery (master rebuild/restore, msdb, model, tempdb path)**, **locked-out sysadmin**, DAC, moving files, **AG lost quorum / forced failover**, re-seeding a stuck secondary |
+| 36 | `36_connectivity_service_troubleshooting.sql` | **Login failed 18456 decoded by state**, connectivity & security ring buffers, **Kerberos vs NTLM + SPN commands**, listener ports/TLS registry, connection storms / pool leaks, linked servers, **orphaned DTC (SPID -2)**, Service Broker health, memory dumps & non-yielding schedulers, Azure SQL DB connectivity checks |
+| 37 | `37_replication.sql` | Topology, publications/articles, one-shot subscription health, **agent status & latency**, **undistributed commands**, **errors + the failing command** (`sp_browsereplcmds`), fix options (skip errors / skip transaction / reinitialize), tracer tokens, log reader & publisher log, distribution DB size/retention, AG notes |
+| 38 | `38_performance_baseline.sql` | **Live perfmon dashboard with correct per-sec / ratio maths** and hints, **baseline collector** (waits, file I/O, counters → DBAdmin, 15-min job), trend queries, **last hour vs same hour last 7 days** |
+| 39 | `39_advanced_tuning.sql` | **Stats histograms**, ascending-key problem, stats past auto-update threshold, **estimated vs actual rows (live)**, parallelism & skew, compile cost & optimizer timeouts, plan guides, **Resource Governor**, **In-Memory OLTP** (memory, hash buckets), spinlocks, query hint quick reference |
 
 ## Symptom → where to look
 
@@ -101,6 +107,21 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | Monthly CU patching | `30` 30.1 → 30.2 → 30.3/30.4 → 30.5 (AG) → 30.7 |
 | UAT doesn't match PROD / post-deploy check | `31` 31.2 → 31.3 → 31.4 → 31.5 |
 | Second opinion / quick triage | `33` sp_BlitzFirst → sp_WhoIsActive → sp_BlitzCache → sp_Blitz |
+| Someone deleted / updated rows by mistake | `34` 34.1 log backup → 34.2 find tran → 34.4 LSN → 34.5 backups → 34.7 restore copy → 34.9 copy back |
+| Release / data fix about to run | `34` 34.12 create snapshot first |
+| CHECKDB errors / 823 / 824 | `35` 35.1 → 35.2 → 35.3 → 35.4 |
+| Database SUSPECT / RECOVERY_PENDING | `35` 35.5 (35.6 if the log is gone) |
+| Instance won't start | `35` 35.8 (tempdb path / master) → error log |
+| Nobody has sysadmin | `35` 35.9 |
+| Server hung, can't connect | `35` 35.10 DAC → `07` 7.3 → `36` 36.9 |
+| Primary datacenter down (AG) | `35` 35.12 |
+| "Login failed for user" | `36` 36.1 |
+| "Cannot connect" / timeouts on connect | `36` 36.2 → 36.4 → 36.5 |
+| Double-hop / ANONYMOUS LOGON / linked server auth | `36` 36.3 → 36.6 |
+| Blocking by SPID -2 | `36` 36.7 |
+| Replication latency / errors | `37` 37.3 → 37.4 → 37.5 → 37.6 → 37.7 |
+| "Is this normal for this server?" | `38` 38.1 live → 38.4 vs baseline (set up 38.2 first) |
+| Estimates way off / bad plan shape | `39` 39.4 → 39.1/39.2 histogram → 39.3 |
 | Refresh UAT from PROD | `32` 32.1 → **32.2 save output** → 32.4 → 32.5 → 32.6 → 32.7 → 32.9 |
 
 ## Get / update the kit
