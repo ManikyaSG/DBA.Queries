@@ -20,7 +20,7 @@ Ready-to-run DMV queries for day-to-day DBA work and incident troubleshooting, o
 4. `42` 42.4: safety check before KILL / restart / failover / cache clears.
 5. Post status updates every 15–30 min (`42` 42.5). Afterwards: timeline `42` 42.3, then RCA.
 
-**Daily / shift handover:** `44` (emailed HC report — schedule it as an Agent job), `41` 41.1 (0 rows = healthy) and `40` 40.1 (RPO/RTO vs SLA).
+**Daily / shift handover:** `44` (emailed HC report — double-click `automation/health-check/Run-HealthCheck.bat`, or schedule it as an Agent job), `41` 41.1 (0 rows = healthy) and `40` 40.1 (RPO/RTO vs SLA).
 
 **Before / after any change (patch, upgrade, failover test):** `43` 43.3 PRE → change → 43.3 POST → 43.4 diff → 43.5 go/no-go.
 
@@ -89,6 +89,9 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 | 42 | `42_incident_response.sql` | **First-60-seconds triage**, **evidence capture proc before restart/failover**, **incident timeline** (error log, jobs, backups, autogrowth/DDL, AG changes, deadlocks, CPU, memory, new Query Store plans), **safety checks before KILL** (rollback estimate, decodes Agent job name) / restart / failover / cache clears, status-update & RCA templates |
 | 43 | `43_pre_post_change_snapshot.sql` | **Pre/post change health-check snapshot**: quick 10-grid report (instance & build, services, DB states, recovery model, last full/diff/log + backup paths, AG roles / replicas / nodes / listeners / DB sync, cluster & quorum, disks, file paths & sizes, jobs, trace flags, endpoints, linked servers), **snapshot procedure storing PRE/POST in DBAdmin**, **automatic PRE vs POST diff (unexpected changes first)**, **go / no-go verdict** |
 | 44 | `44_health_check_report_email.sql` | **Single-file health check — run with F5, no setup.** Instance & build, services, vitals (CPU, PLE, grants, blocking, open tran, tempdb), databases (state, recovery model, compat, owner, size, log %, last full/diff/log + paths, last CHECKDB, AG role), AG replicas/nodes/roles/listeners + DB sync per replica, cluster & quorum, disks, file paths/size/used/growth, failed jobs, severe error log entries, certificates → **'Needs attention' summary** → **colour-coded HTML email via Database Mail** (profile, recipients, thresholds in the config block; Agent-job ready) |
+
+**One-click runner:** [`automation/health-check`](automation/health-check/README.md) has `Run-HealthCheck.bat` + `Invoke-HealthCheck.ps1`. Double-click from the generic admin RDP session, enter your own Windows account, and it runs script 44 on **every instance on the VM**, emails each report via Database Mail and saves PRE/POST copies.
+
 
 ## Symptom → where to look
 
