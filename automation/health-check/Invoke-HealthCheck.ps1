@@ -153,6 +153,9 @@ function Invoke-Scalar($Connection, [string]$Query, [hashtable]$Params = @{}) {
 }
 
 function Get-MailProfileName($Connection) {
+    # 'Database Mail XPs' off = profiles may exist but sp_send_dbmail is blocked -> treat as not configured
+    $xps = Invoke-Scalar $Connection "SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'Database Mail XPs';"
+    if ($null -eq $xps -or $xps -is [DBNull] -or [int]$xps -ne 1) { return $null }
     # Preferred profile if it exists, else the default public/private profile, else the only/first one.
     $q = @"
 SELECT TOP (1) p.name
