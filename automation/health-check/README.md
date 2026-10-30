@@ -58,3 +58,7 @@ The saved copies are named `Reports\SQLVM1_PRE_CHG0012345_20261030_0130.html` (o
 | MailStatus = `failed` | The reason is shown in the summary. The full detail is in `msdb.dbo.sysmail_event_log`, usually an SMTP or relay problem. |
 | Execution policy error despite `-ExecutionPolicy Bypass` | Group Policy enforces signing. Sign the script, or ask for an exception for `C:\DBA\HealthCheck`. If the files were downloaded, run `Unblock-File .\*.ps1` once. |
 | Window closes immediately | Run `Run-HealthCheck.bat` from a `cmd` window to see the error. The log is in `Logs\`. |
+
+## Cleanup
+
+Double-click `Cleanup-OldFiles.bat` to delete files older than **48 hours** from `Reports\` and `Logs\`. Use `Cleanup-OldFiles.bat -Hours 72` for a different age, or `-WhatIf` to preview without deleting. To run it automatically, schedule it daily in Task Scheduler (action: the `.bat`, "Start in": this folder).
