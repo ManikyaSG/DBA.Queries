@@ -489,7 +489,10 @@ try {
             }
             $safe = Get-SafeFileName $t.Instance
             $snapFile = Join-Path $ticketDir ("{0}_{1}_{2}.json" -f $safe, $Phase, $stamp)
-            [System.IO.File]::WriteAllText($snapFile, $Json.Serialize((ConvertTo-PlainObject $snap)), [System.Text.Encoding]::UTF8)
+            # ConvertTo-Json copes with PowerShell-wrapped values (JavaScriptSerializer.Serialize does not);
+            # ConvertTo-PlainObject strips extra PowerShell note properties first. Files are read back with $Json.DeserializeObject.
+            $jsonText = ConvertTo-Json -InputObject (ConvertTo-PlainObject $snap) -Depth 20 -Compress
+            [System.IO.File]::WriteAllText($snapFile, $jsonText, [System.Text.Encoding]::UTF8)
             Write-Step "Snapshot saved : $snapFile"
             $issues = @(Get-Rows $snap 'issues')
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
