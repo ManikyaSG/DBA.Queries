@@ -389,9 +389,9 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
     $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
     [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
     [void]$cmd.Parameters.AddWithValue('@importance', $Importance)
-    $pId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pId.Direction = [System.Data.ParameterDirection]::Output
+    $pMailItemId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pMailItemId.Direction = [System.Data.ParameterDirection]::Output
     [void]$cmd.ExecuteNonQuery()
-    return [int]$pId.Value
+    return [int]$pMailItemId.Value
 }
 
 # =============================================================================
