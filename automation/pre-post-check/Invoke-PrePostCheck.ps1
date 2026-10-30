@@ -449,8 +449,15 @@ try {
         $conn = $null
         try {
             $conn = New-SqlConnection $t.Instance; $conn.Open()
-            $profileName = Get-MailProfileName $conn
-            if (-not $profileName) { throw 'No Database Mail profile on this instance - configure Database Mail first.' }
+            $profileName = $null
+            try { $profileName = Get-MailProfileName $conn }
+            catch { Write-Step "WARNING: could not read Database Mail profiles on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
+
+            if (-not $profileName) {
+                Write-Step "WARNING: Database Mail is not configured on $($t.Instance)." 'Yellow'
+                Write-Step 'Continuing with snapshot collection and report generation (report saved locally, no email).' 'Yellow'
+                $row.MailStatus = 'Database Mail Not Configured'
+            }
 
             Write-Step 'Collecting snapshot...'
             $data = Get-Snapshot $conn $sqlText
@@ -547,8 +554,20 @@ try {
             $reportFile = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f $safe, $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
             [System.IO.File]::WriteAllText($reportFile, $html, [System.Text.Encoding]::UTF8)
             $row.Report = $reportFile
-            $row.MailId = Send-DbMail $conn $profileName $subject $html $importance
-            Write-Step "Email queued   : mailitem_id $($row.MailId) via profile '$profileName'"
+            if ($profileName) {
+                try {
+                    $row.MailId = Send-DbMail $conn $profileName $subject $html $importance
+                    Write-Step "Email queued   : mailitem_id $($row.MailId) via profile '$profileName'"
+                }
+                catch {
+                    $row.MailStatus = 'Send failed: ' + $_.Exception.Message
+                    Write-Step "WARNING: email not sent - $($_.Exception.Message)" 'Yellow'
+                    Write-Step "Report is saved locally: $reportFile" 'Yellow'
+                }
+            }
+            else {
+                Write-Step "Email skipped  : no Database Mail - open the saved report: $reportFile" 'Yellow'
+            }
         }
         catch {
             $row.Outcome = 'FAILED: ' + $_.Exception.Message
