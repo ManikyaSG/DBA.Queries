@@ -72,4 +72,4 @@ For other problems (credentials, folder access, `Login failed`, mail stuck as `u
 
 ## Cleanup
 
-Double-click `Cleanup-OldFiles.bat` to delete files older than **48 hours** from `Reports\` and `Logs\` and `Snapshots\\`. A ticket's snapshots are deleted only once it has a **POST**; a PRE still waiting for its POST is kept for 7 days (`-KeepPreWithoutPostDays`), so a change done later can still be compared. Use `Cleanup-OldFiles.bat -Hours 72` for a different age, or `-WhatIf` to preview without deleting. To run it automatically, schedule it daily in Task Scheduler (action: the `.bat`, "Start in": this folder).
+Double-click `Cleanup-OldFiles.bat` to delete files older than **48 hours** from `Reports\` and `Logs\` and `Snapshots\`. A ticket's snapshots are deleted only once it has a **POST**; a PRE still waiting for its POST is kept for 7 days (`-KeepPreWithoutPostDays`), so a change done later can still be compared. Use `Cleanup-OldFiles.bat -Hours 72` for a different age, or `-WhatIf` to preview without deleting. To run it automatically, schedule it daily in Task Scheduler (action: the `.bat`, "Start in": this folder).
