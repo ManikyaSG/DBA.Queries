@@ -117,6 +117,26 @@ Add-Type -AssemblyName System.Web.Extensions
 $Json = New-Object System.Web.Script.Serialization.JavaScriptSerializer
 $Json.MaxJsonLength = [int]::MaxValue
 
+function ConvertTo-PlainObject($InputObject) {
+    # JavaScriptSerializer can't handle PowerShell-wrapped values (e.g. strings from Get-Date / function
+    # output arrive as PSObject and cause "circular reference ... PSParameterizedProperty").
+    # Recursively unwrap everything to plain .NET strings / numbers / dictionaries / arrays.
+    if ($null -eq $InputObject) { return $null }
+    $base = $InputObject.PSObject.BaseObject
+    if ($base -is [string] -or $base -is [System.ValueType]) { return $base }
+    if ($base -is [System.Collections.IDictionary]) {
+        $d = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+        foreach ($k in @($base.Keys)) { $d[[string]$k] = ConvertTo-PlainObject $base[$k] }
+        return ,$d
+    }
+    if ($base -is [System.Collections.IEnumerable]) {
+        $l = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($item in $base) { $l.Add((ConvertTo-PlainObject $item)) }
+        return ,($l.ToArray())
+    }
+    return [string]$base
+}
+
 function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s,]', '_') }
 function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
@@ -469,7 +489,7 @@ try {
             }
             $safe = Get-SafeFileName $t.Instance
             $snapFile = Join-Path $ticketDir ("{0}_{1}_{2}.json" -f $safe, $Phase, $stamp)
-            [System.IO.File]::WriteAllText($snapFile, $Json.Serialize($snap), [System.Text.Encoding]::UTF8)
+            [System.IO.File]::WriteAllText($snapFile, $Json.Serialize((ConvertTo-PlainObject $snap)), [System.Text.Encoding]::UTF8)
             Write-Step "Snapshot saved : $snapFile"
             $issues = @(Get-Rows $snap 'issues')
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
