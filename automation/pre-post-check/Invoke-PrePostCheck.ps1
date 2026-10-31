@@ -670,6 +670,11 @@ finally {
     if ($summary) { $summary | Format-Table Instance, Outcome, Unexpected, NewProblems, Expected, Baseline, MailStatus -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
     Write-Step "Snapshots : $(Join-Path $Config.SnapshotRoot $Ticket)"
     Write-Step "Reports   : $($Config.ReportsFolder)"
+    # No email for an instance (Database Mail missing/off or send failed): open its saved report in the browser
+    foreach ($r in @($summary | Where-Object { -not $_.MailId -and $_.Report -and (Test-Path -LiteralPath $_.Report) })) {
+        Write-Step "Opening report : $($r.Report)" 'Yellow'
+        try { Invoke-Item -LiteralPath $r.Report } catch { Write-Step "Could not open it: $($_.Exception.Message)" 'Yellow' }
+    }
     Write-Step "Log       : $logFile"
     try { Stop-Transcript | Out-Null } catch { }
     Read-Host "`nPress Enter to close"
