@@ -138,6 +138,37 @@ function ConvertTo-PlainObject($InputObject) {
 }
 
 function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
+
+function Start-SecondaryLogonService {
+    # "Run as different user" / Start-Process -Credential need the Secondary Logon service (seclogon).
+    # Starts it if stopped; if it is Disabled, sets it to Manual first. Needs local admin - if this
+    # window is not elevated, a UAC prompt starts it. Returns $true when the service is running.
+    $svc = Get-Service -Name seclogon -ErrorAction SilentlyContinue
+    if (-not $svc) { Write-Step 'WARNING: Secondary Logon service (seclogon) not found on this VM.' 'Yellow'; return $false }
+    if ($svc.Status -eq 'Running') { Write-Step 'Secondary Logon service: running'; return $true }
+
+    $startType = (Get-CimInstance -ClassName Win32_Service -Filter "Name='seclogon'" -ErrorAction SilentlyContinue).StartMode
+    Write-Step "Secondary Logon service is $($svc.Status) (startup: $startType) - starting it..." 'Yellow'
+    try {
+        if ($startType -eq 'Disabled') { Set-Service -Name seclogon -StartupType Manual -ErrorAction Stop }
+        Start-Service -Name seclogon -ErrorAction Stop
+    }
+    catch {
+        Write-Step 'Not running elevated - approve the UAC prompt to start the Secondary Logon service.' 'Yellow'
+        $cmd = "if ((Get-CimInstance Win32_Service -Filter `"Name='seclogon'`").StartMode -eq 'Disabled') { Set-Service seclogon -StartupType Manual }; Start-Service seclogon"
+        try { Start-Process -FilePath "$PSHOME\powershell.exe" -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList @('-NoProfile', '-Command', $cmd) }
+        catch { Write-Step "Could not elevate: $($_.Exception.Message)" 'Red' }
+    }
+    $svc = Get-Service -Name seclogon
+    for ($i = 0; $i -lt 10 -and $svc.Status -ne 'Running'; $i++) { Start-Sleep -Seconds 1; $svc.Refresh() }
+    if ($svc.Status -eq 'Running') {
+        Write-Step 'Secondary Logon service: started' 'Green'
+        if ($startType -eq 'Disabled') { Write-Step 'NOTE: its startup type was Disabled and is now Manual (needed for Run as different user).' 'Yellow' }
+        return $true
+    }
+    Write-Step 'WARNING: Secondary Logon service could not be started - running as a different user will fail.' 'Red'
+    return $false
+}
 function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s,]', '_') }
 function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
 
@@ -410,6 +441,13 @@ if (-not $Inner) {
     if (-not $Ticket) { $Ticket = 'NO-TICKET' }
 
     $cred = $null
+    if (-not $UseCurrentUser) {
+        if (-not (Start-SecondaryLogonService)) {
+            $ans = Read-Host 'Continue as the CURRENT user instead? (Y/N)'
+            if ($ans -notmatch '^[Yy]') { exit 1 }
+            $UseCurrentUser = $true
+        }
+    }
     if (-not $UseCurrentUser) {
         try   { $cred = Get-Credential -Message "Enter YOUR Windows account (DOMAIN\user) that has access to SQL Server.`nCancel = run as $env:USERDOMAIN\$env:USERNAME" }
         catch { $cred = $null }
