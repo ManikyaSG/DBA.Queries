@@ -582,21 +582,31 @@ try {
                                   else { "DIFFERENCES FOUND - $nU unexpected difference(s), $nN new problem(s) after the change. Review before closing $Ticket." }
                     $diffCols = @('Section', 'Item', 'Attribute', 'Before', 'After', 'Note')
                     $issueCols = @('severity', 'area', 'item', 'detail')
-                    $html = $HtmlHead +
-                            "<h2>$(Enc $Config.ReportTitle) - POST check - $(Enc $t.Instance)</h2>" +
-                            "<div class='banner' style='background:$color'>$(Enc $bannerText)</div>" +
-                            "<table><tr><th></th><th>PRE (before)</th><th>POST (after)</th></tr>" +
-                            "<tr><td>Ticket</td><td>$(Enc $pre['meta']['ticket'])</td><td>$(Enc $Ticket)</td></tr>" +
-                            "<tr><td>Taken</td><td>$(Enc $pre['meta']['taken_at'])</td><td>$(Enc $snap.meta.taken_at)</td></tr>" +
-                            "<tr><td>By</td><td>$(Enc $pre['meta']['taken_by'])</td><td>$(Enc $me)</td></tr>" +
-                            "<tr><td>Build</td><td>$(Enc $pre['meta']['build'])</td><td>$(Enc $snap.meta.build)</td></tr></table>" +
-                            "<h3>Unexpected differences ($nU)</h3>" + (ConvertTo-HtmlTable $cmp.Unexpected $diffCols 'background-color:#f8d7da') +
-                            "<h3>New problems after the change ($nN)</h3>" + (ConvertTo-HtmlTable $cmp.NewProblems $issueCols 'background-color:#f8d7da') +
-                            "<h3>Expected changes ($nE)</h3>" + (ConvertTo-HtmlTable $cmp.Expected $diffCols 'background-color:#eef3f8') +
-                            "<h3>Problems that already existed before the change ($($cmp.OldProblems.Count))</h3>" + (ConvertTo-HtmlTable $cmp.OldProblems $issueCols 'background-color:#fff3cd') +
-                            "<p style='color:#777'>Tolerances: file/DB size &gt; $($Config.FileSizeDriftPct)% and &gt; $($Config.FileSizeDriftMinMB) MB; disk free space &gt; $($Config.DiskFreeDriftPct)% of disk. " +
-                            "AG primary / role changes are flagged on purpose. Run POST after AG databases are SYNCHRONIZED.</p>" +
-                            "<h2>Full POST report</h2>" + (Get-FullReportHtml $snap) + '</body></html>'
+                    # Built as a list of strings and joined - avoids PowerShell '+' type coercion
+                    $parts = @(
+                        [string]$HtmlHead
+                        "<h2>$(Enc $Config.ReportTitle) - POST check - $(Enc $t.Instance)</h2>"
+                        "<div class='banner' style='background:$color'>$(Enc $bannerText)</div>"
+                        "<table><tr><th></th><th>PRE (before)</th><th>POST (after)</th></tr>"
+                        "<tr><td>Ticket</td><td>$(Enc $pre['meta']['ticket'])</td><td>$(Enc $Ticket)</td></tr>"
+                        "<tr><td>Taken</td><td>$(Enc $pre['meta']['taken_at'])</td><td>$(Enc $snap.meta.taken_at)</td></tr>"
+                        "<tr><td>By</td><td>$(Enc $pre['meta']['taken_by'])</td><td>$(Enc $me)</td></tr>"
+                        "<tr><td>Build</td><td>$(Enc $pre['meta']['build'])</td><td>$(Enc $snap.meta.build)</td></tr></table>"
+                        "<h3>Unexpected differences ($nU)</h3>"
+                        [string](ConvertTo-HtmlTable $cmp.Unexpected $diffCols 'background-color:#f8d7da')
+                        "<h3>New problems after the change ($nN)</h3>"
+                        [string](ConvertTo-HtmlTable $cmp.NewProblems $issueCols 'background-color:#f8d7da')
+                        "<h3>Expected changes ($nE)</h3>"
+                        [string](ConvertTo-HtmlTable $cmp.Expected $diffCols 'background-color:#eef3f8')
+                        "<h3>Problems that already existed before the change ($($cmp.OldProblems.Count))</h3>"
+                        [string](ConvertTo-HtmlTable $cmp.OldProblems $issueCols 'background-color:#fff3cd')
+                        "<p style='color:#777'>Tolerances: file/DB size &gt; $($Config.FileSizeDriftPct)% and &gt; $($Config.FileSizeDriftMinMB) MB; disk free space &gt; $($Config.DiskFreeDriftPct)% of disk. "
+                        "AG primary / role changes are flagged on purpose. Run POST after AG databases are SYNCHRONIZED.</p>"
+                        "<h2>Full POST report</h2>"
+                        [string](Get-FullReportHtml $snap)
+                        '</body></html>'
+                    )
+                    $html = $parts -join ''
                     $subject = if ($ok) { "[POST SUCCESS] $($Config.ReportTitle) [$Ticket] - $($t.Instance) - no differences" }
                                else { "[POST DIFFERENCES] $($Config.ReportTitle) [$Ticket] - $($t.Instance) - $nU difference(s), $nN new problem(s)" }
                     $importance = if ($ok) { 'Normal' } else { 'High' }
