@@ -14,6 +14,31 @@ setlocal
 title SQL Server PRE-POST Change Check
 cd /d "%~dp0"
 
+REM --- Make sure the Secondary Logon service (needed for "run as different user") is running ---
+sc query seclogon | find /i "RUNNING" >nul
+if errorlevel 1 (
+    echo Secondary Logon service is not running - starting it...
+    net session >nul 2>&1
+    if errorlevel 1 (
+        echo Administrator rights needed - approve the UAC prompt.
+        powershell -NoProfile -Command "Start-Process cmd.exe -Verb RunAs -Wait -ArgumentList '/c sc config seclogon start= demand & net start seclogon & timeout /t 3'"
+    ) else (
+        sc config seclogon start= demand >nul
+        net start seclogon
+    )
+    sc query seclogon | find /i "RUNNING" >nul
+    if errorlevel 1 (
+        echo.
+        echo WARNING: Secondary Logon could not be started. Current configuration:
+        sc qc seclogon
+        sc query seclogon
+        echo Check services.msc ^> Secondary Logon, or a Group Policy that disables it.
+        pause
+    ) else (
+        echo Secondary Logon service started.
+    )
+)
+
 if not exist "%~dp0Invoke-PrePostCheck.ps1" (
     echo Invoke-PrePostCheck.ps1 not found in %~dp0
     pause
