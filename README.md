@@ -175,7 +175,7 @@ Offline copies of **Brent Ozar's First Responder Kit**, **Adam Machanic's sp_Who
 
 ## Community tools (`/community-tools`)
 
-sp_WhoIsActive, the First Responder Kit, Ola Hallengren's Maintenance Solution, dbatools and Glenn Berry's Diagnostic Information Queries — installed from their official sources (not copied here):
+sp_WhoIsActive, the First Responder Kit, Ola Hallengren's Maintenance Solution, dbatools and Glenn Berry's Diagnostic Information Queries — installed from their official sources (offline copies of most are in `scripts/third-party`):
 
 ```powershell
 .\community-tools\Install-CommunityTools.ps1 -SqlInstance SQLVM1,SQLVM2 -BackupDirectory '\\backup\sql' -CreateOlaJobs

@@ -27,7 +27,7 @@ How to use each one: [`scripts/33_community_tools.sql`](../33_community_tools.sq
 -- 2. Edit the settings at the top before running:
 --      USE [DBAdmin]  (or master)       -> database the procedures and CommandLog table go into
 --      @CreateJobs          = 'Y'       -> creates the Agent jobs (no schedules - add your own)
---      @BackupDirectory     = N'\\backupshare\SQL'  (or a URL for backup to Azure blob)
+--      @BackupDirectory     = N'\\backupshare\SQL'   (or @BackupURL for Azure blob storage)
 --      @CleanupTime         = 168       -> hours to keep backup files (NULL = never delete)
 --      @OutputFileDirectory = NULL      -> job output files (NULL = SQL error log folder)
 --      @LogToTable          = 'Y'       -> log every command to dbo.CommandLog
