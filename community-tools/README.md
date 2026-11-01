@@ -1,6 +1,6 @@
 # Community tools
 
-Free, widely used tools that complement the DMV scripts in `/scripts`. **Their code is not copied into this repo.** They are updated frequently and each has its own licence, so install them from the official source with `Install-CommunityTools.ps1`.
+Free, widely used tools that complement the DMV scripts in `/scripts`. Install the latest versions from the official sources with `Install-CommunityTools.ps1`. For servers without internet access, offline copies of the First Responder Kit, sp_WhoIsActive and Vlad Drumea's PSBlitz and scripts are in [`scripts/third-party`](../scripts/third-party/README.md).
 
 | Tool | Author | What it's for | Official source | Licence |
 |---|---|---|---|---|

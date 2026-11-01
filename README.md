@@ -169,6 +169,10 @@ git pull                                                  # later, to get new sc
 
 **Tip:** In SSMS, add the `scripts` folder via *File → Open → Folder* (SSMS 21+) or keep the repo in your Templates/Snippets path; in Azure Data Studio / VS Code, open the repo folder for instant search across all scripts (`Ctrl+Shift+F` → search "VLF", "deadlock", …).
 
+## Third-party toolkits (`/scripts/third-party`)
+
+Offline copies of **Brent Ozar's First Responder Kit**, **Adam Machanic's sp_WhoIsActive**, and **Vlad Drumea's PSBlitz and SQL-Server-Scripts**. They are unmodified and each keeps its license. See [`scripts/third-party/README.md`](scripts/third-party/README.md) for install, usage and the `Update-ThirdParty.ps1` refresh script.
+
 ## Community tools (`/community-tools`)
 
 sp_WhoIsActive, the First Responder Kit, Ola Hallengren's Maintenance Solution, dbatools and Glenn Berry's Diagnostic Information Queries — installed from their official sources (not copied here):
