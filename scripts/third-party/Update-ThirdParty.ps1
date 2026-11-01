@@ -9,7 +9,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'frk', 'whoisactive', 'psblitz', 'vladscripts')]
+    [ValidateSet('all', 'frk', 'whoisactive', 'psblitz', 'vladscripts', 'ola')]
     [string] $Only = 'all'
 )
 $ErrorActionPreference = 'Stop'
@@ -23,6 +23,8 @@ $tools = @(
     @{ Key = 'psblitz';     Repo = 'VladDBA/PSBlitz';                              Folder = 'vlad-drumea-psblitz'
        Keep = @('*') ; Skip = @('Screenshots', '.git*') }
     @{ Key = 'vladscripts'; Repo = 'VladDBA/SQL-Server-Scripts';                   Folder = 'vlad-drumea-sql-server-scripts'
+       Keep = @('*') ; Skip = @('.git*') }
+    @{ Key = 'ola';         Repo = 'olahallengren/sql-server-maintenance-solution'; Folder = 'ola-hallengren-maintenance-solution'
        Keep = @('*') ; Skip = @('.git*') }
 )
 
