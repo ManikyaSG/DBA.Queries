@@ -171,7 +171,7 @@ git pull                                                  # later, to get new sc
 
 ## Third-party toolkits (`/scripts/third-party`)
 
-Offline copies of **Brent Ozar's First Responder Kit**, **Adam Machanic's sp_WhoIsActive**, and **Vlad Drumea's PSBlitz and SQL-Server-Scripts**. They are unmodified and each keeps its license. See [`scripts/third-party/README.md`](scripts/third-party/README.md) for install, usage and the `Update-ThirdParty.ps1` refresh script.
+Offline copies of **Brent Ozar's First Responder Kit**, **Adam Machanic's sp_WhoIsActive**, **Ola Hallengren's Maintenance Solution**, and **Vlad Drumea's PSBlitz and SQL-Server-Scripts**. They are unmodified and each keeps its license. See [`scripts/third-party/README.md`](scripts/third-party/README.md) for install, usage and the `Update-ThirdParty.ps1` refresh script.
 
 ## Community tools (`/community-tools`)
 

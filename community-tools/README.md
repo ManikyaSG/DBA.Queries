@@ -1,6 +1,6 @@
 # Community tools
 
-Free, widely used tools that complement the DMV scripts in `/scripts`. Install the latest versions from the official sources with `Install-CommunityTools.ps1`. For servers without internet access, offline copies of the First Responder Kit, sp_WhoIsActive and Vlad Drumea's PSBlitz and scripts are in [`scripts/third-party`](../scripts/third-party/README.md).
+Free, widely used tools that complement the DMV scripts in `/scripts`. Install the latest versions from the official sources with `Install-CommunityTools.ps1`. For servers without internet access, offline copies of the First Responder Kit, sp_WhoIsActive, Ola Hallengren's Maintenance Solution and Vlad Drumea's PSBlitz and scripts are in [`scripts/third-party`](../scripts/third-party/README.md).
 
 | Tool | Author | What it's for | Official source | Licence |
 |---|---|---|---|---|
