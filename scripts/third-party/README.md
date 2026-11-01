@@ -23,10 +23,10 @@ How to use each one: [`scripts/33_community_tools.sql`](../33_community_tools.sq
 **PSBlitz** (run from a machine with SSMS or the SqlServer module; produces an Excel or HTML health report per instance):
 ```powershell
 cd scripts\third-party\vlad-drumea-psblitz
-.\PSBlitz.ps1 -ServerName SQLVM1                    # Windows auth, Excel output if Excel is installed
-.\PSBlitz.ps1 -ServerName SQLVM1 -ToHTML Y          # HTML report (no Excel needed)
-.\PSBlitz.ps1 -ServerName SQLVM1 -IsIndepth Y       # deeper checks
-.\PSBlitzGUI.ps1                                    # point-and-click
+.\PSBlitz.ps1 SQLVM1                    # Windows auth; Excel report (needs Excel installed)
+.\PSBlitz.ps1 SQLVM1\INST2 -ToHTML      # HTML report, no Excel needed
+.\PSBlitz.ps1 SQLVM1 -InDepth -ToHTML   # deeper checks
+.\PSBlitz.ps1 -GUI                      # point-and-click
 ```
 Run `Get-Help .\PSBlitz.ps1 -Full` for all options, and see `PERMISSIONS.md` for the rights it needs.
 
