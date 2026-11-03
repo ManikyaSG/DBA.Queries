@@ -49,6 +49,9 @@ If POST finds no PRE for that ticket, it offers the **latest PRE for that instan
 | Cluster | quorum type/state, member type/state, votes | |
 | Disks / files | disk size, file paths, type, state, growth, max size | free space and size changes within tolerance |
 | Jobs / security / objects | job enabled/owner/category; logins (type, disabled, default DB); server role members; linked servers; endpoints; certificates; XE sessions | |
+| SSIS | SSIS service state; SSISDB catalog settings; projects (package count, version, deployed by); environments (variable count). Failed package executions in the last 24 h are reported as problems | catalog `SCHEMA_BUILD` / `SCHEMA_VERSION` |
+| SSRS | Reporting Services / Power BI Report Server service; for each report server database on the instance: counts of folders, reports, data sources, datasets and schedules; each subscription (report, owner, enabled, failing). Failing subscriptions and failed report executions (24 h) are reported as problems | |
+| SSAS | Analysis Services service; whether the instance can be queried; each database (compatibility level, type) | SSAS version, database `date_modified` |
 | Problems | issues that exist **after but not before** = new problems | issues already present at PRE are listed separately |
 
 **Tolerances**, set in `$Config`:
@@ -68,6 +71,11 @@ Last-backup *times*, log usage %, queue sizes and CPU are not compared, because 
 ## Permissions and troubleshooting
 
 Your account needs `VIEW SERVER STATE`, read access to `msdb`, and `DatabaseMailUserRole` (or sysadmin) on every instance. It also needs write access to the folder.
+For the SSIS / SSRS / SSAS sections it also needs:
+- **SSIS:** read access to `SSISDB` (sysadmin, or `ssis_admin`). Otherwise the section is skipped and a warning is added.
+- **SSRS:** read access to the report server database (for example `ReportServer`). It must be on the same instance; a remote report server catalog isn't seen.
+- **SSAS:** SSAS server administrator rights, and the **MSOLAP OLE DB provider** on the VM (installed with SSAS / SSMS). If either is missing, the SSAS service state is still captured and a warning explains why the databases couldn't be read.
+- SSIS/SSRS/SSAS **services** are read from the VM itself, so they're only captured for instances discovered on this VM, not for `servers.txt` entries.
 For other problems (credentials, folder access, `Login failed`, mail stuck as `unsent`/`failed`, execution policy), see the troubleshooting table in [`../health-check/README.md`](../health-check/README.md); the same fixes apply.
 
 ## Cleanup

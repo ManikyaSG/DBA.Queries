@@ -100,6 +100,14 @@ $Spec = [ordered]@{
     endpoints      = @{ Title = 'Endpoints';           Key = @('name');          Compare = @('type', 'state', 'port') }
     certificates   = @{ Title = 'Certificates';        Key = @('name');          Compare = @('thumbprint', 'expiry') }
     xe_sessions    = @{ Title = 'XE sessions';         Key = @('name');          Compare = @('running') }
+    bi_services    = @{ Title = 'SSIS / SSRS / SSAS services'; Key = @('name'); Compare = @('state', 'start_mode', 'account') }
+    ssis_catalog   = @{ Title = 'SSIS catalog settings'; Key = @('property_name'); Compare = @('property_value'); ExpectedKeys = @('SCHEMA_BUILD', 'SCHEMA_VERSION') }
+    ssis_projects  = @{ Title = 'SSIS projects';       Key = @('folder', 'project'); Compare = @('packages', 'object_version_lsn', 'deployed_by') }
+    ssis_environments = @{ Title = 'SSIS environments'; Key = @('folder', 'environment'); Compare = @('variables') }
+    ssrs_summary   = @{ Title = 'SSRS content';        Key = @('rs_database');   Compare = @('folders', 'reports', 'datasources', 'datasets', 'other_items', 'subscriptions', 'schedules') }
+    ssrs_subscriptions = @{ Title = 'SSRS subscriptions'; Key = @('rs_database', 'subscription_id'); Compare = @('report_path', 'owner', 'inactive_flags', 'is_failing') }
+    ssas_server    = @{ Title = 'SSAS instances';      Key = @('ssas_instance'); Compare = @('service_state', 'connected'); Expected = @('version') }
+    ssas_databases = @{ Title = 'SSAS databases';      Key = @('ssas_instance', 'database'); Compare = @('compatibility_level', 'type'); Expected = @('date_modified') }
 }
 # Order + titles for the full report in the email
 $ReportSections = [ordered]@{
@@ -108,6 +116,9 @@ $ReportSections = [ordered]@{
     files = 'Data & log files'; jobs = 'Agent jobs'; job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
     traceflags = 'Global trace flags'; config = 'sp_configure'; logins = 'Logins'; server_roles = 'Server role members'
     linked_servers = 'Linked servers'; endpoints = 'Endpoints'; certificates = 'Certificates'; xe_sessions = 'XE sessions'
+    bi_services = 'SSIS / SSRS / SSAS services (this VM)'; ssis_catalog = 'SSIS catalog settings'; ssis_projects = 'SSIS projects'
+    ssis_environments = 'SSIS environments'; ssis_failures = 'SSIS failed executions (24 h)'; ssrs_summary = 'SSRS content (report server databases)'
+    ssrs_subscriptions = 'SSRS subscriptions'; ssas_server = 'SSAS instances (this VM)'; ssas_databases = 'SSAS databases'
 }
 
 # =============================================================================
@@ -280,6 +291,56 @@ function Get-Snapshot($Connection, [string]$SqlText) {
     } while ($reader.NextResult())
     $reader.Close()
     return @{ sections = $sections; columns = $columns }
+}
+
+function Get-MachineBiSnapshot {
+    # SSIS / SSRS / SSAS Windows services on THIS VM (not visible from T-SQL) and SSAS databases via the MSOLAP provider.
+    $sections = @{}; $columns = @{}
+    $issues = New-Object System.Collections.ArrayList
+    $pattern = '^(MsDtsServer\d*|SSISScaleOutMaster\d*|SSISScaleOutWorker\d*|ReportServer(\$.+)?|SQLServerReportingServices|PowerBIReportServer|MSSQLServerOLAPService|MSOLAP\$.+|SQLBrowser)$'
+    $svcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $pattern } | Sort-Object Name)
+
+    $svcRows = New-Object System.Collections.ArrayList
+    foreach ($s in $svcs) {
+        [void]$svcRows.Add(@{ name = [string]$s.Name; display_name = [string]$s.DisplayName; state = [string]$s.State; start_mode = [string]$s.StartMode; account = [string]$s.StartName })
+        if ($s.StartMode -eq 'Auto' -and $s.State -ne 'Running') {
+            [void]$issues.Add(@{ severity = 'CRITICAL'; area = 'BI service'; item = [string]$s.Name; detail = "Startup type Automatic but service is $($s.State)" })
+        }
+    }
+    if ($svcRows.Count -gt 0) { $sections['bi_services'] = $svcRows; $columns['bi_services'] = @('name', 'display_name', 'state', 'start_mode', 'account') }
+
+    $srvRows = New-Object System.Collections.ArrayList
+    $dbRows  = New-Object System.Collections.ArrayList
+    foreach ($s in @($svcs | Where-Object { $_.Name -eq 'MSSQLServerOLAPService' -or $_.Name -like 'MSOLAP$*' })) {
+        $inst = if ($s.Name -eq 'MSSQLServerOLAPService') { $env:COMPUTERNAME } else { $env:COMPUTERNAME + '\' + $s.Name.Substring(7) }
+        $row = @{ ssas_instance = $inst; service_state = [string]$s.State; connected = '0'; version = ''; error = '' }
+        if ($s.State -eq 'Running') {
+            $c = $null
+            try {
+                $c = New-Object System.Data.OleDb.OleDbConnection "Provider=MSOLAP;Data Source=$inst;Integrated Security=SSPI;Connect Timeout=15"
+                $c.Open()
+                $row.connected = '1'; $row.version = [string]$c.ServerVersion
+                $cmd = $c.CreateCommand(); $cmd.CommandText = 'SELECT * FROM $SYSTEM.DBSCHEMA_CATALOGS'
+                $r = $cmd.ExecuteReader()
+                while ($r.Read()) {
+                    $vals = @{}
+                    for ($i = 0; $i -lt $r.FieldCount; $i++) { $vals[$r.GetName($i).ToUpperInvariant()] = if ($r.IsDBNull($i)) { '' } else { [string]$r.GetValue($i) } }
+                    [void]$dbRows.Add(@{ ssas_instance = $inst; database = [string]$vals['CATALOG_NAME']; compatibility_level = [string]$vals['COMPATIBILITY_LEVEL']
+                                         type = [string]$vals['TYPE']; date_modified = [string]$vals['DATE_MODIFIED'] })
+                }
+                $r.Close()
+            }
+            catch {
+                $row.error = $_.Exception.Message
+                [void]$issues.Add(@{ severity = 'WARNING'; area = 'SSAS'; item = $inst; detail = 'Could not query SSAS (MSOLAP provider missing or no SSAS admin rights?): ' + $_.Exception.Message })
+            }
+            finally { if ($c) { $c.Dispose() } }
+        }
+        [void]$srvRows.Add($row)
+    }
+    if ($srvRows.Count -gt 0) { $sections['ssas_server'] = $srvRows; $columns['ssas_server'] = @('ssas_instance', 'service_state', 'connected', 'version', 'error') }
+    if ($dbRows.Count -gt 0)  { $sections['ssas_databases'] = $dbRows; $columns['ssas_databases'] = @('ssas_instance', 'database', 'compatibility_level', 'type', 'date_modified') }
+    return @{ sections = $sections; columns = $columns; issues = $issues }
 }
 
 function Get-Rows($Snap, [string]$Section) {
@@ -500,6 +561,13 @@ try {
     $ticketDir = Join-Path $Config.SnapshotRoot $Ticket
     if (-not (Test-Path $ticketDir)) { New-Item -ItemType Directory -Path $ticketDir -Force | Out-Null }
 
+    # Machine-level SSIS / SSRS / SSAS data (services + SSAS databases), added to every LOCAL instance's snapshot
+    $machineBi = $null
+    if (@($targets | Where-Object { $_.Service }).Count -gt 0) {
+        try { Write-Step 'Collecting SSIS / SSRS / SSAS service and SSAS database info...'; $machineBi = Get-MachineBiSnapshot }
+        catch { Write-Step "WARNING: SSIS/SSRS/SSAS collection failed: $($_.Exception.Message)" 'Yellow' }
+    }
+
     foreach ($t in $targets) {
         $row = [ordered]@{ Instance = $t.Instance; Outcome = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; MailId = $null; MailStatus = ''; Report = '' }
         Write-Step "`n--- $($t.Instance) ---" 'Green'
@@ -522,6 +590,16 @@ try {
 
             Write-Step 'Collecting snapshot...'
             $data = Get-Snapshot $conn $sqlText
+            if ($machineBi -and $t.Service) {
+                foreach ($k in @($machineBi.sections.Keys)) { $data.sections[$k] = $machineBi.sections[$k]; $data.columns[$k] = $machineBi.columns[$k] }
+                if ($machineBi.issues.Count -gt 0) {
+                    if (-not $data.sections.ContainsKey('issues')) {
+                        $data.sections['issues'] = New-Object System.Collections.ArrayList
+                        $data.columns['issues'] = @('severity', 'area', 'item', 'detail')
+                    }
+                    foreach ($i in $machineBi.issues) { [void]$data.sections['issues'].Add($i) }
+                }
+            }
             $snap = @{
                 meta     = @{ instance = $t.Instance; phase = $Phase; ticket = $Ticket; taken_at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); taken_by = $me; machine = $env:COMPUTERNAME
                               build = (Get-Val (@(Get-Rows $data 'instance') | Where-Object { (Get-Val $_ 'property_code') -eq 'build' } | Select-Object -First 1) 'value') }
