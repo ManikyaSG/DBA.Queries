@@ -1,5 +1,9 @@
 # One-click PRE / POST change check
 
+> **One SQL file for everything:** this folder needs only `HC_Snapshot.sql`. It covers the PRE/POST change check **and** the daily health check (`Run-HealthCheck.bat`, or `-Phase HEALTH`). The older `automation/health-check` folder (script 44) isn't needed.
+
+**Health check only:** double-click `Run-HealthCheck.bat` (or `.\Invoke-PrePostCheck.ps1 -Phase HEALTH`). It runs the same snapshot on every instance on the VM and emails **one combined health report** with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject and the full report attached. Nothing is stored for comparison.
+
 Before a change (patching, CU, in-place upgrade, failover test, config change), run it with **PRE**. After the change, run it with **POST**. It checks **every SQL instance on the VM**:
 
 - **PRE** collects a full health-check snapshot, **stores it on the VM** as JSON, and emails a *PRE captured* report, which gives the team a baseline.

@@ -39,7 +39,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]   $Phase = '',          # PRE or POST (prompted if empty)
+    [string]   $Phase = '',          # PRE, POST or HEALTH (prompted if empty)
     [string]   $Ticket,
     [switch]   $UseCurrentUser,
     [string[]] $Instances,
@@ -55,6 +55,7 @@ $Config = @{
     CopyRecipients        = ''
     MailProfile           = 'DBA_Mail'                   # preferred; else default / only profile on the instance
     ReportTitle           = 'SQL Server Change Check'
+    HealthReportTitle     = 'SQL Server Health Check'      # used for -Phase HEALTH
     IncludeLocalInstances = $true
     ServersFile           = Join-Path $PSScriptRoot 'servers.txt'
     SnapshotRoot          = Join-Path $PSScriptRoot 'Snapshots'
@@ -73,7 +74,8 @@ $Config = @{
 
 $ErrorActionPreference = 'Stop'
 $Phase = ([string]$Phase).Trim().ToUpperInvariant()
-if ($Inner -and $Phase -notin @('PRE', 'POST')) { throw "Invalid -Phase '$Phase' (use PRE or POST)." }
+if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
+if ($Inner -and $Phase -notin @('PRE', 'POST', 'HEALTH')) { throw "Invalid -Phase '$Phase' (use PRE, POST or HEALTH)." }
 if ($Instances) { $Instances = @($Instances -split ',' | ForEach-Object { $_.Trim(" '`"") } | Where-Object { $_ }) }
 
 # What to compare per section: Key = identifies a row, Compare = must be equal,
@@ -499,12 +501,16 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
 # =============================================================================
 if (-not $Inner) {
     Write-Step '=== SQL Server PRE / POST change check ===' 'Green'
-    while ($Phase -notin @('PRE', 'POST')) {
-        $Phase = (Read-Host 'Phase - PRE (before the change) or POST (after the change)').Trim().ToUpperInvariant()
+    while ($Phase -notin @('PRE', 'POST', 'HEALTH')) {
+        $Phase = (Read-Host 'Phase - PRE (before a change), POST (after a change) or HEALTH (health check only)').Trim().ToUpperInvariant()
+        if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
     }
-    if (-not $PSBoundParameters.ContainsKey('Ticket')) { $Ticket = Read-Host 'Change ticket (used to pair PRE and POST, e.g. CHG0012345)' }
+    if (-not $PSBoundParameters.ContainsKey('Ticket')) {
+        $Ticket = if ($Phase -eq 'HEALTH') { Read-Host 'Ticket / label (optional, Enter = DAILY)' }
+                  else { Read-Host 'Change ticket (used to pair PRE and POST, e.g. CHG0012345)' }
+    }
     $Ticket = ([string]$Ticket).Trim() -replace '[^A-Za-z0-9_-]', ''
-    if (-not $Ticket) { $Ticket = 'NO-TICKET' }
+    if (-not $Ticket) { $Ticket = if ($Phase -eq 'HEALTH') { 'DAILY' } else { 'NO-TICKET' } }
 
     $cred = $null
     if (-not $UseCurrentUser) {
@@ -566,7 +572,8 @@ try {
     if (-not $targets) { throw 'No SQL Server instances found on this VM and servers.txt is empty.' }
     $targets | Format-Table Instance, Service, Status -AutoSize | Out-String | Write-Host
     $ticketDir = Join-Path $Config.SnapshotRoot $Ticket
-    if (-not (Test-Path $ticketDir)) { New-Item -ItemType Directory -Path $ticketDir -Force | Out-Null }
+    if ($Phase -ne 'HEALTH' -and -not (Test-Path $ticketDir)) { New-Item -ItemType Directory -Path $ticketDir -Force | Out-Null }
+    if ($Phase -eq 'HEALTH') { $Config.ReportTitle = $Config.HealthReportTitle }
 
     # Machine-level SSIS / SSRS / SSAS data (services + SSAS databases), added to every LOCAL instance's snapshot
     $machineBi = $null
@@ -617,15 +624,31 @@ try {
             }
             $safe = Get-SafeFileName $t.Instance
             $snapFile = Join-Path $ticketDir ("{0}_{1}_{2}.json" -f $safe, $Phase, $stamp)
-            $jsonText = ConvertTo-Json -InputObject (ConvertTo-PlainObject $snap) -Depth 20 -Compress
-            [System.IO.File]::WriteAllText($snapFile, $jsonText, [System.Text.Encoding]::UTF8)
-            Write-Step "Snapshot saved : $snapFile"
+            if ($Phase -ne 'HEALTH') {
+                $jsonText = ConvertTo-Json -InputObject (ConvertTo-PlainObject $snap) -Depth 20 -Compress
+                [System.IO.File]::WriteAllText($snapFile, $jsonText, [System.Text.Encoding]::UTF8)
+                Write-Step "Snapshot saved : $snapFile"
+            }
             $issues = @(Get-Rows $snap 'issues')
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
             $warn = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'WARNING' }).Count
             $fullReport = [string](Get-FullReportHtml $snap)
 
-            if ($Phase -eq 'PRE') {
+            if ($Phase -eq 'HEALTH') {
+                $color = if ($crit -gt 0) { '#f8d7da' } elseif ($warn -gt 0) { '#fff3cd' } else { '#d4edda' }
+                $row.State = if ($crit -gt 0) { 'CRIT' } elseif ($warn -gt 0) { 'WARN' } else { 'OK' }
+                $row.Outcome = if ($crit + $warn -gt 0) { "$crit critical, $warn warning(s)" } else { 'OK - no issues' }
+                $row.ShortHtml = (@(
+                    "<h1>$(Enc $t.Instance)</h1>"
+                    "<div class='banner' style='background:$color'>$(Enc $row.Outcome)</div>"
+                    "<div>Build: $(Enc $snap.meta.build)</div>"
+                    "<h3>Needs attention ($($issues.Count))</h3>"
+                    [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
+                ) -join '')
+                $row.FullHtml = $row.ShortHtml + ([string](Get-FullReportHtml $snap) -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
+                Write-Step $row.Outcome $(if ($row.State -eq 'OK') { 'Green' } else { 'Yellow' })
+            }
+            elseif ($Phase -eq 'PRE') {
                 $color = if ($crit -gt 0) { '#f8d7da' } elseif ($warn -gt 0) { '#fff3cd' } else { '#d4edda' }
                 $row.Outcome = 'PRE CAPTURED'; $row.State = 'PRE'
                 $row.Expected = "$crit critical, $warn warning(s)"
@@ -723,7 +746,14 @@ try {
     # =========================================================================
     $states = @($summary | ForEach-Object { $_.State })
     $nFail  = @($states | Where-Object { $_ -eq 'FAILED' }).Count
-    if ($Phase -eq 'PRE') {
+    if ($Phase -eq 'HEALTH') {
+        $nCrit = @($states | Where-Object { $_ -eq 'CRIT' }).Count; $nWarn = @($states | Where-Object { $_ -eq 'WARN' }).Count
+        $tag = if ($nCrit + $nFail -gt 0) { 'CRITICAL' } elseif ($nWarn -gt 0) { 'WARNING' } else { 'OK' }
+        $overall = "$tag - $($summary.Count) instance(s): $nCrit critical, $nWarn with warnings, $nFail failed"
+        $overallColor = switch ($tag) { 'CRITICAL' { '#f8d7da' } 'WARNING' { '#fff3cd' } default { '#d4edda' } }
+        $importance = if ($tag -eq 'CRITICAL') { 'High' } else { 'Normal' }
+    }
+    elseif ($Phase -eq 'PRE') {
         $overall = if ($nFail -gt 0) { "PRE CAPTURED - $nFail instance(s) FAILED" } else { 'PRE CAPTURED' }
         $overallColor = if ($nFail -gt 0) { '#f8d7da' } else { '#d4edda' }
         $tag = 'PRE CAPTURED'; $importance = if ($nFail -gt 0) { 'High' } else { 'Normal' }
@@ -733,9 +763,9 @@ try {
     elseif ($nFail -gt 0)               { $overall = "INCOMPLETE - $nFail instance(s) FAILED";               $overallColor = '#f8d7da'; $tag = 'POST INCOMPLETE';  $importance = 'High' }
     else                                { $overall = 'SUCCESS - no differences on any instance';             $overallColor = '#d4edda'; $tag = 'POST SUCCESS';     $importance = 'Normal' }
 
-    $summaryCols = if ($Phase -eq 'PRE') { @('Instance', 'Outcome') } else { @('Instance', 'Outcome', 'Unexpected', 'NewProblems', 'Expected', 'Baseline') }
+    $summaryCols = if ($Phase -in @('PRE', 'HEALTH')) { @('Instance', 'Outcome') } else { @('Instance', 'Outcome', 'Unexpected', 'NewProblems', 'Expected', 'Baseline') }
     $summaryRows = @($summary | ForEach-Object {
-        $st = switch ($_.State) { 'DIFF' { 'CRITICAL' } 'FAILED' { 'CRITICAL' } 'NOBASE' { 'WARNING' } default { '' } }
+        $st = switch ($_.State) { 'DIFF' { 'CRITICAL' } 'FAILED' { 'CRITICAL' } 'CRIT' { 'CRITICAL' } 'NOBASE' { 'WARNING' } 'WARN' { 'WARNING' } default { '' } }
         $o = [ordered]@{ status = $st }; foreach ($c in $summaryCols) { $o[$c] = [string]$_.$c }; [pscustomobject]$o })
     $header = (@(
         "<h2>$(Enc $Config.ReportTitle) - $Phase - $(Enc $env:COMPUTERNAME)</h2>"
