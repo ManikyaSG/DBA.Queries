@@ -61,6 +61,7 @@ IF OBJECT_ID('tempdb..#db')      IS NOT NULL DROP TABLE #db;
 IF OBJECT_ID('tempdb..#agr')     IS NOT NULL DROP TABLE #agr;
 IF OBJECT_ID('tempdb..#agdb')    IS NOT NULL DROP TABLE #agdb;
 IF OBJECT_ID('tempdb..#cluster') IS NOT NULL DROP TABLE #cluster;
+IF OBJECT_ID('tempdb..#agl')     IS NOT NULL DROP TABLE #agl;
 IF OBJECT_ID('tempdb..#disk')    IS NOT NULL DROP TABLE #disk;
 IF OBJECT_ID('tempdb..#files')   IS NOT NULL DROP TABLE #files;
 IF OBJECT_ID('tempdb..#used')    IS NOT NULL DROP TABLE #used;
@@ -93,6 +94,7 @@ CROSS APPLY (VALUES
     (N'Failover cluster (FCI)', CASE WHEN SERVERPROPERTY('IsClustered') = 1 THEN N'Yes' ELSE N'No' END),
     (N'Always On enabled',    CASE WHEN SERVERPROPERTY('IsHadrEnabled') = 1 THEN N'Yes' ELSE N'No' END),
     (N'SQL started',          CONVERT(nvarchar(30), i.sqlserver_start_time, 120) + N'  (' + CAST(DATEDIFF(HOUR, i.sqlserver_start_time, @now) / 24 AS nvarchar(10)) + N' days up)'),
+    (N'Windows started',      CONVERT(nvarchar(30), DATEADD(SECOND, -CAST(i.ms_ticks / 1000 AS int), @now), 120) + N'  (' + CAST(i.ms_ticks / 1000 / 86400 AS nvarchar(10)) + N' days up)'),
     (N'Logical CPUs / schedulers', CAST(i.cpu_count AS nvarchar(10)) + N' / ' + CAST(i.scheduler_count AS nvarchar(10))),
     (N'Physical memory (MB)', CAST(i.physical_memory_kb / 1024 AS nvarchar(20))),
     (N'Max server memory (MB)', (SELECT CAST(value_in_use AS nvarchar(20)) FROM sys.configurations WHERE name = N'max server memory (MB)')),
@@ -246,6 +248,16 @@ INSERT #issues SELECT status, 'AlwaysOn database', ag_name + N' / ' + database_n
 FROM #agdb WHERE status <> 'OK';
 
 -- Cluster (AG on WSFC / FCI)
+-- Listener IPs (static / DHCP, subnet, state). DNN listeners are not listed here.
+SELECT ag.name AS ag_name, l.dns_name AS listener, l.port, ip.ip_address, ip.ip_subnet_mask,
+       CASE ip.is_dhcp WHEN 1 THEN N'DHCP' WHEN 0 THEN N'Static' ELSE N'' END AS ip_type,
+       ip.network_subnet_ip + N'/' + CAST(ip.network_subnet_prefix_length AS nvarchar(5)) AS network_subnet,
+       ip.state_desc AS ip_state
+INTO #agl
+FROM sys.availability_group_listeners AS l
+JOIN sys.availability_groups AS ag ON ag.group_id = l.group_id
+LEFT JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id = l.listener_id;
+
 SELECT c.cluster_name, c.quorum_type_desc, c.quorum_state_desc, m.member_name, m.member_type_desc, m.member_state_desc, m.number_of_quorum_votes,
        CAST(CASE WHEN m.member_state_desc = 'UP' AND c.quorum_state_desc = 'NORMAL_QUORUM' THEN 'OK' ELSE 'CRITICAL' END AS varchar(10)) AS status
 INTO #cluster
@@ -371,6 +383,7 @@ BEGIN
            ag_name, ag_role, ag_sync_state, last_full, last_full_path, last_diff, last_log, last_log_path, last_checkdb
     FROM #db ORDER BY database_id;
     SELECT * FROM #agr ORDER BY ag_name, role_desc, replica_node;
+    SELECT * FROM #agl ORDER BY ag_name, listener, ip_address;
     SELECT * FROM #agdb ORDER BY ag_name, database_name, role;
     SELECT * FROM #cluster;
     SELECT * FROM #disk ORDER BY volume;
@@ -457,6 +470,11 @@ td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top} .ok{color:#2e7d3
                       td = ISNULL(synchronization_health_desc, N'?'), '', td = secondary_role_allow_connections_desc, '',
                       td = ISNULL(listeners, N'(none / DNN)'), '', td = ISNULL(endpoint_url, N''), '', td = status
                FROM #agr ORDER BY ag_name, role_desc, replica_node FOR XML PATH('tr'), TYPE) AS nvarchar(max)), @none)
++ N'</table>'
++ N'<h3>Always On - listeners</h3><table><tr><th>AG</th><th>Listener</th><th>Port</th><th>IP address</th><th>Subnet mask</th><th>Static / DHCP</th><th>Network subnet</th><th>IP state</th></tr>'
++ ISNULL(CAST((SELECT td = ag_name, '', td = listener, '', td = CAST(port AS nvarchar(10)), '', td = ISNULL(ip_address, N''), '',
+                      td = ISNULL(ip_subnet_mask, N''), '', td = ip_type, '', td = ISNULL(network_subnet, N''), '', td = ISNULL(ip_state, N'')
+               FROM #agl ORDER BY ag_name, listener, ip_address FOR XML PATH('tr'), TYPE) AS nvarchar(max)), N'<tr><td colspan="8">No listener IPs (none configured, or DNN listener)</td></tr>')
 + N'</table>'
 + N'<h3>Always On - databases per replica</h3><table><tr><th>AG</th><th>Database</th><th>Replica node</th><th>Role</th><th>Sync state</th><th>Health</th>'
 + N'<th>Suspended</th><th>Send queue KB</th><th>Redo queue KB</th><th>Lag s</th><th>Last commit</th></tr>'

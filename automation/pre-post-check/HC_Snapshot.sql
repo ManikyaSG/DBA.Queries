@@ -439,6 +439,13 @@ CROSS APPLY (VALUES
     (N'is_fci',      N'Failover cluster (FCI)', CAST(SERVERPROPERTY('IsClustered') AS nvarchar(4000))),
     (N'is_hadr',     N'Always On enabled',      CAST(SERVERPROPERTY('IsHadrEnabled') AS nvarchar(4000))),
     (N'start_time',  N'SQL started',            CONVERT(nvarchar(19), i.sqlserver_start_time, 120)),
+    (N'sql_uptime',  N'SQL Server uptime',      CAST(DATEDIFF(SECOND, i.sqlserver_start_time, GETDATE()) / 86400 AS nvarchar(10)) + N'd '
+                                                + RIGHT(N'0' + CAST(DATEDIFF(SECOND, i.sqlserver_start_time, GETDATE()) % 86400 / 3600 AS nvarchar(2)), 2) + N'h '
+                                                + RIGHT(N'0' + CAST(DATEDIFF(SECOND, i.sqlserver_start_time, GETDATE()) % 3600 / 60 AS nvarchar(2)), 2) + N'm'),
+    (N'os_boot_time',N'Windows started',        CONVERT(nvarchar(16), DATEADD(SECOND, -CAST(i.ms_ticks / 1000 AS int), GETDATE()), 120)),
+    (N'os_uptime',   N'Windows uptime',         CAST(i.ms_ticks / 1000 / 86400 AS nvarchar(10)) + N'd '
+                                                + RIGHT(N'0' + CAST(i.ms_ticks / 1000 % 86400 / 3600 AS nvarchar(2)), 2) + N'h '
+                                                + RIGHT(N'0' + CAST(i.ms_ticks / 1000 % 3600 / 60 AS nvarchar(2)), 2) + N'm'),
     (N'cpu_count',   N'Logical CPUs',           CAST(i.cpu_count AS nvarchar(20))),
     (N'schedulers',  N'Schedulers',             CAST(i.scheduler_count AS nvarchar(20))),
     (N'memory_mb',   N'Physical memory (MB)',   CAST(i.physical_memory_kb / 1024 AS nvarchar(20))),
@@ -486,6 +493,17 @@ SELECT N'ag_replicas' AS _section, ag_name, replica_node, ISNULL(primary_replica
        secondary_role_allow_connections_desc AS readable, ISNULL(endpoint_url, N'') AS endpoint_url,
        CAST(backup_priority AS nvarchar(5)) AS backup_priority, ISNULL(listeners, N'') AS listeners, status
 FROM #agr ORDER BY ag_name, replica_node;
+
+-- Listener IPs: static or DHCP, subnet, IP resource state (DNN listeners are not listed here)
+SELECT N'ag_listeners' AS _section, ag.name AS ag_name, l.dns_name AS listener, CAST(l.port AS nvarchar(10)) AS port,
+       ISNULL(ip.ip_address, N'') AS ip_address, ISNULL(ip.ip_subnet_mask, N'') AS subnet_mask,
+       CASE ip.is_dhcp WHEN 1 THEN N'DHCP' WHEN 0 THEN N'Static' ELSE N'' END AS ip_type,
+       ISNULL(ip.network_subnet_ip + N'/' + CAST(ip.network_subnet_prefix_length AS nvarchar(5)), N'') AS network_subnet,
+       ISNULL(ip.state_desc, N'') AS ip_state, CAST(l.is_conformant AS nvarchar(5)) AS is_conformant
+FROM sys.availability_group_listeners AS l
+JOIN sys.availability_groups AS ag ON ag.group_id = l.group_id
+LEFT JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id = l.listener_id
+ORDER BY ag.name, l.dns_name, ip.ip_address;
 
 SELECT N'ag_databases' AS _section, ag_name, database_name, replica_node, role,
        synchronization_state_desc AS sync_state, synchronization_health_desc AS sync_health,
