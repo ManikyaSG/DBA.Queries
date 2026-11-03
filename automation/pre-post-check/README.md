@@ -13,7 +13,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
 - The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the whole report goes in the email body instead.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
-Snapshots (JSON) and reports stay on the VM as evidence. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
+Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
 
 ## Files
 

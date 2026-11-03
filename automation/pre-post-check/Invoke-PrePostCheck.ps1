@@ -116,8 +116,8 @@ $Spec = [ordered]@{
 $ReportSections = [ordered]@{
     issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases, backups & CHECKDB'
     ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
-    files = 'Data & log files'; jobs = 'Agent jobs'; job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
-    traceflags = 'Global trace flags'; config = 'sp_configure'; logins = 'Logins'; server_roles = 'Server role members'
+    files = 'Data & log files'; job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
+    traceflags = 'Global trace flags'; config = 'sp_configure'
     linked_servers = 'Linked servers'; endpoints = 'Endpoints'; certificates = 'Certificates'; xe_sessions = 'XE sessions'
     bi_services = 'SSIS / SSRS / SSAS services (this VM)'; ssis_catalog = 'SSIS catalog settings'; ssis_projects = 'SSIS projects'
     ssis_environments = 'SSIS environments'; ssis_failures = 'SSIS failed executions (24 h)'; ssrs_summary = 'SSRS content (report server databases)'
