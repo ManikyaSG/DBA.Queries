@@ -3,7 +3,8 @@
  Purpose : Data-only version of scripts/44_health_check_report_email.sql for
            PRE / POST change comparison. Collects the same health check plus
            config, trace flags, all jobs, logins, server roles, linked servers,
-           endpoints, certificates and XE sessions, and returns one result set
+           endpoints, certificates, XE sessions, SSIS catalog (SSISDB) and SSRS
+           report server databases, and returns one result set
            per section (first column = _section). No email, no objects created.
            Invoke-PrePostCheck.ps1 runs it, stores the results on the VM as
            JSON, compares PRE vs POST and emails the outcome.
@@ -327,6 +328,99 @@ CREATE TABLE #tf (TraceFlag int, Status int, Global int, Session int);
 INSERT #tf EXEC (N'DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');
 
 /*=============================================================================
+  12. SSIS CATALOG (SSISDB) - catalog settings, projects, environments, failures
+=============================================================================*/
+IF OBJECT_ID('tempdb..#ssis_cat')  IS NOT NULL DROP TABLE #ssis_cat;
+IF OBJECT_ID('tempdb..#ssis_proj') IS NOT NULL DROP TABLE #ssis_proj;
+IF OBJECT_ID('tempdb..#ssis_env')  IS NOT NULL DROP TABLE #ssis_env;
+IF OBJECT_ID('tempdb..#ssis_fail') IS NOT NULL DROP TABLE #ssis_fail;
+CREATE TABLE #ssis_cat  (property_name nvarchar(256), property_value nvarchar(4000));
+CREATE TABLE #ssis_proj (folder nvarchar(128), project nvarchar(128), packages int, object_version_lsn bigint, last_deployed nvarchar(19), deployed_by nvarchar(256));
+CREATE TABLE #ssis_env  (folder nvarchar(128), environment nvarchar(128), variables int);
+CREATE TABLE #ssis_fail (execution_id bigint, folder nvarchar(128) NULL, project nvarchar(128) NULL, package nvarchar(260) NULL, start_time nvarchar(19) NULL, status nvarchar(30) NULL);
+
+IF DB_ID(N'SSISDB') IS NOT NULL AND HAS_DBACCESS(N'SSISDB') = 1
+BEGIN
+    BEGIN TRY
+        EXEC (N'INSERT #ssis_cat SELECT property_name, CAST(property_value AS nvarchar(4000)) FROM SSISDB.catalog.catalog_properties;');
+        EXEC (N'INSERT #ssis_proj SELECT f.name, p.name, (SELECT COUNT(*) FROM SSISDB.catalog.packages AS k WHERE k.project_id = p.project_id),
+                       p.object_version_lsn, CONVERT(nvarchar(19), p.last_deployed_time, 120), p.deployed_by_name
+                FROM SSISDB.catalog.projects AS p JOIN SSISDB.catalog.folders AS f ON f.folder_id = p.folder_id;');
+        EXEC (N'INSERT #ssis_env SELECT f.name, e.name, (SELECT COUNT(*) FROM SSISDB.catalog.environment_variables AS v WHERE v.environment_id = e.environment_id)
+                FROM SSISDB.catalog.environments AS e JOIN SSISDB.catalog.folders AS f ON f.folder_id = e.folder_id;');
+        SET @sql = N'INSERT #ssis_fail SELECT TOP (200) execution_id, folder_name, project_name, package_name, CONVERT(nvarchar(19), start_time, 120),
+                       CASE status WHEN 4 THEN N''Failed'' WHEN 6 THEN N''Ended unexpectedly'' END
+                FROM SSISDB.catalog.executions
+                WHERE status IN (4, 6) AND start_time >= DATEADD(HOUR, -@h, SYSDATETIMEOFFSET())
+                ORDER BY execution_id DESC;';
+        EXEC sys.sp_executesql @sql, N'@h int', @h = @JobFailHours;
+    END TRY
+    BEGIN CATCH
+        INSERT #issues (severity, area, item, detail) VALUES ('WARNING', 'SSIS', N'SSISDB', LEFT(N'Could not read the SSIS catalog: ' + ERROR_MESSAGE(), 1900));
+    END CATCH;
+
+    INSERT #issues (severity, area, item, detail)
+    SELECT 'WARNING', 'SSIS', N'Failed package executions',
+           CAST(COUNT(*) AS nvarchar(10)) + N' in the last ' + CAST(@JobFailHours AS nvarchar(5)) + N' h, latest: ' + ISNULL(MAX(package), N'')
+    FROM #ssis_fail HAVING COUNT(*) > 0;
+END;
+
+/*=============================================================================
+  13. SSRS REPORT SERVER DATABASES ON THIS INSTANCE - content & subscriptions
+  Any database with dbo.Catalog + dbo.Subscriptions + dbo.ExecutionLogStorage.
+=============================================================================*/
+IF OBJECT_ID('tempdb..#ssrs_sum') IS NOT NULL DROP TABLE #ssrs_sum;
+IF OBJECT_ID('tempdb..#ssrs_sub') IS NOT NULL DROP TABLE #ssrs_sub;
+CREATE TABLE #ssrs_sum (rs_database sysname, folders int, reports int, datasources int, datasets int, other_items int,
+                        subscriptions int, failing_subscriptions int, schedules int, failed_executions int);
+CREATE TABLE #ssrs_sub (rs_database sysname, subscription_id nvarchar(40), report_path nvarchar(425) NULL, owner nvarchar(260) NULL,
+                        description nvarchar(512) NULL, inactive_flags int NULL, last_status nvarchar(260) NULL, last_run nvarchar(19) NULL, is_failing int);
+
+DECLARE rsc CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases
+    WHERE state_desc = N'ONLINE' AND HAS_DBACCESS(name) = 1 AND source_database_id IS NULL
+      AND OBJECT_ID(QUOTENAME(name) + N'.dbo.Catalog') IS NOT NULL
+      AND OBJECT_ID(QUOTENAME(name) + N'.dbo.Subscriptions') IS NOT NULL
+      AND OBJECT_ID(QUOTENAME(name) + N'.dbo.ExecutionLogStorage') IS NOT NULL;
+OPEN rsc; FETCH NEXT FROM rsc INTO @dbn;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+        SET @sql = N'USE ' + QUOTENAME(@dbn) + N';
+INSERT #ssrs_sub (rs_database, subscription_id, report_path, owner, description, inactive_flags, last_status, last_run, is_failing)
+SELECT DB_NAME(), CAST(s.SubscriptionID AS nvarchar(40)), c.Path, u.UserName, LEFT(s.Description, 512), s.InactiveFlags,
+       LEFT(s.LastStatus, 260), CONVERT(nvarchar(19), s.LastRunTime, 120),
+       CASE WHEN s.LastStatus LIKE N''%fail%'' OR s.LastStatus LIKE N''%error%'' THEN 1 ELSE 0 END
+FROM dbo.Subscriptions AS s
+LEFT JOIN dbo.Catalog AS c ON c.ItemID = s.Report_OID
+LEFT JOIN dbo.Users AS u ON u.UserID = s.OwnerID;
+INSERT #ssrs_sum
+SELECT DB_NAME(),
+       SUM(CASE WHEN c.Type = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN c.Type = 2 THEN 1 ELSE 0 END),
+       SUM(CASE WHEN c.Type = 5 THEN 1 ELSE 0 END), SUM(CASE WHEN c.Type = 8 THEN 1 ELSE 0 END),
+       SUM(CASE WHEN c.Type NOT IN (1, 2, 5, 8) THEN 1 ELSE 0 END),
+       (SELECT COUNT(*) FROM dbo.Subscriptions),
+       (SELECT COUNT(*) FROM #ssrs_sub AS x WHERE x.rs_database = DB_NAME() AND x.is_failing = 1),
+       (SELECT COUNT(*) FROM dbo.Schedule),
+       (SELECT COUNT(*) FROM dbo.ExecutionLogStorage AS e WHERE e.TimeStart >= DATEADD(HOUR, -@h, GETDATE()) AND e.Status <> N''rsSuccess'')
+FROM dbo.Catalog AS c;';
+        EXEC sys.sp_executesql @sql, N'@h int', @h = @JobFailHours;
+    END TRY
+    BEGIN CATCH
+        INSERT #issues (severity, area, item, detail) VALUES ('WARNING', 'SSRS', @dbn, LEFT(N'Could not read the report server database: ' + ERROR_MESSAGE(), 1900));
+    END CATCH;
+    FETCH NEXT FROM rsc INTO @dbn;
+END
+CLOSE rsc; DEALLOCATE rsc;
+
+INSERT #issues (severity, area, item, detail)
+SELECT 'WARNING', 'SSRS', LEFT(rs_database + N' / ' + ISNULL(report_path, subscription_id), 300), N'Subscription failing: ' + ISNULL(last_status, N'')
+FROM #ssrs_sub WHERE is_failing = 1;
+INSERT #issues (severity, area, item, detail)
+SELECT 'WARNING', 'SSRS', rs_database, CAST(failed_executions AS nvarchar(10)) + N' failed report executions in the last ' + CAST(@JobFailHours AS nvarchar(5)) + N' h'
+FROM #ssrs_sum WHERE failed_executions > 0;
+
+/*=============================================================================
   OUTPUT - one result set per section. First column _section = section name.
   Every value is returned as text so PRE / POST compare exactly.
 =============================================================================*/
@@ -452,6 +546,30 @@ FROM #jobs ORDER BY run_time DESC;
 
 SELECT TOP (50) N'errorlog' AS _section, CONVERT(nvarchar(19), LogDate, 120) AS log_time, ProcessInfo AS source, message
 FROM #errlog ORDER BY LogDate DESC;
+
+SELECT N'ssis_catalog' AS _section, property_name, ISNULL(property_value, N'') AS property_value FROM #ssis_cat ORDER BY property_name;
+
+SELECT N'ssis_projects' AS _section, folder, project, CAST(packages AS nvarchar(10)) AS packages,
+       CAST(object_version_lsn AS nvarchar(30)) AS object_version_lsn, ISNULL(last_deployed, N'') AS last_deployed, ISNULL(deployed_by, N'') AS deployed_by
+FROM #ssis_proj ORDER BY folder, project;
+
+SELECT N'ssis_environments' AS _section, folder, environment, CAST(variables AS nvarchar(10)) AS variables
+FROM #ssis_env ORDER BY folder, environment;
+
+SELECT N'ssis_failures' AS _section, CAST(execution_id AS nvarchar(30)) AS execution_id, ISNULL(folder, N'') AS folder, ISNULL(project, N'') AS project,
+       ISNULL(package, N'') AS package, ISNULL(start_time, N'') AS start_time, ISNULL(status, N'') AS status
+FROM #ssis_fail ORDER BY execution_id DESC;
+
+SELECT N'ssrs_summary' AS _section, rs_database, CAST(folders AS nvarchar(10)) AS folders, CAST(reports AS nvarchar(10)) AS reports,
+       CAST(datasources AS nvarchar(10)) AS datasources, CAST(datasets AS nvarchar(10)) AS datasets, CAST(other_items AS nvarchar(10)) AS other_items,
+       CAST(subscriptions AS nvarchar(10)) AS subscriptions, CAST(failing_subscriptions AS nvarchar(10)) AS failing_subscriptions,
+       CAST(schedules AS nvarchar(10)) AS schedules, CAST(failed_executions AS nvarchar(10)) AS failed_executions
+FROM #ssrs_sum ORDER BY rs_database;
+
+SELECT N'ssrs_subscriptions' AS _section, rs_database, subscription_id, ISNULL(report_path, N'') AS report_path, ISNULL(owner, N'') AS owner,
+       ISNULL(description, N'') AS description, CAST(ISNULL(inactive_flags, 0) AS nvarchar(10)) AS inactive_flags,
+       ISNULL(last_status, N'') AS last_status, ISNULL(last_run, N'') AS last_run, CAST(is_failing AS nvarchar(5)) AS is_failing
+FROM #ssrs_sub ORDER BY rs_database, report_path;
 
 SELECT N'issues' AS _section, severity, area, item, ISNULL(detail, N'') AS detail
 FROM #issues ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, area, item;
