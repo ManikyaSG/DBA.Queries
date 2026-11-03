@@ -64,6 +64,8 @@ $Config = @{
     QueryTimeoutSec       = 900
     Encrypt               = $false                       # $true if the instance forces encryption
     MailCheckDelaySec     = 20                           # wait before checking Database Mail delivery status
+    AttachReport          = $true                        # attach the combined report (falls back to the email body)
+    PerInstanceReports    = $false                       # also save one HTML file per instance
 }
 
 $ErrorActionPreference = 'Stop'
@@ -213,6 +215,26 @@ function ConvertTo-SqlLiteral([string]$Value) {
 
 function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s]', '_') }
 
+function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
+
+function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [string]$Html, [string]$Importance, [string]$Attachment = '') {
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = 'msdb.dbo.sp_send_dbmail'
+    $cmd.CommandType = [System.Data.CommandType]::StoredProcedure
+    $cmd.CommandTimeout = 120
+    [void]$cmd.Parameters.AddWithValue('@profile_name', $MailProfileName)
+    [void]$cmd.Parameters.AddWithValue('@recipients', $Config.Recipients)
+    if ($Config.CopyRecipients) { [void]$cmd.Parameters.AddWithValue('@copy_recipients', $Config.CopyRecipients) }
+    [void]$cmd.Parameters.AddWithValue('@subject', $Subject)
+    $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
+    [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
+    [void]$cmd.Parameters.AddWithValue('@importance', $Importance)
+    if ($Attachment) { [void]$cmd.Parameters.AddWithValue('@file_attachments', $Attachment) }
+    $pMailItemId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pMailItemId.Direction = [System.Data.ParameterDirection]::Output
+    [void]$cmd.ExecuteNonQuery()
+    return [int]$pMailItemId.Value
+}
+
 # =============================================================================
 #  OUTER: prompt for label / ticket / credentials, relaunch as your account
 # =============================================================================
@@ -286,6 +308,8 @@ $logFile = Join-Path $Config.LogsFolder "HealthCheck_${Label}_$stamp.log"
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { Write-Warning "Transcript not started: $($_.Exception.Message)" }
 
 $summary = @()
+$combinedFile = $null
+$mailStatus = 'Not sent'
 try {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     Write-Step "Running as      : $me"
@@ -301,8 +325,10 @@ try {
 
     $title = $Config.ReportTitle + ' [' + $Label + $(if ($Ticket) { ' ' + $Ticket } else { '' }) + ']'
 
+    $mailCandidates = @()
+
     foreach ($t in $targets) {
-        $row = [ordered]@{ Instance = $t.Instance; Result = ''; Critical = ''; Warnings = ''; MailProfile = ''; Report = ''; MailStatus = '' }
+        $row = [ordered]@{ Instance = $t.Instance; Result = ''; Critical = ''; Warnings = ''; Html = '' }
         Write-Step "`n--- $($t.Instance) ---" 'Green'
 
         if ($t.Status -notin @('Running', 'Listed')) {
@@ -317,53 +343,44 @@ try {
             $conn = New-SqlConnection $t.Instance
             $conn.Open()
 
-            $mailProfile = Get-MailProfileName $conn
-            if (-not $mailProfile) { throw 'No Database Mail profile exists on this instance - configure Database Mail first.' }
-            $row.MailProfile = $mailProfile
-            Write-Step "Mail profile    : $mailProfile"
+            $mailProfile = $null
+            try { $mailProfile = Get-MailProfileName $conn } catch { }
+            if ($mailProfile) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $mailProfile; Local = [bool]$t.Service } }
+            else { Write-Step 'Database Mail not configured / enabled here - another instance will send the email, if any.' 'Yellow' }
 
-            # Override the config block of script 44 for this run
+            # Run script 44 without its own email; return the HTML + counts
             $sql = $sqlTemplate
-            $sql = Set-SqlConfigValue $sql '(@SendEmail\s+bit\s*=\s*)\d'                                    '1'  '@SendEmail'
-            $sql = Set-SqlConfigValue $sql '(@ShowResultSets\s+bit\s*=\s*)\d'                               '0'  '@ShowResultSets'
-            $sql = Set-SqlConfigValue $sql '(@SendOnlyIfIssues\s+bit\s*=\s*)\d'                             '0'  '@SendOnlyIfIssues'
-            $sql = Set-SqlConfigValue $sql "(@MailProfile\s+sysname\s*=\s*)N'(?:[^']|'')*'"                 (ConvertTo-SqlLiteral $mailProfile)                 '@MailProfile'
-            $sql = Set-SqlConfigValue $sql "(@Recipients\s+nvarchar\(max\)\s*=\s*)N'(?:[^']|'')*'"          (ConvertTo-SqlLiteral $Config.Recipients)       '@Recipients'
-            $sql = Set-SqlConfigValue $sql "(@CopyRecipients\s+nvarchar\(max\)\s*=\s*)(?:NULL|N'(?:[^']|'')*')" (ConvertTo-SqlLiteral $Config.CopyRecipients) '@CopyRecipients'
-            $sql = Set-SqlConfigValue $sql "(@ReportTitle\s+nvarchar\(200\)\s*=\s*)N'(?:[^']|'')*'"         (ConvertTo-SqlLiteral $title)                   '@ReportTitle'
-            $sql += "`r`nSELECT @html AS html_report;`r`n"      # return the report so we can save it
-
-            # Capture PRINT output from the script
-            $script:messages = New-Object System.Collections.ArrayList
-            $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] { param($src, $e) [void]$script:messages.Add($e.Message) }
-            $conn.add_InfoMessage($handler)
+            $sql = Set-SqlConfigValue $sql '(@SendEmail\s+bit\s*=\s*)\d'                            '0' '@SendEmail'
+            $sql = Set-SqlConfigValue $sql '(@ShowResultSets\s+bit\s*=\s*)\d'                       '0' '@ShowResultSets'
+            $sql = Set-SqlConfigValue $sql '(@SendOnlyIfIssues\s+bit\s*=\s*)\d'                     '0' '@SendOnlyIfIssues'
+            $sql = Set-SqlConfigValue $sql "(@ReportTitle\s+nvarchar\(200\)\s*=\s*)N'(?:[^']|'')*'" (ConvertTo-SqlLiteral $title) '@ReportTitle'
+            $sql += "`r`nSELECT @html AS html_report, @crit AS crit_count, @warn AS warn_count;`r`n"
 
             $cmd = $conn.CreateCommand()
             $cmd.CommandText    = $sql
             $cmd.CommandTimeout = $Config.QueryTimeoutSec
-            Write-Step 'Collecting health check data and sending email...'
+            Write-Step 'Collecting health check data...'
             $reader = $cmd.ExecuteReader()
             $html = $null
             do {
                 if ($reader.FieldCount -gt 0 -and $reader.GetName(0) -eq 'html_report') {
-                    while ($reader.Read()) { if (-not $reader.IsDBNull(0)) { $html = $reader.GetString(0) } }
+                    while ($reader.Read()) {
+                        if (-not $reader.IsDBNull(0)) { $html = $reader.GetString(0) }
+                        $row.Critical = [string]$reader.GetValue(1); $row.Warnings = [string]$reader.GetValue(2)
+                    }
                 }
                 else { while ($reader.Read()) { } }
             } while ($reader.NextResult())
             $reader.Close()
 
-            $script:messages | ForEach-Object { Write-Host "  $_" }
-            $sentMsg = $script:messages | Where-Object { $_ -like 'Health check email queued*' } | Select-Object -First 1
-            if ($sentMsg -and $sentMsg -match '\((\d+) critical, (\d+) warnings\)') { $row.Critical = $Matches[1]; $row.Warnings = $Matches[2] }
-
-            if ($html) {
-                $fileName = (Get-SafeFileName $t.Instance) + '_' + $Label + $(if ($Ticket) { '_' + $Ticket } else { '' }) + '_' + (Get-Date -Format 'yyyyMMdd_HHmm') + '.html'
-                $path = Join-Path $Config.ReportsFolder $fileName
-                [System.IO.File]::WriteAllText($path, $html, [System.Text.Encoding]::UTF8)
-                $row.Report = $path
-                Write-Step "Saved report    : $path"
+            if (-not $html) { throw 'The health check returned no report.' }
+            $row.Html = $html
+            $row.Result = if ([int]$row.Critical -gt 0) { 'CRITICAL' } elseif ([int]$row.Warnings -gt 0) { 'WARNING' } else { 'OK' }
+            Write-Step "Result          : $($row.Result) ($($row.Critical) critical, $($row.Warnings) warnings)" $(if ($row.Result -eq 'OK') { 'Green' } else { 'Yellow' })
+            if ($Config.PerInstanceReports) {
+                $p = Join-Path $Config.ReportsFolder ((Get-SafeFileName $t.Instance) + '_' + $Label + $(if ($Ticket) { '_' + $Ticket } else { '' }) + '_' + (Get-Date -Format 'yyyyMMdd_HHmm') + '.html')
+                [System.IO.File]::WriteAllText($p, $html, [System.Text.Encoding]::UTF8)
             }
-            $row.Result = if ($sentMsg) { 'EMAIL QUEUED' } else { 'RAN - email not confirmed (see messages)' }
         }
         catch {
             $row.Result = 'FAILED: ' + $_.Exception.Message
@@ -372,34 +389,96 @@ try {
                 Write-Step "  -> $me has no login on $($t.Instance). Use the account you use for SSMS (cancel = current user)." 'Yellow'
             }
         }
-        finally {
-            if ($conn) { $conn.Dispose() }
-        }
+        finally { if ($conn) { $conn.Dispose() } }
         $summary += [pscustomobject]$row
     }
 
-    # Check Database Mail actually delivered (sent / failed / unsent)
-    $queued = $summary | Where-Object { $_.Result -eq 'EMAIL QUEUED' }
-    if ($queued) {
-        Write-Step "`nWaiting $($Config.MailCheckDelaySec)s to check Database Mail delivery..."
-        Start-Sleep -Seconds $Config.MailCheckDelaySec
-        foreach ($s in $queued) {
-            $c = $null
-            try {
-                $c = New-SqlConnection $s.Instance; $c.Open()
-                $q = @"
-SELECT TOP (1) sent_status + CASE WHEN sent_status = 'failed'
-       THEN ' - ' + ISNULL((SELECT TOP (1) LEFT(l.description, 200) FROM msdb.dbo.sysmail_event_log l WHERE l.mailitem_id = a.mailitem_id ORDER BY l.log_id DESC), '') ELSE '' END
-FROM msdb.dbo.sysmail_allitems AS a
-WHERE a.subject LIKE '%' + @t + '%' AND a.send_request_date >= DATEADD(MINUTE, -30, GETDATE())
-ORDER BY a.mailitem_id DESC;
-"@
-                $st = Invoke-Scalar $c $q @{ '@t' = $title }
-                $s.MailStatus = if ($st -is [DBNull] -or -not $st) { 'not found' } else { [string]$st }
+    # =========================================================================
+    #  ONE COMBINED REPORT + ONE EMAIL FOR THE WHOLE VM
+    # =========================================================================
+    $nCrit = @($summary | Where-Object { $_.Result -eq 'CRITICAL' -or $_.Result -like 'FAILED*' -or $_.Result -like 'SKIPPED*' }).Count
+    $nWarn = @($summary | Where-Object { $_.Result -eq 'WARNING' }).Count
+    $tag   = if ($nCrit -gt 0) { 'CRITICAL' } elseif ($nWarn -gt 0) { 'WARNING' } else { 'OK' }
+    $bannerColor = switch ($tag) { 'CRITICAL' { '#f8d7da' } 'WARNING' { '#fff3cd' } default { '#d4edda' } }
+
+    # <head> (styles) from the first instance report, plus an instance heading style
+    $firstHtml = ($summary | Where-Object { $_.Html } | Select-Object -First 1).Html
+    $head = if ($firstHtml -and $firstHtml -match '(?s)^(.*?)<body[^>]*>') { $Matches[1] } else { '<html><head></head>' }
+    $head = $head -replace '</head>', '<style>h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:28px 0 6px 0} .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}</style></head>'
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<h2>$(Enc $title) - $(Enc $env:COMPUTERNAME)</h2>")
+    [void]$sb.Append("<div class='banner' style='background:$bannerColor'>$tag - $($summary.Count) instance(s): $nCrit critical / failed, $nWarn with warnings</div>")
+    [void]$sb.Append("<div>Run by $(Enc $me) at $(Get-Date -Format 'yyyy-MM-dd HH:mm')</div><h3>Summary</h3><table><tr><th>Instance</th><th>Result</th><th>Critical</th><th>Warnings</th></tr>")
+    foreach ($r in $summary) {
+        $style = if ($r.Result -eq 'OK') { '' } elseif ($r.Result -eq 'WARNING') { " style='background-color:#fff3cd'" } else { " style='background-color:#f8d7da'" }
+        [void]$sb.Append("<tr$style><td>$(Enc $r.Instance)</td><td>$(Enc $r.Result)</td><td>$(Enc $r.Critical)</td><td>$(Enc $r.Warnings)</td></tr>")
+    }
+    [void]$sb.Append('</table>')
+    $header = $sb.ToString()
+
+    $fullParts = @(); $shortParts = @()
+    foreach ($r in $summary) {
+        $body = if ($r.Html -and $r.Html -match '(?s)<body[^>]*>(.*)</body>') { $Matches[1] } else { "<div class='banner' style='background:#f8d7da'>$(Enc $r.Result)</div>" }
+        $fullParts += "<h1>$(Enc $r.Instance)</h1>" + $body
+        # email body: only each instance's "Needs attention" table
+        $attn = if ($r.Html -and $r.Html -match '(?s)(<h3>Needs attention</h3>.*?</table>)') { $Matches[1] } else { "<div class='banner' style='background:#f8d7da'>$(Enc $r.Result)</div>" }
+        $shortParts += "<h1>$(Enc $r.Instance)</h1>" + $attn
+    }
+    $combinedHtml = $head + '<body>' + $header + ($fullParts -join '') + '</body></html>'
+    $combinedFile = Join-Path $Config.ReportsFolder ((Get-SafeFileName $env:COMPUTERNAME) + '_' + $Label + $(if ($Ticket) { '_' + $Ticket } else { '' }) + '_' + (Get-Date -Format 'yyyyMMdd_HHmm') + '.html')
+    [System.IO.File]::WriteAllText($combinedFile, $combinedHtml, [System.Text.Encoding]::UTF8)
+    Write-Step "`nCombined report : $combinedFile" 'Green'
+
+    $subject = "[$tag] $title - $env:COMPUTERNAME - $($summary.Count) instance(s) - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+    $importance = if ($tag -eq 'CRITICAL') { 'High' } else { 'Normal' }
+    $sender = @($mailCandidates | Sort-Object @{ Expression = { -not $_.Local } }) | Select-Object -First 1
+    if (-not $sender) {
+        $mailStatus = 'Not sent - no instance with Database Mail'
+        Write-Step 'No instance has Database Mail configured/enabled - email not sent.' 'Yellow'
+    }
+    else {
+        $c = $null
+        try {
+            $c = New-SqlConnection $sender.Instance; $c.Open()
+            $sizeBytes = (Get-Item -LiteralPath $combinedFile).Length
+            $maxBytes = 0
+            try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
+            $attach = $Config.AttachReport -and ($maxBytes -le 0 -or $sizeBytes -le $maxBytes)
+            if ($Config.AttachReport -and -not $attach) { Write-Step ("Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) - sending it in the email body instead." -f ($sizeBytes / 1KB), ($maxBytes / 1KB)) 'Yellow' }
+            $mailId = $null
+            if ($attach) {
+                try {
+                    $shortHtml = $head + '<body>' + $header + ($shortParts -join '') + "<p style='color:#555'>The full report for every instance is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
+                    $mailId = Send-DbMail $c $sender.Profile $subject $shortHtml $importance $combinedFile
+                    $mailStatus = 'Queued with attachment'
+                }
+                catch {
+                    Write-Step "Attachment not possible ($($_.Exception.Message)) - sending the full report in the email body instead." 'Yellow'
+                    Write-Step '  (the SQL Server service account must be able to read the Reports folder on a local disk)' 'DarkGray'
+                }
             }
-            catch { $s.MailStatus = 'check failed: ' + $_.Exception.Message }
-            finally { if ($c) { $c.Dispose() } }
+            if (-not $mailId) {
+                $mailId = Send-DbMail $c $sender.Profile $subject $combinedHtml $importance
+                $mailStatus = 'Queued (report in body)'
+            }
+            Write-Step "Email queued    : mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)'" 'Green'
+
+            Write-Step "Waiting $($Config.MailCheckDelaySec)s to check Database Mail delivery..."
+            Start-Sleep -Seconds $Config.MailCheckDelaySec
+            $q = @"
+SELECT a.sent_status + CASE WHEN a.sent_status = 'failed'
+       THEN ' - ' + ISNULL((SELECT TOP (1) LEFT(l.description, 200) FROM msdb.dbo.sysmail_event_log l WHERE l.mailitem_id = a.mailitem_id ORDER BY l.log_id DESC), '') ELSE '' END
+FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
+"@
+            $st = Invoke-Scalar $c $q @{ '@id' = $mailId }
+            $mailStatus = "$mailStatus - " + $(if ($null -eq $st -or $st -is [DBNull]) { 'status not found' } else { [string]$st })
         }
+        catch {
+            $mailStatus = 'Send failed: ' + $_.Exception.Message
+            Write-Step "WARNING: email not sent - $($_.Exception.Message)" 'Yellow'
+        }
+        finally { if ($c) { $c.Dispose() } }
     }
 }
 catch {
@@ -407,10 +486,14 @@ catch {
 }
 finally {
     Write-Step "`n=== SUMMARY ===" 'Green'
-    if ($summary) { $summary | Format-Table Instance, Result, Critical, Warnings, MailProfile, MailStatus -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
-    Write-Step "Reports folder  : $($Config.ReportsFolder)"
+    if ($summary) { $summary | Format-Table Instance, Result, Critical, Warnings -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+    Write-Step "Email           : $mailStatus"
+    Write-Step "Report          : $combinedFile"
     Write-Step "Log file        : $logFile"
-    Write-Step "MailStatus 'unsent' = still queued (check again later); 'failed' = see msdb.dbo.sysmail_event_log." 'DarkGray'
+    if ($combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
+        Write-Step 'Opening the combined report...' 'Yellow'
+        try { Invoke-Item -LiteralPath $combinedFile } catch { }
+    }
     try { Stop-Transcript | Out-Null } catch { }
     Read-Host "`nPress Enter to close"
 }

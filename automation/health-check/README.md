@@ -1,6 +1,11 @@
 # One-click health check (all instances on a VM)
 
-Runs [`scripts/44_health_check_report_email.sql`](../../scripts/44_health_check_report_email.sql) against **every SQL Server instance on the VM**. For each instance it emails the full HTML report through that instance's **Database Mail** profile and saves a timestamped copy locally, so you can compare reports from before and after a change.
+Runs [`scripts/44_health_check_report_email.sql`](../../scripts/44_health_check_report_email.sql) against **every SQL Server instance on the VM**. All instances go into **one combined HTML report**, `Reports\<VM>_<label>_<ticket>_<time>.html`, which starts with a summary table (one row per instance). **One email** is sent through the first instance with working Database Mail, local instances first:
+- The **email body** has the summary plus each instance's *Needs attention* table.
+- The **full report is attached**. If it can't be attached, because it's over Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the whole report goes in the email body instead.
+- If no instance has Database Mail, the report opens in your browser.
+
+The subject shows the worst result on the VM: `[CRITICAL]`, `[WARNING]` or `[OK]`. In `$Config`, `PerInstanceReports = $true` also saves one file per instance, and `AttachReport = $false` always puts the report in the body.
 
 ## Files
 
