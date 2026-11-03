@@ -67,6 +67,8 @@ $Config = @{
     QueryTimeoutSec       = 900
     Encrypt               = $false
     MailCheckDelaySec     = 20
+    AttachReport          = $true    # attach the combined HTML report to the email (falls back to the email body)
+    PerInstanceReports    = $false   # also save one HTML file per instance
 }
 
 $ErrorActionPreference = 'Stop'
@@ -77,7 +79,7 @@ if ($Instances) { $Instances = @($Instances -split ',' | ForEach-Object { $_.Tri
 # What to compare per section: Key = identifies a row, Compare = must be equal,
 # Expected = may change (listed as expected), Drift = numeric tolerance rule.
 $Spec = [ordered]@{
-    instance       = @{ Title = 'Instance';            Key = @('property_code'); Compare = @('value'); ExpectedKeys = @('build', 'sp_level', 'cu', 'kb', 'start_time') }
+    instance       = @{ Title = 'Instance';            Key = @('property_code'); Compare = @('value'); ExpectedKeys = @('build', 'sp_level', 'cu', 'kb', 'start_time', 'os_boot_time'); IgnoreKeys = @('sql_uptime', 'os_uptime') }
     services       = @{ Title = 'SQL Server services'; Key = @('servicename');   Compare = @('status', 'startup_type', 'service_account', 'ifi'); Expected = @('last_startup') }
     config         = @{ Title = 'sp_configure';        Key = @('name');          Compare = @('value_in_use') }
     traceflags     = @{ Title = 'Global trace flags';  Key = @('trace_flag');    Compare = @() }
@@ -89,6 +91,7 @@ $Spec = [ordered]@{
     ag_replicas    = @{ Title = 'Always On replicas';  Key = @('ag_name', 'replica_node');
                         Compare = @('primary_replica', 'role', 'availability_mode', 'failover_mode', 'connected_state', 'sync_health', 'readable',
                                     'endpoint_url', 'backup_priority', 'listeners') }
+    ag_listeners   = @{ Title = 'Always On listeners'; Key = @('ag_name', 'listener', 'ip_address'); Compare = @('port', 'subnet_mask', 'ip_type', 'network_subnet', 'ip_state', 'is_conformant') }
     ag_databases   = @{ Title = 'Always On databases'; Key = @('ag_name', 'database_name', 'replica_node'); Compare = @('role', 'sync_state', 'sync_health', 'is_suspended') }
     cluster        = @{ Title = 'Cluster & quorum';    Key = @('member_name');   Compare = @('quorum_type', 'quorum_state', 'member_type', 'member_state', 'votes') }
     disks          = @{ Title = 'Disks';               Key = @('volume');        Compare = @('total_gb'); Drift = @{ free_gb = 'disk' } }
@@ -112,7 +115,7 @@ $Spec = [ordered]@{
 # Order + titles for the full report in the email
 $ReportSections = [ordered]@{
     issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases, backups & CHECKDB'
-    ag_replicas = 'Always On - replicas (nodes)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
+    ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
     files = 'Data & log files'; jobs = 'Agent jobs'; job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
     traceflags = 'Global trace flags'; config = 'sp_configure'; logins = 'Logins'; server_roles = 'Server role members'
     linked_servers = 'Linked servers'; endpoints = 'Endpoints'; certificates = 'Certificates'; xe_sessions = 'XE sessions'
@@ -378,6 +381,7 @@ function Compare-Snapshots($Pre, $Post) {
         }
         foreach ($k in $preMap.Keys) {
             if (-not $postMap.ContainsKey($k)) { continue }
+            if ($sp.IgnoreKeys -and ($sp.IgnoreKeys -contains $k)) { continue }
             $a = $preMap[$k]; $b = $postMap[$k]
             foreach ($col in $sp.Compare) {
                 $va = Get-Val $a $col; $vb = Get-Val $b $col
@@ -465,14 +469,14 @@ function Get-FullReportHtml($Snap) {
 $HtmlHead = @'
 <html><head><style>
 body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
-h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
+h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
 table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
 td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
 </style></head><body>
 '@
 
-function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [string]$Html, [string]$Importance) {
+function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [string]$Html, [string]$Importance, [string]$Attachment = '') {
     $cmd = $Connection.CreateCommand()
     $cmd.CommandText = 'msdb.dbo.sp_send_dbmail'
     $cmd.CommandType = [System.Data.CommandType]::StoredProcedure
@@ -484,6 +488,7 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
     $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
     [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
     [void]$cmd.Parameters.AddWithValue('@importance', $Importance)
+    if ($Attachment) { [void]$cmd.Parameters.AddWithValue('@file_attachments', $Attachment) }
     $pMailItemId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pMailItemId.Direction = [System.Data.ParameterDirection]::Output
     [void]$cmd.ExecuteNonQuery()
     return [int]$pMailItemId.Value
@@ -550,6 +555,8 @@ $logFile = Join-Path $Config.LogsFolder "PrePostCheck_${Phase}_${Ticket}_$stamp.
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { }
 
 $summary = @()
+$combinedFile = $null
+$mailStatus = 'Not sent'
 try {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     Write-Step "Running as : $me"
@@ -568,11 +575,17 @@ try {
         catch { Write-Step "WARNING: SSIS/SSRS/SSAS collection failed: $($_.Exception.Message)" 'Yellow' }
     }
 
+    $diffCols  = @('Section', 'Item', 'Attribute', 'Before', 'After', 'Note')
+    $issueCols = @('severity', 'area', 'item', 'detail')
+    $mailCandidates = @()      # instances with a usable Database Mail profile (local ones first)
+
     foreach ($t in $targets) {
-        $row = [ordered]@{ Instance = $t.Instance; Outcome = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; MailId = $null; MailStatus = ''; Report = '' }
+        $row = [ordered]@{ Instance = $t.Instance; Outcome = ''; State = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; ShortHtml = ''; FullHtml = '' }
         Write-Step "`n--- $($t.Instance) ---" 'Green'
         if ($t.Status -notin @('Running', 'Listed')) {
-            $row.Outcome = "SKIPPED - service $($t.Service) is $($t.Status)"
+            $row.Outcome = "SKIPPED - service $($t.Service) is $($t.Status)"; $row.State = 'FAILED'
+            $row.ShortHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
+            $row.FullHtml = $row.ShortHtml
             Write-Step $row.Outcome 'Red'; $summary += [pscustomobject]$row; continue
         }
         $conn = $null
@@ -581,12 +594,8 @@ try {
             $profileName = $null
             try { $profileName = Get-MailProfileName $conn }
             catch { Write-Step "WARNING: could not read Database Mail profiles on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
-
-            if (-not $profileName) {
-                Write-Step "WARNING: Database Mail is not configured on $($t.Instance)." 'Yellow'
-                Write-Step 'Continuing with snapshot collection and report generation (report saved locally, no email).' 'Yellow'
-                $row.MailStatus = 'Database Mail Not Configured'
-            }
+            if ($profileName) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $profileName; Local = [bool]$t.Service } }
+            else { Write-Step "Database Mail is not configured / enabled on $($t.Instance) - another instance will be used to send, if any." 'Yellow' }
 
             Write-Step 'Collecting snapshot...'
             $data = Get-Snapshot $conn $sqlText
@@ -608,27 +617,27 @@ try {
             }
             $safe = Get-SafeFileName $t.Instance
             $snapFile = Join-Path $ticketDir ("{0}_{1}_{2}.json" -f $safe, $Phase, $stamp)
-            # ConvertTo-Json copes with PowerShell-wrapped values (JavaScriptSerializer.Serialize does not);
-            # ConvertTo-PlainObject strips extra PowerShell note properties first. Files are read back with $Json.DeserializeObject.
             $jsonText = ConvertTo-Json -InputObject (ConvertTo-PlainObject $snap) -Depth 20 -Compress
             [System.IO.File]::WriteAllText($snapFile, $jsonText, [System.Text.Encoding]::UTF8)
             Write-Step "Snapshot saved : $snapFile"
             $issues = @(Get-Rows $snap 'issues')
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
             $warn = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'WARNING' }).Count
+            $fullReport = [string](Get-FullReportHtml $snap)
 
-            $now = Get-Date -Format 'yyyy-MM-dd HH:mm'
             if ($Phase -eq 'PRE') {
                 $color = if ($crit -gt 0) { '#f8d7da' } elseif ($warn -gt 0) { '#fff3cd' } else { '#d4edda' }
-                $html = $HtmlHead +
-                        "<h2>$(Enc $Config.ReportTitle) - PRE snapshot - $(Enc $t.Instance)</h2>" +
-                        "<div class='banner' style='background:$color'>PRE snapshot captured for $(Enc $Ticket) at $now by $(Enc $me). " +
-                        "Current state: $crit critical, $warn warning(s) - these will NOT count as new problems in the POST check.</div>" +
-                        "<div>Build: $(Enc $snap.meta.build) &nbsp;|&nbsp; Stored on $(Enc $env:COMPUTERNAME): $(Enc $snapFile)</div>" +
-                        (Get-FullReportHtml $snap) + '</body></html>'
-                $subject = "[PRE CAPTURED] $($Config.ReportTitle) [$Ticket] - $($t.Instance) - $now"
-                $importance = 'Normal'
-                $row.Outcome = 'PRE CAPTURED'
+                $row.Outcome = 'PRE CAPTURED'; $row.State = 'PRE'
+                $row.Expected = "$crit critical, $warn warning(s)"
+                $row.ShortHtml = (@(
+                    "<h1>$(Enc $t.Instance)</h1>"
+                    "<div class='banner' style='background:$color'>PRE snapshot captured. Current state: $crit critical, $warn warning(s) - these will NOT count as new problems in the POST check.</div>"
+                    "<div>Build: $(Enc $snap.meta.build) &nbsp;|&nbsp; Snapshot: $(Enc $snapFile)</div>"
+                    "<h3>Needs attention now ($($issues.Count))</h3>"
+                    [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
+                ) -join '')
+                $row.FullHtml = $row.ShortHtml + $fullReport
+                Write-Step $row.Outcome 'Green'
             }
             else {
                 # ---- find the PRE baseline -------------------------------------------------
@@ -655,15 +664,12 @@ try {
                     $row.Unexpected = $nU; $row.NewProblems = $nN; $row.Expected = $nE
                     $ok = ($nU + $nN) -eq 0
                     $row.Outcome = if ($ok) { 'SUCCESS - no differences' } else { 'DIFFERENCES FOUND' }
+                    $row.State = if ($ok) { 'SUCCESS' } else { 'DIFF' }
                     $color = if ($ok) { '#d4edda' } else { '#f8d7da' }
-                    $bannerText = if ($ok) { "SUCCESS - no unexpected differences between PRE and POST, and no new problems." }
-                                  else { "DIFFERENCES FOUND - $nU unexpected difference(s), $nN new problem(s) after the change. Review before closing $Ticket." }
-                    $diffCols = @('Section', 'Item', 'Attribute', 'Before', 'After', 'Note')
-                    $issueCols = @('severity', 'area', 'item', 'detail')
-                    # Built as a list of strings and joined - avoids PowerShell '+' type coercion
-                    $parts = @(
-                        [string]$HtmlHead
-                        "<h2>$(Enc $Config.ReportTitle) - POST check - $(Enc $t.Instance)</h2>"
+                    $bannerText = if ($ok) { 'SUCCESS - no unexpected differences between PRE and POST, and no new problems.' }
+                                  else { "DIFFERENCES FOUND - $nU unexpected difference(s), $nN new problem(s) after the change." }
+                    $row.ShortHtml = (@(
+                        "<h1>$(Enc $t.Instance)</h1>"
                         "<div class='banner' style='background:$color'>$(Enc $bannerText)</div>"
                         "<table><tr><th></th><th>PRE (before)</th><th>POST (after)</th></tr>"
                         "<tr><td>Ticket</td><td>$(Enc $pre['meta']['ticket'])</td><td>$(Enc $Ticket)</td></tr>"
@@ -678,51 +684,33 @@ try {
                         [string](ConvertTo-HtmlTable $cmp.Expected $diffCols 'background-color:#eef3f8')
                         "<h3>Problems that already existed before the change ($($cmp.OldProblems.Count))</h3>"
                         [string](ConvertTo-HtmlTable $cmp.OldProblems $issueCols 'background-color:#fff3cd')
-                        "<p style='color:#777'>Tolerances: file/DB size &gt; $($Config.FileSizeDriftPct)% and &gt; $($Config.FileSizeDriftMinMB) MB; disk free space &gt; $($Config.DiskFreeDriftPct)% of disk. "
-                        "AG primary / role changes are flagged on purpose. Run POST after AG databases are SYNCHRONIZED.</p>"
-                        "<h2>Full POST report</h2>"
-                        [string](Get-FullReportHtml $snap)
-                        '</body></html>'
-                    )
-                    $html = $parts -join ''
-                    $subject = if ($ok) { "[POST SUCCESS] $($Config.ReportTitle) [$Ticket] - $($t.Instance) - no differences" }
-                               else { "[POST DIFFERENCES] $($Config.ReportTitle) [$Ticket] - $($t.Instance) - $nU difference(s), $nN new problem(s)" }
-                    $importance = if ($ok) { 'Normal' } else { 'High' }
+                    ) -join '')
+                    $row.FullHtml = $row.ShortHtml + '<h2>Full POST report</h2>' + $fullReport
                     Write-Step $row.Outcome $(if ($ok) { 'Green' } else { 'Red' })
                     if (-not $ok) { $cmp.Unexpected | Select-Object -First 25 | Format-Table Section, Item, Attribute, Before, After -AutoSize | Out-String -Width 220 | Write-Host }
                 }
                 else {
-                    $row.Outcome = 'NO BASELINE - POST report only'
-                    $html = $HtmlHead +
-                            "<h2>$(Enc $Config.ReportTitle) - POST check - $(Enc $t.Instance)</h2>" +
-                            "<div class='banner' style='background:#fff3cd'>NO BASELINE - no PRE snapshot found for this instance, so nothing could be compared. " +
-                            "Current state: $crit critical, $warn warning(s).</div>" + (Get-FullReportHtml $snap) + '</body></html>'
-                    $subject = "[POST NO BASELINE] $($Config.ReportTitle) [$Ticket] - $($t.Instance) - $crit critical, $warn warning(s)"
-                    $importance = 'High'
+                    $row.Outcome = 'NO BASELINE - POST report only'; $row.State = 'NOBASE'
+                    $row.ShortHtml = (@(
+                        "<h1>$(Enc $t.Instance)</h1>"
+                        "<div class='banner' style='background:#fff3cd'>NO BASELINE - no PRE snapshot found for this instance, so nothing could be compared. Current state: $crit critical, $warn warning(s).</div>"
+                        "<h3>Needs attention now ($($issues.Count))</h3>"
+                        [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
+                    ) -join '')
+                    $row.FullHtml = $row.ShortHtml + $fullReport
                     Write-Step $row.Outcome 'Yellow'
                 }
             }
 
-            $reportFile = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f $safe, $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
-            [System.IO.File]::WriteAllText($reportFile, $html, [System.Text.Encoding]::UTF8)
-            $row.Report = $reportFile
-            if ($profileName) {
-                try {
-                    $row.MailId = Send-DbMail $conn $profileName $subject $html $importance
-                    Write-Step "Email queued   : mailitem_id $($row.MailId) via profile '$profileName'"
-                }
-                catch {
-                    $row.MailStatus = 'Send failed: ' + $_.Exception.Message
-                    Write-Step "WARNING: email not sent - $($_.Exception.Message)" 'Yellow'
-                    Write-Step "Report is saved locally: $reportFile" 'Yellow'
-                }
-            }
-            else {
-                Write-Step "Email skipped  : no Database Mail - open the saved report: $reportFile" 'Yellow'
+            if ($Config.PerInstanceReports) {
+                $f = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f $safe, $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
+                [System.IO.File]::WriteAllText($f, ([string]$HtmlHead + $row.FullHtml + '</body></html>'), [System.Text.Encoding]::UTF8)
             }
         }
         catch {
-            $row.Outcome = 'FAILED: ' + $_.Exception.Message
+            $row.Outcome = 'FAILED: ' + $_.Exception.Message; $row.State = 'FAILED'
+            $row.ShortHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
+            $row.FullHtml = $row.ShortHtml
             Write-Step $row.Outcome 'Red'
             if ($_.Exception.Message -match 'Login failed') { Write-Step "  -> $me has no login on $($t.Instance). Use the account you use for SSMS." 'Yellow' }
         }
@@ -730,38 +718,100 @@ try {
         $summary += [pscustomobject]$row
     }
 
-    # Delivery check
-    $sent = @($summary | Where-Object { $_.MailId })
-    if ($sent.Count -gt 0) {
-        Write-Step "`nWaiting $($Config.MailCheckDelaySec)s to check Database Mail delivery..."
-        Start-Sleep -Seconds $Config.MailCheckDelaySec
-        foreach ($s in $sent) {
-            $c = $null
-            try {
-                $c = New-SqlConnection $s.Instance; $c.Open()
-                $q = @"
+    # =========================================================================
+    #  ONE COMBINED REPORT + ONE EMAIL FOR THE WHOLE VM
+    # =========================================================================
+    $states = @($summary | ForEach-Object { $_.State })
+    $nFail  = @($states | Where-Object { $_ -eq 'FAILED' }).Count
+    if ($Phase -eq 'PRE') {
+        $overall = if ($nFail -gt 0) { "PRE CAPTURED - $nFail instance(s) FAILED" } else { 'PRE CAPTURED' }
+        $overallColor = if ($nFail -gt 0) { '#f8d7da' } else { '#d4edda' }
+        $tag = 'PRE CAPTURED'; $importance = if ($nFail -gt 0) { 'High' } else { 'Normal' }
+    }
+    elseif ($states -contains 'DIFF')   { $overall = 'DIFFERENCES FOUND - review before closing the change'; $overallColor = '#f8d7da'; $tag = 'POST DIFFERENCES'; $importance = 'High' }
+    elseif ($states -contains 'NOBASE') { $overall = 'NO BASELINE for some instances - nothing to compare';  $overallColor = '#fff3cd'; $tag = 'POST NO BASELINE'; $importance = 'High' }
+    elseif ($nFail -gt 0)               { $overall = "INCOMPLETE - $nFail instance(s) FAILED";               $overallColor = '#f8d7da'; $tag = 'POST INCOMPLETE';  $importance = 'High' }
+    else                                { $overall = 'SUCCESS - no differences on any instance';             $overallColor = '#d4edda'; $tag = 'POST SUCCESS';     $importance = 'Normal' }
+
+    $summaryCols = if ($Phase -eq 'PRE') { @('Instance', 'Outcome') } else { @('Instance', 'Outcome', 'Unexpected', 'NewProblems', 'Expected', 'Baseline') }
+    $summaryRows = @($summary | ForEach-Object {
+        $st = switch ($_.State) { 'DIFF' { 'CRITICAL' } 'FAILED' { 'CRITICAL' } 'NOBASE' { 'WARNING' } default { '' } }
+        $o = [ordered]@{ status = $st }; foreach ($c in $summaryCols) { $o[$c] = [string]$_.$c }; [pscustomobject]$o })
+    $header = (@(
+        "<h2>$(Enc $Config.ReportTitle) - $Phase - $(Enc $env:COMPUTERNAME)</h2>"
+        "<div class='banner' style='background:$overallColor'>$(Enc $overall)</div>"
+        "<div>Ticket: <b>$(Enc $Ticket)</b> &nbsp;|&nbsp; Run by: $(Enc $me) &nbsp;|&nbsp; $(Get-Date -Format 'yyyy-MM-dd HH:mm') &nbsp;|&nbsp; Instances: $($summary.Count)</div>"
+        '<h3>Summary</h3>'
+        [string](ConvertTo-HtmlTable $summaryRows $summaryCols '' 'status')
+    ) -join '')
+    $combinedHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + '</body></html>'
+    $combinedFile = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f (Get-SafeFileName $env:COMPUTERNAME), $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    [System.IO.File]::WriteAllText($combinedFile, $combinedHtml, [System.Text.Encoding]::UTF8)
+    Write-Step "`nCombined report: $combinedFile" 'Green'
+
+    $subject = "[$tag] $($Config.ReportTitle) [$Ticket] - $env:COMPUTERNAME - $($summary.Count) instance(s)"
+    $sender = @($mailCandidates | Sort-Object @{ Expression = { -not $_.Local } }) | Select-Object -First 1
+    if (-not $sender) {
+        $mailStatus = 'Not sent - no instance with Database Mail'
+        Write-Step 'No instance has Database Mail configured/enabled - email not sent. Open the combined report instead.' 'Yellow'
+    }
+    else {
+        $c = $null
+        try {
+            $c = New-SqlConnection $sender.Instance; $c.Open()
+            $shortHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
+            $sizeBytes = (Get-Item -LiteralPath $combinedFile).Length
+            $maxBytes = 0
+            try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
+            $attach = $Config.AttachReport -and ($maxBytes -le 0 -or $sizeBytes -le $maxBytes)
+            if ($Config.AttachReport -and -not $attach) { Write-Step ("Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) - sending it in the email body instead." -f ($sizeBytes / 1KB), ($maxBytes / 1KB)) 'Yellow' }
+            $mailId = $null
+            if ($attach) {
+                try {
+                    $body = $shortHtml + "<p style='color:#555'>The full report for every instance is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
+                    $mailId = Send-DbMail $c $sender.Profile $subject $body $importance $combinedFile
+                    $mailStatus = 'Queued with attachment'
+                }
+                catch {
+                    Write-Step "Attachment not possible ($($_.Exception.Message)) - sending the full report in the email body instead." 'Yellow'
+                    Write-Step '  (the SQL Server service account must be able to read the Reports folder on a local disk)' 'DarkGray'
+                }
+            }
+            if (-not $mailId) {
+                $mailId = Send-DbMail $c $sender.Profile $subject $combinedHtml $importance
+                $mailStatus = 'Queued (report in body)'
+            }
+            Write-Step "Email queued   : mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)'" 'Green'
+
+            Write-Step "Waiting $($Config.MailCheckDelaySec)s to check Database Mail delivery..."
+            Start-Sleep -Seconds $Config.MailCheckDelaySec
+            $q = @"
 SELECT a.sent_status + CASE WHEN a.sent_status = 'failed'
        THEN ' - ' + ISNULL((SELECT TOP (1) LEFT(l.description, 200) FROM msdb.dbo.sysmail_event_log l WHERE l.mailitem_id = a.mailitem_id ORDER BY l.log_id DESC), '') ELSE '' END
 FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
 "@
-                $st = Invoke-Scalar $c $q @{ '@id' = $s.MailId }
-                $s.MailStatus = if ($null -eq $st -or $st -is [DBNull]) { 'not found' } else { [string]$st }
-            }
-            catch { $s.MailStatus = 'check failed: ' + $_.Exception.Message }
-            finally { if ($c) { $c.Dispose() } }
+            $st = Invoke-Scalar $c $q @{ '@id' = $mailId }
+            $mailStatus = "$mailStatus - " + $(if ($null -eq $st -or $st -is [DBNull]) { 'status not found' } else { [string]$st })
         }
+        catch {
+            $mailStatus = 'Send failed: ' + $_.Exception.Message
+            Write-Step "WARNING: email not sent - $($_.Exception.Message)" 'Yellow'
+        }
+        finally { if ($c) { $c.Dispose() } }
     }
 }
 catch { Write-Step ('ERROR: ' + $_.Exception.Message) 'Red' }
 finally {
     Write-Step "`n=== SUMMARY ($Phase / $Ticket) ===" 'Green'
-    if ($summary) { $summary | Format-Table Instance, Outcome, Unexpected, NewProblems, Expected, Baseline, MailStatus -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+    if ($summary) { $summary | Format-Table Instance, Outcome, Unexpected, NewProblems, Expected, Baseline -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+    Write-Step "Email     : $mailStatus"
     Write-Step "Snapshots : $(Join-Path $Config.SnapshotRoot $Ticket)"
     Write-Step "Reports   : $($Config.ReportsFolder)"
-    # No email for an instance (Database Mail missing/off or send failed): open its saved report in the browser
-    foreach ($r in @($summary | Where-Object { -not $_.MailId -and $_.Report -and (Test-Path -LiteralPath $_.Report) })) {
-        Write-Step "Opening report : $($r.Report)" 'Yellow'
-        try { Invoke-Item -LiteralPath $r.Report } catch { Write-Step "Could not open it: $($_.Exception.Message)" 'Yellow' }
+    Write-Step "Report    : $combinedFile"
+    # No email sent: open the combined report in the browser
+    if ($combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
+        Write-Step 'Opening the combined report...' 'Yellow'
+        try { Invoke-Item -LiteralPath $combinedFile } catch { Write-Step "Could not open it: $($_.Exception.Message)" 'Yellow' }
     }
     Write-Step "Log       : $logFile"
     try { Stop-Transcript | Out-Null } catch { }
