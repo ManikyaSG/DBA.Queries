@@ -1,5 +1,7 @@
 # One-click health check (all instances on a VM)
 
+> **Superseded:** the PRE/POST tool in [`automation/pre-post-check`](../pre-post-check/README.md) now also does the health check (`Run-HealthCheck.bat` there, or `-Phase HEALTH`) using only `HC_Snapshot.sql`. Use that instead. This folder (based on script 44) is kept for reference only.
+
 Runs [`scripts/44_health_check_report_email.sql`](../../scripts/44_health_check_report_email.sql) against **every SQL Server instance on the VM**. All instances go into **one combined HTML report**, `Reports\<VM>_<label>_<ticket>_<time>.html`, which starts with a summary table (one row per instance). **One email** is sent through the first instance with working Database Mail, local instances first:
 - The **email body** has the summary plus each instance's *Needs attention* table.
 - The **full report is attached**. If it can't be attached, because it's over Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the whole report goes in the email body instead.
