@@ -10,9 +10,10 @@
     RDP in with the generic admin account and double-click Run-PrePostCheck.bat:
       1. Choose PRE or POST and enter the change ticket.
       2. Enter YOUR Windows account (as for SSMS "Run as different user"); the script
-         opens each SQL connection as you (no Secondary Logon service needed). If your
-         account can't log in to an instance or lacks VIEW SERVER STATE there, the
-         logged-in RDP account is used for that instance. Cancel = RDP account only.
+         starts the Secondary Logon service if needed and relaunches itself as you.
+         Fail-safe: any instance your account can't log in to (or has no VIEW SERVER
+         STATE on) is retried as the logged-in RDP account, and if run-as can't start
+         at all, your account is used from this window. Cancel = RDP account only.
       3. Every SQL instance on the VM (+ servers.txt) is checked.
     Snapshots : Snapshots\<ticket>\<instance>_PRE|POST_<yyyyMMdd_HHmmss>.json
     Reports   : Reports\<instance>_<PRE|POST>_<ticket>_<yyyyMMdd_HHmm>.html
@@ -46,7 +47,8 @@ param(
     [switch]   $UseCurrentUser,
     [string[]] $Instances,
     [string]   $SqlFile,
-    [switch]   $Inner
+    [switch]   $Inner,
+    [string]   $HandOff               # internal: result file shared with the original (RDP) window
 )
 
 # =============================================================================
@@ -157,6 +159,37 @@ function ConvertTo-PlainObject($InputObject) {
 
 function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 
+function Start-SecondaryLogonService {
+    # "Run as different user" / Start-Process -Credential need the Secondary Logon service (seclogon).
+    # Starts it if stopped; if it is Disabled, sets it to Manual first. Needs local admin - if this
+    # window is not elevated, a UAC prompt starts it. Returns $true when the service is running.
+    $svc = Get-Service -Name seclogon -ErrorAction SilentlyContinue
+    if (-not $svc) { Write-Step 'WARNING: Secondary Logon service (seclogon) not found on this VM.' 'Yellow'; return $false }
+    if ($svc.Status -eq 'Running') { Write-Step 'Secondary Logon service: running'; return $true }
+
+    $startType = (Get-CimInstance -ClassName Win32_Service -Filter "Name='seclogon'" -ErrorAction SilentlyContinue).StartMode
+    Write-Step "Secondary Logon service is $($svc.Status) (startup: $startType) - starting it..." 'Yellow'
+    try {
+        if ($startType -eq 'Disabled') { Set-Service -Name seclogon -StartupType Manual -ErrorAction Stop }
+        Start-Service -Name seclogon -ErrorAction Stop
+    }
+    catch {
+        Write-Step 'Not running elevated - approve the UAC prompt to start the Secondary Logon service.' 'Yellow'
+        $cmd = "if ((Get-CimInstance Win32_Service -Filter `"Name='seclogon'`").StartMode -eq 'Disabled') { Set-Service seclogon -StartupType Manual }; Start-Service seclogon"
+        try { Start-Process -FilePath "$PSHOME\powershell.exe" -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList @('-NoProfile', '-Command', $cmd) }
+        catch { Write-Step "Could not elevate: $($_.Exception.Message)" 'Red' }
+    }
+    $svc = Get-Service -Name seclogon
+    for ($i = 0; $i -lt 10 -and $svc.Status -ne 'Running'; $i++) { Start-Sleep -Seconds 1; $svc.Refresh() }
+    if ($svc.Status -eq 'Running') {
+        Write-Step 'Secondary Logon service: started' 'Green'
+        if ($startType -eq 'Disabled') { Write-Step 'NOTE: its startup type was Disabled and is now Manual (needed for Run as different user).' 'Yellow' }
+        return $true
+    }
+    Write-Step 'WARNING: Secondary Logon service could not be started - running as a different user will fail.' 'Red'
+    return $false
+}
+
 function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s,]', '_') }
 function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
 
@@ -223,9 +256,10 @@ function New-SqlConnection([string]$Instance) {
     return New-Object System.Data.SqlClient.SqlConnection $cs
 }
 
-# ---- Run SQL as YOUR account without "Run as different user" (no Secondary Logon service needed) ----
-# The script runs as the RDP user; connections are opened while impersonating the account you key in.
-# If that account can't log in to an instance (or lacks VIEW SERVER STATE), the RDP user is tried instead.
+# ---- Fail-safe connections ----
+# Normal path: the script relaunches itself as YOUR account (Secondary Logon) and connects as you.
+# Fail-safe 1: if the relaunch can't start, this window logs on as you in-process (impersonation).
+# Fail-safe 2: instances your account can't use are retried as the logged-in RDP account.
 if (-not ('DbaLogon' -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -240,6 +274,10 @@ public static class DbaLogon {
 }
 $script:ImpIdentity = $null
 $script:ImpUser     = $null
+$script:RetryErrors = $null   # set in the original window when the run-as window hands instances back
+$script:HandOffRows = $null
+$script:HandOffMail = $null
+$script:KeyedUser   = $null
 
 function Connect-AsUser([pscredential]$Credential) {
     # Returns $true if the keyed-in Windows account could be logged on (password / logon rights OK).
@@ -267,11 +305,12 @@ function Test-SqlAccess($Connection) {
     try { return ([int](Invoke-Scalar $Connection "SELECT ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0);") -eq 1) } catch { return $false }
 }
 
-function Open-SqlConnection([string]$Instance) {
-    # 1st: the keyed-in account (impersonated). 2nd: the account running this script (RDP user).
+function Open-SqlConnection([string]$Instance, [switch]$RequirePerms, [switch]$NoImpersonation) {
+    # 1st: the keyed-in account (impersonated). 2nd: the account running this script.
+    # -RequirePerms: fail instead of continuing without VIEW SERVER STATE (so the RDP user can retry it).
     $notes = @()
     $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    if ($script:ImpIdentity) {
+    if ($script:ImpIdentity -and -not $NoImpersonation) {
         $conn = New-SqlConnection $Instance; $ctx = $null
         try { $ctx = $script:ImpIdentity.Impersonate(); $conn.Open() }
         catch { $notes += "$($script:ImpUser): $($_.Exception.Message)"; $conn.Dispose(); $conn = $null }
@@ -290,7 +329,10 @@ function Open-SqlConnection([string]$Instance) {
         $conn.Dispose()
         throw ((@($notes) + "$($current): $($_.Exception.Message)") -join ' | ')
     }
-    if (-not (Test-SqlAccess $conn)) { Write-Step "  WARNING: $current has no VIEW SERVER STATE on $Instance - some checks will be empty." 'Yellow' }
+    if (-not (Test-SqlAccess $conn)) {
+        if ($RequirePerms) { $conn.Dispose(); throw "$current has no VIEW SERVER STATE on $Instance" }
+        Write-Step "  WARNING: $current has no VIEW SERVER STATE on $Instance - some checks will be empty." 'Yellow'
+    }
     return [pscustomobject]@{ Connection = $conn; As = $current }
 }
 
@@ -555,16 +597,68 @@ if (-not $Inner) {
     $Ticket = ([string]$Ticket).Trim() -replace '[^A-Za-z0-9_-]', ''
     if (-not $Ticket) { $Ticket = if ($Phase -eq 'HEALTH') { 'DAILY' } else { 'NO-TICKET' } }
 
+    $rdpUser = "$env:USERDOMAIN\$env:USERNAME"
     $cred = $null
     if (-not $UseCurrentUser) {
-        try   { $cred = Get-Credential -Message "Enter YOUR Windows account (DOMAIN\user) that has access to SQL Server.`nCancel = use $env:USERDOMAIN\$env:USERNAME only" }
-        catch { $cred = $null }
+        # FIRST PRIORITY: your own Windows account (same as SSMS "Run as different user")
+        while (-not $cred) {
+            try   { $cred = Get-Credential -Message "Enter YOUR Windows account (DOMAIN\user) that has access to SQL Server - same as SSMS 'Run as different user'." }
+            catch { $cred = $null }
+            if (-not $cred) {
+                $ans = Read-Host "No credentials entered. R = retry, C = continue as $rdpUser only"
+                if ($ans -notmatch '^[Rr]') { break }
+            }
+        }
     }
     if ($cred) {
-        if (Connect-AsUser $cred) { Write-Step "SQL connections will use $($script:ImpUser) (fallback: $env:USERDOMAIN\$env:USERNAME)" 'Green' }
+        $launched = $false
+        if (-not (Test-Path $Config.LogsFolder)) { try { New-Item -ItemType Directory -Path $Config.LogsFolder -Force | Out-Null } catch { } }
+        $handOffFile = Join-Path $Config.LogsFolder ("handoff_{0}_{1}.json" -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID)
+        if (Start-SecondaryLogonService) {
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket, '-HandOff', "`"$handOffFile`"")
+            if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
+            if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
+            Write-Step "Starting the check as $($cred.UserName) in a new window..." 'Green'
+            try {
+                Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -Wait -ErrorAction Stop
+                $launched = $true
+            }
+            catch {
+                Write-Step "Could not start as $($cred.UserName): $($_.Exception.Message)" 'Red'
+                Write-Step '  (wrong password / locked account, no "log on locally" right, or the account cannot read this folder)' 'DarkGray'
+            }
+        }
+        if ($launched) {
+            $ho = $null
+            if (Test-Path -LiteralPath $handOffFile) {
+                try { $ho = $Json.DeserializeObject([System.IO.File]::ReadAllText($handOffFile)) } catch { }
+                Remove-Item -LiteralPath $handOffFile -Force -ErrorAction SilentlyContinue
+            }
+            if ($ho -and $ho['status'] -eq 'done') { exit 0 }
+            if ($ho -and $ho['status'] -eq 'retry') {
+                # FAIL-SAFE: re-check only the instances your account could not use, as the RDP user
+                $script:HandOffRows = @($ho['rows'] | ForEach-Object { New-Object psobject -Property $_ })
+                $script:HandOffMail = @($ho['mail'] | ForEach-Object { New-Object psobject -Property $_ })
+                $script:RetryErrors = @{}
+                foreach ($r in $ho['retry']) { $script:RetryErrors[[string]$r['Instance']] = [string]$r['Error'] }
+                $script:KeyedUser = [string]$ho['user']
+                Write-Step "`n$($script:KeyedUser) could not check $($script:RetryErrors.Count) instance(s) - retrying them as $rdpUser (fail-safe):" 'Yellow'
+                $script:RetryErrors.Keys | ForEach-Object { Write-Step "  $_" 'Yellow' }
+                [void](Connect-AsUser $cred)      # lets the email still be sent as your account
+            }
+            else {
+                $ans = Read-Host "The check as $($cred.UserName) ended without a result. Run it from this window instead ($($cred.UserName) first, then $rdpUser)? (Y/N)"
+                if ($ans -notmatch '^[Yy]') { exit 1 }
+                [void](Connect-AsUser $cred)
+            }
+        }
         else {
-            $ans = Read-Host "Continue with $env:USERDOMAIN\$env:USERNAME only? (Y/N)"
-            if ($ans -notmatch '^[Yy]') { exit 1 }
+            # FAIL-SAFE: run-as not possible - use your account from this window, then the RDP user per instance
+            Write-Step "Fail-safe: using $($cred.UserName) from this window (no new window), $rdpUser for instances it can't use." 'Yellow'
+            if (-not (Connect-AsUser $cred)) {
+                $ans = Read-Host "Continue with $rdpUser only? (Y/N)"
+                if ($ans -notmatch '^[Yy]') { exit 1 }
+            }
         }
     }
 }
@@ -579,7 +673,7 @@ foreach ($key in @('SnapshotRoot', 'ReportsFolder', 'LogsFolder')) {
         $probe = Join-Path $Config[$key] ('.write_test_' + $stamp); [System.IO.File]::WriteAllText($probe, 'x'); Remove-Item $probe -Force
     }
     catch {
-        if ($key -eq 'SnapshotRoot') { Write-Step "ERROR: no write access to $($Config[$key]). Snapshots must be stored there - fix folder permissions." 'Red'; Read-Host 'Press Enter to close'; exit 1 }
+        if ($key -eq 'SnapshotRoot' -and -not $script:RetryErrors) { Write-Step "ERROR: no write access to $($Config[$key]). Snapshots must be stored there - fix folder permissions." 'Red'; Read-Host 'Press Enter to close'; exit 1 }
         $fallback = Join-Path $env:TEMP ('DBA_PrePostCheck\' + (Split-Path $Config[$key] -Leaf))
         New-Item -ItemType Directory -Path $fallback -Force | Out-Null
         Write-Warning "No write access to $($Config[$key]) - using $fallback"; $Config[$key] = $fallback
@@ -589,6 +683,8 @@ $logFile = Join-Path $Config.LogsFolder "PrePostCheck_${Phase}_${Ticket}_$stamp.
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { }
 
 $summary = @()
+if ($script:HandOffRows) { $summary = @($script:HandOffRows) }
+$handedOff = $false
 $combinedFile = $null
 $mailStatus = 'Not sent'
 try {
@@ -598,6 +694,7 @@ try {
     $sqlText = [System.IO.File]::ReadAllText((Get-SqlFilePath))
     $targets = Get-TargetInstances
     if (-not $targets) { throw 'No SQL Server instances found on this VM and servers.txt is empty.' }
+    if ($script:RetryErrors) { $targets = @($targets | Where-Object { $script:RetryErrors.ContainsKey([string]$_.Instance) }) }
     $targets | Format-Table Instance, Service, Status -AutoSize | Out-String | Write-Host
     $ticketDir = Join-Path $Config.SnapshotRoot $Ticket
     if ($Phase -ne 'HEALTH' -and -not (Test-Path $ticketDir)) { New-Item -ItemType Directory -Path $ticketDir -Force | Out-Null }
@@ -609,7 +706,7 @@ try {
         try {
             Write-Step 'Collecting SSIS / SSRS / SSAS service and SSAS database info...'
             $ctx = $null
-            try { if ($script:ImpIdentity) { $ctx = $script:ImpIdentity.Impersonate() }; $machineBi = Get-MachineBiSnapshot }
+            try { if ($script:ImpIdentity -and -not $script:RetryErrors) { $ctx = $script:ImpIdentity.Impersonate() }; $machineBi = Get-MachineBiSnapshot }
             finally { if ($ctx) { $ctx.Undo() } }
         }
         catch { Write-Step "WARNING: SSIS/SSRS/SSAS collection failed: $($_.Exception.Message)" 'Yellow' }
@@ -618,6 +715,7 @@ try {
     $diffCols  = @('Section', 'Item', 'Attribute', 'Before', 'After', 'Note')
     $issueCols = @('severity', 'area', 'item', 'detail')
     $mailCandidates = @()      # instances with a usable Database Mail profile (local ones first)
+    if ($script:HandOffMail) { $mailCandidates = @($script:HandOffMail) }
 
     foreach ($t in $targets) {
         $row = [ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; ShortHtml = ''; FullHtml = '' }
@@ -628,9 +726,10 @@ try {
             $row.FullHtml = $row.ShortHtml
             Write-Step $row.Outcome 'Red'; $summary += [pscustomobject]$row; continue
         }
-        $conn = $null
+        $conn = $null; $stage = 'connect'
         try {
-            $oc = Open-SqlConnection $t.Instance; $conn = $oc.Connection; $row.ConnectedAs = $oc.As
+            $oc = Open-SqlConnection $t.Instance -RequirePerms:([bool]$HandOff) -NoImpersonation:([bool]$script:RetryErrors)
+            $conn = $oc.Connection; $row.ConnectedAs = $oc.As; $stage = 'collect'
             Write-Step "Connected as   : $($oc.As)"
             $profileName = $null
             try { $profileName = Get-MailProfileName $conn }
@@ -651,7 +750,7 @@ try {
                 }
             }
             $snap = @{
-                meta     = @{ instance = $t.Instance; phase = $Phase; ticket = $Ticket; taken_at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); taken_by = $me; machine = $env:COMPUTERNAME
+                meta     = @{ instance = $t.Instance; phase = $Phase; ticket = $Ticket; taken_at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); taken_by = $row.ConnectedAs; machine = $env:COMPUTERNAME
                               build = (Get-Val (@(Get-Rows $data 'instance') | Where-Object { (Get-Val $_ 'property_code') -eq 'build' } | Select-Object -First 1) 'value') }
                 sections = $data.sections
                 columns  = $data.columns
@@ -766,15 +865,34 @@ try {
         }
         catch {
             $row.Outcome = 'FAILED: ' + $_.Exception.Message; $row.State = 'FAILED'
+            if ($HandOff -and $stage -eq 'connect') { $row.State = 'RETRY'; $row.Outcome = $_.Exception.Message }
+            if ($script:RetryErrors -and $stage -eq 'connect') { $row.Outcome = "FAILED: $($script:KeyedUser): $($script:RetryErrors[[string]$t.Instance]) | $($me): $($_.Exception.Message)" }
             $row.ShortHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
             $row.FullHtml = $row.ShortHtml
-            Write-Step $row.Outcome 'Red'
-            if ($_.Exception.Message -match 'Login failed') { Write-Step "  -> $me has no login on $($t.Instance). Use the account you use for SSMS." 'Yellow' }
+            if ($row.State -eq 'RETRY') { Write-Step "$($row.Outcome) -> will be retried as the RDP user" 'Yellow' } else { Write-Step $row.Outcome 'Red' }
+            if ($row.State -ne 'RETRY' -and $_.Exception.Message -match 'Login failed') { Write-Step "  -> $me has no login on $($t.Instance). Use the account you use for SSMS." 'Yellow' }
         }
         finally { if ($conn) { $conn.Dispose() } }
         $summary += [pscustomobject]$row
     }
 
+    # Run as your account (new window) and some instances failed: hand them to the original window
+    $retryRows = @($summary | Where-Object { $_.State -eq 'RETRY' })
+    if ($HandOff -and $retryRows.Count -gt 0) {
+        $plain = { param($o) $h = @{}; foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = if ($p.Value -is [bool]) { $p.Value } else { [string]$p.Value } }; $h }
+        $payload = @{
+            status = 'retry'; user = $me
+            rows   = @($summary | Where-Object { $_.State -ne 'RETRY' } | ForEach-Object { & $plain $_ })
+            retry  = @($retryRows | ForEach-Object { @{ Instance = [string]$_.Instance; Error = [string]$_.Outcome } })
+            mail   = @($mailCandidates | ForEach-Object { & $plain $_ })
+        }
+        [System.IO.File]::WriteAllText($HandOff, (ConvertTo-Json -InputObject $payload -Depth 6 -Compress), [System.Text.Encoding]::UTF8)
+        $handedOff = $true
+        $summary = @($summary | Where-Object { $_.State -ne 'RETRY' })
+        Write-Step "`n$($retryRows.Count) instance(s) could not be checked as $me - the original window retries them as the RDP user and sends the combined report." 'Yellow'
+    }
+
+    if (-not $handedOff) {
     # =========================================================================
     #  ONE COMBINED REPORT + ONE EMAIL FOR THE WHOLE VM
     # =========================================================================
@@ -863,9 +981,19 @@ FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
         }
         finally { if ($c) { $c.Dispose() } }
     }
+    }   # end if (-not $handedOff)
 }
 catch { Write-Step ('ERROR: ' + $_.Exception.Message) 'Red' }
 finally {
+    if ($HandOff -and -not $handedOff) {
+        try { [System.IO.File]::WriteAllText($HandOff, '{"status":"done"}') } catch { }
+    }
+    if ($handedOff) {
+        Write-Step 'Handing over to the original window...' 'Yellow'
+        try { Stop-Transcript | Out-Null } catch { }
+        Start-Sleep -Seconds 3
+    }
+    else {
     Write-Step "`n=== SUMMARY ($Phase / $Ticket) ===" 'Green'
     if ($summary) { $summary | Format-Table Instance, ConnectedAs, Outcome, Unexpected, NewProblems, Expected, Baseline -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
     Write-Step "Email     : $mailStatus"
@@ -880,4 +1008,5 @@ finally {
     Write-Step "Log       : $logFile"
     try { Stop-Transcript | Out-Null } catch { }
     Read-Host "`nPress Enter to close"
+    }
 }
