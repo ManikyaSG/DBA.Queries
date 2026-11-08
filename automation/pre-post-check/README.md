@@ -1,8 +1,15 @@
 # One-click PRE / POST change check
 
-> **One SQL file for everything:** this folder needs only `HC_Snapshot.sql`. It covers the PRE/POST change check **and** the daily health check (`Run-HealthCheck.bat`, or `-Phase HEALTH`). The older `automation/health-check` folder (script 44) isn't needed.
+> **Just 3 files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`. Copy them together to a folder on the VM, for example `C:\DBA\PrePostCheck`. The older `automation/health-check` folder (script 44) isn't needed.
 
-**Health check only:** double-click `Run-HealthCheck.bat` (or `.\Invoke-PrePostCheck.ps1 -Phase HEALTH`). It runs the same snapshot on every instance on the VM and emails **one combined health report** with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject and the full report attached. Nothing is stored for comparison.
+Double-click `Run-PrePostCheck.bat` and choose:
+
+| # | Choice | What it does |
+|---|---|---|
+| 1 | **PRE** | Snapshot before a change, stored on the VM and emailed |
+| 2 | **POST** | Snapshot after the change, compared with PRE, emailed as SUCCESS or DIFFERENCES |
+| 3 | **HEALTH** | Health check only: one combined report with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject. Nothing is stored for comparison |
+| 4 | **CLEANUP** | Delete old snapshots, reports and logs (this also runs automatically at the start of every check) |
 
 Before a change (patching, CU, in-place upgrade, failover test, config change), run it with **PRE**. After the change, run it with **POST**. It checks **every SQL instance on the VM**:
 
@@ -23,22 +30,21 @@ Snapshots (JSON) and reports stay on the VM as evidence. The report and email do
 
 | File | Purpose |
 |---|---|
-| `Run-PrePostCheck.bat` | Double-click this. |
-| `Invoke-PrePostCheck.ps1` | Handles the prompts, starts Secondary Logon and relaunches as your account (RDP account as fail-safe). Then it runs the instances, stores the snapshots, compares PRE and POST, and emails the result through Database Mail. |
-| `HC_Snapshot.sql` | A data-only version of `scripts/44`. It contains the same checks plus config, trace flags, all jobs, logins, server roles, linked servers, endpoints, certificates and XE sessions. |
-| `servers.txt.example` | Optional. Rename it to `servers.txt` to add instances on other VMs. |
+| `Run-PrePostCheck.bat` | Double-click this. Starts the Secondary Logon service if needed, then runs the PowerShell script. |
+| `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. All settings are in `$Config` at the top. |
+| `HC_Snapshot.sql` | All the checks, run on every instance. |
 
 Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\` (HTML) and `Logs\`.
 
 ## Set up once per VM
 
 1. Copy the folder to a place **your own account can read and write**, for example `C:\DBA\PrePostCheck`. Snapshots must be writable there.
-2. In `Invoke-PrePostCheck.ps1` → `$Config`, set `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below).
+2. In `Invoke-PrePostCheck.ps1` → `$Config`, set `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below), and list instances on other VMs (for example AG replicas) in `ExtraInstances = @('SQLVM2', 'SQLVM3\INST2')`.
 
 ## Run it
 
 1. RDP in with the generic admin account and double-click `Run-PrePostCheck.bat`.
-2. Enter `PRE` or `POST` and the **change ticket**. The ticket is how PRE and POST get paired, so use the same one for both runs.
+2. Choose `1` PRE, `2` POST or `3` HEALTH, then enter the **change ticket**. The ticket is how PRE and POST get paired, so use the same one for both runs.
 3. Enter **your** Windows account at the credential prompt, the same one you use for SSMS "Run as different user". **This is always the first choice.**
    - The `.bat` (and the script) start the **Secondary Logon** service if it's stopped or disabled (UAC prompt if the window isn't elevated). The check then runs **as your account** in a new window.
    - **Fail-safe, per instance:** if your account can't log in to an instance, or has no `VIEW SERVER STATE` there, that instance is handed back to the original window and retried as the **logged-in RDP account**. Everything still ends up in one combined report and one email. If both accounts fail, the instance shows *FAILED* with both errors.
@@ -76,6 +82,11 @@ Last-backup *times*, log usage %, queue sizes and CPU are not compared, because 
 
 ## Command line (optional)
 
+```bat
+Run-PrePostCheck.bat -Phase HEALTH
+Run-PrePostCheck.bat -Phase CLEANUP
+```
+
 ```powershell
 .\Invoke-PrePostCheck.ps1 -Phase PRE  -Ticket CHG0012345
 .\Invoke-PrePostCheck.ps1 -Phase POST -Ticket CHG0012345 -UseCurrentUser
@@ -89,9 +100,11 @@ For the SSIS / SSRS / SSAS sections it also needs:
 - **SSIS:** read access to `SSISDB` (sysadmin, or `ssis_admin`). Otherwise the section is skipped and a warning is added.
 - **SSRS:** read access to the report server database (for example `ReportServer`). It must be on the same instance; a remote report server catalog isn't seen.
 - **SSAS:** SSAS server administrator rights, and the **MSOLAP OLE DB provider** on the VM (installed with SSAS / SSMS). If either is missing, the SSAS service state is still captured and a warning explains why the databases couldn't be read.
-- SSIS/SSRS/SSAS **services** are read from the VM itself, so they're only captured for instances discovered on this VM, not for `servers.txt` entries.
+- SSIS/SSRS/SSAS **services** are read from the VM itself, so they're only captured for instances discovered on this VM, not for `ExtraInstances` entries.
 For other problems (credentials, folder access, `Login failed`, mail stuck as `unsent`/`failed`, execution policy), see the troubleshooting table in [`../health-check/README.md`](../health-check/README.md); the same fixes apply.
 
 ## Cleanup
 
-Double-click `Cleanup-OldFiles.bat` to delete files older than **48 hours** from `Reports\` and `Logs\` and `Snapshots\`. A ticket's snapshots are deleted only once it has a **POST**; a PRE still waiting for its POST is kept for 7 days (`-KeepPreWithoutPostDays`), so a change done later can still be compared. Use `Cleanup-OldFiles.bat -Hours 72` for a different age, or `-WhatIf` to preview without deleting. To run it automatically, schedule it daily in Task Scheduler (action: the `.bat`, "Start in": this folder).
+Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `$Config`.
+
+To clean up without running a check, choose `4` CLEANUP, or schedule `Run-PrePostCheck.bat -Phase CLEANUP` daily in Task Scheduler ("Start in": this folder). Cleanup doesn't ask for credentials or start Secondary Logon.
