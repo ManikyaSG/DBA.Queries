@@ -24,7 +24,7 @@ Snapshots (JSON) and reports stay on the VM as evidence. The report and email do
 | File | Purpose |
 |---|---|
 | `Run-PrePostCheck.bat` | Double-click this. |
-| `Invoke-PrePostCheck.ps1` | Handles the prompts and logs on as your account for the SQL connections. Then it runs the instances, stores the snapshots, compares PRE and POST, and emails the result through Database Mail. |
+| `Invoke-PrePostCheck.ps1` | Handles the prompts, starts Secondary Logon and relaunches as your account (RDP account as fail-safe). Then it runs the instances, stores the snapshots, compares PRE and POST, and emails the result through Database Mail. |
 | `HC_Snapshot.sql` | A data-only version of `scripts/44`. It contains the same checks plus config, trace flags, all jobs, logins, server roles, linked servers, endpoints, certificates and XE sessions. |
 | `servers.txt.example` | Optional. Rename it to `servers.txt` to add instances on other VMs. |
 
@@ -39,10 +39,12 @@ Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\`
 
 1. RDP in with the generic admin account and double-click `Run-PrePostCheck.bat`.
 2. Enter `PRE` or `POST` and the **change ticket**. The ticket is how PRE and POST get paired, so use the same one for both runs.
-3. Enter **your** Windows account at the credential prompt, the same one you use for SSMS "Run as different user". Cancel runs it as the RDP account only.
-   - The script stays in the RDP window and opens each SQL connection **as your account**, so the **Secondary Logon service isn't needed**.
-   - If your account can't log in to an instance, or has no `VIEW SERVER STATE` there, that instance is checked as the **logged-in RDP account** instead. The summary and report show a **ConnectedAs** column per instance.
-   - A wrong password or a locked account is reported straight away, and you can carry on with the RDP account.
+3. Enter **your** Windows account at the credential prompt, the same one you use for SSMS "Run as different user". **This is always the first choice.**
+   - The `.bat` (and the script) start the **Secondary Logon** service if it's stopped or disabled (UAC prompt if the window isn't elevated). The check then runs **as your account** in a new window.
+   - **Fail-safe, per instance:** if your account can't log in to an instance, or has no `VIEW SERVER STATE` there, that instance is handed back to the original window and retried as the **logged-in RDP account**. Everything still ends up in one combined report and one email. If both accounts fail, the instance shows *FAILED* with both errors.
+   - **Fail-safe, run-as:** if the new window can't start at all (Secondary Logon won't start, or the logon is refused), the script uses your account from the original window instead, still before the RDP account.
+   - The summary, report and email have a **ConnectedAs** column, so you can see which account checked each instance.
+   - Cancel at the prompt runs it as the RDP account only.
 4. Read the summary in the window and check your mailbox.
 
 **When to run POST:** after services are up and the **AG databases are SYNCHRONIZED** again. If they're still catching up, the check will rightly report it as a difference. Also resume any jobs you paused, otherwise jobs left disabled will show up as differences.
@@ -82,7 +84,7 @@ Last-backup *times*, log usage %, queue sizes and CPU are not compared, because 
 
 ## Permissions and troubleshooting
 
-Your account needs `VIEW SERVER STATE`, read access to `msdb`, and `DatabaseMailUserRole` (or sysadmin) on every instance. Snapshots, reports and logs are written by the RDP account, so that account needs write access to the folder.
+Your account needs `VIEW SERVER STATE`, read access to `msdb`, and `DatabaseMailUserRole` (or sysadmin) on every instance. Both your account and the RDP account need write access to the folder (snapshots, reports and logs are written by whichever account checks the instance).
 For the SSIS / SSRS / SSAS sections it also needs:
 - **SSIS:** read access to `SSISDB` (sysadmin, or `ssis_admin`). Otherwise the section is skipped and a warning is added.
 - **SSRS:** read access to the report server database (for example `ReportServer`). It must be on the same instance; a remote report server catalog isn't seen.
