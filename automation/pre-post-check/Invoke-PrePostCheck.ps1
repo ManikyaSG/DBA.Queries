@@ -10,7 +10,9 @@
     RDP in with the generic admin account and double-click Run-PrePostCheck.bat:
       1. Choose PRE or POST and enter the change ticket.
       2. Enter YOUR Windows account (as for SSMS "Run as different user"); the script
-         relaunches itself as you. Cancel = run as the current account.
+         opens each SQL connection as you (no Secondary Logon service needed). If your
+         account can't log in to an instance or lacks VIEW SERVER STATE there, the
+         logged-in RDP account is used for that instance. Cancel = RDP account only.
       3. Every SQL instance on the VM (+ servers.txt) is checked.
     Snapshots : Snapshots\<ticket>\<instance>_PRE|POST_<yyyyMMdd_HHmmss>.json
     Reports   : Reports\<instance>_<PRE|POST>_<ticket>_<yyyyMMdd_HHmm>.html
@@ -155,36 +157,6 @@ function ConvertTo-PlainObject($InputObject) {
 
 function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 
-function Start-SecondaryLogonService {
-    # "Run as different user" / Start-Process -Credential need the Secondary Logon service (seclogon).
-    # Starts it if stopped; if it is Disabled, sets it to Manual first. Needs local admin - if this
-    # window is not elevated, a UAC prompt starts it. Returns $true when the service is running.
-    $svc = Get-Service -Name seclogon -ErrorAction SilentlyContinue
-    if (-not $svc) { Write-Step 'WARNING: Secondary Logon service (seclogon) not found on this VM.' 'Yellow'; return $false }
-    if ($svc.Status -eq 'Running') { Write-Step 'Secondary Logon service: running'; return $true }
-
-    $startType = (Get-CimInstance -ClassName Win32_Service -Filter "Name='seclogon'" -ErrorAction SilentlyContinue).StartMode
-    Write-Step "Secondary Logon service is $($svc.Status) (startup: $startType) - starting it..." 'Yellow'
-    try {
-        if ($startType -eq 'Disabled') { Set-Service -Name seclogon -StartupType Manual -ErrorAction Stop }
-        Start-Service -Name seclogon -ErrorAction Stop
-    }
-    catch {
-        Write-Step 'Not running elevated - approve the UAC prompt to start the Secondary Logon service.' 'Yellow'
-        $cmd = "if ((Get-CimInstance Win32_Service -Filter `"Name='seclogon'`").StartMode -eq 'Disabled') { Set-Service seclogon -StartupType Manual }; Start-Service seclogon"
-        try { Start-Process -FilePath "$PSHOME\powershell.exe" -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList @('-NoProfile', '-Command', $cmd) }
-        catch { Write-Step "Could not elevate: $($_.Exception.Message)" 'Red' }
-    }
-    $svc = Get-Service -Name seclogon
-    for ($i = 0; $i -lt 10 -and $svc.Status -ne 'Running'; $i++) { Start-Sleep -Seconds 1; $svc.Refresh() }
-    if ($svc.Status -eq 'Running') {
-        Write-Step 'Secondary Logon service: started' 'Green'
-        if ($startType -eq 'Disabled') { Write-Step 'NOTE: its startup type was Disabled and is now Manual (needed for Run as different user).' 'Yellow' }
-        return $true
-    }
-    Write-Step 'WARNING: Secondary Logon service could not be started - running as a different user will fail.' 'Red'
-    return $false
-}
 function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s,]', '_') }
 function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
 
@@ -249,6 +221,77 @@ function New-SqlConnection([string]$Instance) {
     $cs = "Server=$Instance;Database=master;Integrated Security=SSPI;Application Name=DBA PrePostCheck;" +
           "Connect Timeout=$($Config.ConnectTimeoutSec);Encrypt=$enc;TrustServerCertificate=True"
     return New-Object System.Data.SqlClient.SqlConnection $cs
+}
+
+# ---- Run SQL as YOUR account without "Run as different user" (no Secondary Logon service needed) ----
+# The script runs as the RDP user; connections are opened while impersonating the account you key in.
+# If that account can't log in to an instance (or lacks VIEW SERVER STATE), the RDP user is tried instead.
+if (-not ('DbaLogon' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class DbaLogon {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool LogonUser(string user, string domain, string password, int logonType, int provider, out IntPtr token);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+"@
+}
+$script:ImpIdentity = $null
+$script:ImpUser     = $null
+
+function Connect-AsUser([pscredential]$Credential) {
+    # Returns $true if the keyed-in Windows account could be logged on (password / logon rights OK).
+    $name = $Credential.UserName; $domain = $null; $user = $name
+    if ($name -match '^(.+)\\(.+)$') { $domain = $Matches[1]; $user = $Matches[2] }
+    elseif ($name -notmatch '@') { $domain = $env:USERDOMAIN }
+    $pw = $Credential.GetNetworkCredential().Password
+    foreach ($type in 2, 8, 3) {        # interactive, network cleartext, network
+        $token = [IntPtr]::Zero
+        if ([DbaLogon]::LogonUser($user, $domain, $pw, $type, 0, [ref]$token)) {
+            $script:ImpIdentity = New-Object System.Security.Principal.WindowsIdentity($token)
+            [void][DbaLogon]::CloseHandle($token)
+            $script:ImpUser = $script:ImpIdentity.Name
+            return $true
+        }
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($err -eq 1326) { Write-Step "Logon failed for $name - wrong user name or password." 'Red'; return $false }
+        if ($err -in 1327, 1330, 1331, 1909) { Write-Step "Logon failed for $name - account restricted, expired, disabled or locked (error $err)." 'Red'; return $false }
+    }
+    Write-Step "Logon failed for $name (error $err)." 'Red'
+    return $false
+}
+
+function Test-SqlAccess($Connection) {
+    try { return ([int](Invoke-Scalar $Connection "SELECT ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0);") -eq 1) } catch { return $false }
+}
+
+function Open-SqlConnection([string]$Instance) {
+    # 1st: the keyed-in account (impersonated). 2nd: the account running this script (RDP user).
+    $notes = @()
+    $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ($script:ImpIdentity) {
+        $conn = New-SqlConnection $Instance; $ctx = $null
+        try { $ctx = $script:ImpIdentity.Impersonate(); $conn.Open() }
+        catch { $notes += "$($script:ImpUser): $($_.Exception.Message)"; $conn.Dispose(); $conn = $null }
+        finally { if ($ctx) { $ctx.Undo() } }
+        if ($conn) {
+            if (Test-SqlAccess $conn) { return [pscustomobject]@{ Connection = $conn; As = $script:ImpUser } }
+            $notes += "$($script:ImpUser): connected but has no VIEW SERVER STATE"
+            $conn.Dispose()
+        }
+        Write-Step "  $($script:ImpUser) can't be used on $Instance - trying $current" 'Yellow'
+        $notes | ForEach-Object { Write-Step "    $_" 'DarkGray' }
+    }
+    $conn = New-SqlConnection $Instance
+    try { $conn.Open() }
+    catch {
+        $conn.Dispose()
+        throw ((@($notes) + "$($current): $($_.Exception.Message)") -join ' | ')
+    }
+    if (-not (Test-SqlAccess $conn)) { Write-Step "  WARNING: $current has no VIEW SERVER STATE on $Instance - some checks will be empty." 'Yellow' }
+    return [pscustomobject]@{ Connection = $conn; As = $current }
 }
 
 function Invoke-Scalar($Connection, [string]$Query, [hashtable]$Params = @{}) {
@@ -497,7 +540,7 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
 }
 
 # =============================================================================
-#  OUTER: prompts + relaunch as your account
+#  OUTER: prompts + log on as your account (used for SQL connections)
 # =============================================================================
 if (-not $Inner) {
     Write-Step '=== SQL Server PRE / POST change check ===' 'Green'
@@ -514,30 +557,15 @@ if (-not $Inner) {
 
     $cred = $null
     if (-not $UseCurrentUser) {
-        if (-not (Start-SecondaryLogonService)) {
-            $ans = Read-Host 'Continue as the CURRENT user instead? (Y/N)'
-            if ($ans -notmatch '^[Yy]') { exit 1 }
-            $UseCurrentUser = $true
-        }
-    }
-    if (-not $UseCurrentUser) {
-        try   { $cred = Get-Credential -Message "Enter YOUR Windows account (DOMAIN\user) that has access to SQL Server.`nCancel = run as $env:USERDOMAIN\$env:USERNAME" }
+        try   { $cred = Get-Credential -Message "Enter YOUR Windows account (DOMAIN\user) that has access to SQL Server.`nCancel = use $env:USERDOMAIN\$env:USERNAME only" }
         catch { $cred = $null }
     }
     if ($cred) {
-        $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket)
-        if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
-        if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
-        Write-Step "Starting the $Phase check as $($cred.UserName) in a new window..."
-        try {
-            Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -Wait
+        if (Connect-AsUser $cred) { Write-Step "SQL connections will use $($script:ImpUser) (fallback: $env:USERDOMAIN\$env:USERNAME)" 'Green' }
+        else {
+            $ans = Read-Host "Continue with $env:USERDOMAIN\$env:USERNAME only? (Y/N)"
+            if ($ans -notmatch '^[Yy]') { exit 1 }
         }
-        catch {
-            Write-Step "Could not start as $($cred.UserName): $($_.Exception.Message)" 'Red'
-            Write-Step "Check the password, that the account may log on to this VM, and that it can READ $PSScriptRoot (e.g. use C:\DBA\PrePostCheck)." 'Yellow'
-            Read-Host 'Press Enter to close'; exit 1
-        }
-        exit 0
     }
 }
 
@@ -578,7 +606,12 @@ try {
     # Machine-level SSIS / SSRS / SSAS data (services + SSAS databases), added to every LOCAL instance's snapshot
     $machineBi = $null
     if (@($targets | Where-Object { $_.Service }).Count -gt 0) {
-        try { Write-Step 'Collecting SSIS / SSRS / SSAS service and SSAS database info...'; $machineBi = Get-MachineBiSnapshot }
+        try {
+            Write-Step 'Collecting SSIS / SSRS / SSAS service and SSAS database info...'
+            $ctx = $null
+            try { if ($script:ImpIdentity) { $ctx = $script:ImpIdentity.Impersonate() }; $machineBi = Get-MachineBiSnapshot }
+            finally { if ($ctx) { $ctx.Undo() } }
+        }
         catch { Write-Step "WARNING: SSIS/SSRS/SSAS collection failed: $($_.Exception.Message)" 'Yellow' }
     }
 
@@ -587,7 +620,7 @@ try {
     $mailCandidates = @()      # instances with a usable Database Mail profile (local ones first)
 
     foreach ($t in $targets) {
-        $row = [ordered]@{ Instance = $t.Instance; Outcome = ''; State = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; ShortHtml = ''; FullHtml = '' }
+        $row = [ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; ShortHtml = ''; FullHtml = '' }
         Write-Step "`n--- $($t.Instance) ---" 'Green'
         if ($t.Status -notin @('Running', 'Listed')) {
             $row.Outcome = "SKIPPED - service $($t.Service) is $($t.Status)"; $row.State = 'FAILED'
@@ -597,7 +630,8 @@ try {
         }
         $conn = $null
         try {
-            $conn = New-SqlConnection $t.Instance; $conn.Open()
+            $oc = Open-SqlConnection $t.Instance; $conn = $oc.Connection; $row.ConnectedAs = $oc.As
+            Write-Step "Connected as   : $($oc.As)"
             $profileName = $null
             try { $profileName = Get-MailProfileName $conn }
             catch { Write-Step "WARNING: could not read Database Mail profiles on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
@@ -763,7 +797,7 @@ try {
     elseif ($nFail -gt 0)               { $overall = "INCOMPLETE - $nFail instance(s) FAILED";               $overallColor = '#f8d7da'; $tag = 'POST INCOMPLETE';  $importance = 'High' }
     else                                { $overall = 'SUCCESS - no differences on any instance';             $overallColor = '#d4edda'; $tag = 'POST SUCCESS';     $importance = 'Normal' }
 
-    $summaryCols = if ($Phase -in @('PRE', 'HEALTH')) { @('Instance', 'Outcome') } else { @('Instance', 'Outcome', 'Unexpected', 'NewProblems', 'Expected', 'Baseline') }
+    $summaryCols = if ($Phase -in @('PRE', 'HEALTH')) { @('Instance', 'ConnectedAs', 'Outcome') } else { @('Instance', 'ConnectedAs', 'Outcome', 'Unexpected', 'NewProblems', 'Expected', 'Baseline') }
     $summaryRows = @($summary | ForEach-Object {
         $st = switch ($_.State) { 'DIFF' { 'CRITICAL' } 'FAILED' { 'CRITICAL' } 'CRIT' { 'CRITICAL' } 'NOBASE' { 'WARNING' } 'WARN' { 'WARNING' } default { '' } }
         $o = [ordered]@{ status = $st }; foreach ($c in $summaryCols) { $o[$c] = [string]$_.$c }; [pscustomobject]$o })
@@ -788,7 +822,7 @@ try {
     else {
         $c = $null
         try {
-            $c = New-SqlConnection $sender.Instance; $c.Open()
+            $c = (Open-SqlConnection $sender.Instance).Connection
             $shortHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
             $sizeBytes = (Get-Item -LiteralPath $combinedFile).Length
             $maxBytes = 0
@@ -833,7 +867,7 @@ FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
 catch { Write-Step ('ERROR: ' + $_.Exception.Message) 'Red' }
 finally {
     Write-Step "`n=== SUMMARY ($Phase / $Ticket) ===" 'Green'
-    if ($summary) { $summary | Format-Table Instance, Outcome, Unexpected, NewProblems, Expected, Baseline -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+    if ($summary) { $summary | Format-Table Instance, ConnectedAs, Outcome, Unexpected, NewProblems, Expected, Baseline -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
     Write-Step "Email     : $mailStatus"
     Write-Step "Snapshots : $(Join-Path $Config.SnapshotRoot $Ticket)"
     Write-Step "Reports   : $($Config.ReportsFolder)"
