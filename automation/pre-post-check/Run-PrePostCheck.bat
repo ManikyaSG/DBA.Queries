@@ -1,19 +1,24 @@
 @echo off
 REM ==========================================================================
-REM  One-click PRE / POST change check for all SQL instances on this VM.
-REM  Double-click while logged in with the generic admin account:
-REM    - asks PRE or POST and the change ticket (pairs the two runs)
-REM    - asks for YOUR Windows account (same one you use for SSMS
-REM      "Run as different user") and runs the check as that account (Secondary Logon);
-REM      fail-safe: instances it can't use are retried as the RDP account
-REM    - PRE: stores a snapshot on this VM + emails it; POST: compares with PRE,
-REM      emails SUCCESS or DIFFERENCES FOUND (Database Mail)
-REM  Keep this file, Invoke-PrePostCheck.ps1 and HC_Snapshot.sql
-REM  together in a folder your account can read, e.g. C:\DBA\PrePostCheck
+REM  One-click SQL Server check for all instances on this VM.
+REM  Double-click while logged in with the generic admin account, then choose:
+REM    1 PRE     - snapshot stored on this VM + emailed (before a change)
+REM    2 POST    - compared with PRE, emails SUCCESS or DIFFERENCES FOUND
+REM    3 HEALTH  - health check report only
+REM    4 CLEANUP - delete old snapshots / reports / logs (also done on every run)
+REM  It starts the Secondary Logon service, asks for YOUR Windows account and
+REM  runs as that account; instances it can't use are retried as the RDP account.
+REM  Command line:  Run-PrePostCheck.bat -Phase HEALTH
+REM                 Run-PrePostCheck.bat -Phase CLEANUP   (e.g. from Task Scheduler)
+REM  Only 3 files, kept together in a folder your account can read and write:
+REM    Run-PrePostCheck.bat, Invoke-PrePostCheck.ps1, HC_Snapshot.sql
 REM ==========================================================================
 setlocal
-title SQL Server PRE-POST Change Check
+title SQL Server PRE-POST / Health Check
 cd /d "%~dp0"
+
+REM Cleanup only: no Secondary Logon / credentials needed
+echo %* | find /i "CLEANUP" >nul && goto :run
 
 REM --- Make sure the Secondary Logon service (needed for "run as different user") is running ---
 sc query seclogon | find /i "RUNNING" >nul
@@ -41,6 +46,7 @@ if errorlevel 1 (
     )
 )
 
+:run
 if not exist "%~dp0Invoke-PrePostCheck.ps1" (
     echo Invoke-PrePostCheck.ps1 not found in %~dp0
     pause

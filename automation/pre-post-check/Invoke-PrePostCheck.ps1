@@ -14,7 +14,9 @@
          Fail-safe: any instance your account can't log in to (or has no VIEW SERVER
          STATE on) is retried as the logged-in RDP account, and if run-as can't start
          at all, your account is used from this window. Cancel = RDP account only.
-      3. Every SQL instance on the VM (+ servers.txt) is checked.
+      3. Every SQL instance on the VM (+ ExtraInstances in $Config) is checked.
+      4. Files older than CleanupHours in Snapshots / Reports / Logs are removed (or run -Phase CLEANUP).
+    Only 3 files are needed: Run-PrePostCheck.bat, Invoke-PrePostCheck.ps1, HC_Snapshot.sql.
     Snapshots : Snapshots\<ticket>\<instance>_PRE|POST_<yyyyMMdd_HHmmss>.json
     Reports   : Reports\<instance>_<PRE|POST>_<ticket>_<yyyyMMdd_HHmm>.html
     Email     : Database Mail on each instance (preferred profile, else default/only profile).
@@ -61,7 +63,8 @@ $Config = @{
     ReportTitle           = 'SQL Server Change Check'
     HealthReportTitle     = 'SQL Server Health Check'      # used for -Phase HEALTH
     IncludeLocalInstances = $true
-    ServersFile           = Join-Path $PSScriptRoot 'servers.txt'
+    ExtraInstances        = @()      # other instances to add, e.g. @('SQLVM2', 'SQLVM3\INST2', 'SQLVM4,14330')
+    ServersFile           = Join-Path $PSScriptRoot 'servers.txt'   # optional, one instance per line (old setups)
     SnapshotRoot          = Join-Path $PSScriptRoot 'Snapshots'
     ReportsFolder         = Join-Path $PSScriptRoot 'Reports'
     LogsFolder            = Join-Path $PSScriptRoot 'Logs'
@@ -74,12 +77,14 @@ $Config = @{
     MailCheckDelaySec     = 20
     AttachReport          = $true    # attach the combined HTML report to the email (falls back to the email body)
     PerInstanceReports    = $false   # also save one HTML file per instance
+    CleanupHours          = 48       # each run deletes Reports / Logs / finished Snapshots older than this (0 = off)
+    KeepPreWithoutPostDays = 7       # a PRE still waiting for its POST is kept this long
 }
 
 $ErrorActionPreference = 'Stop'
 $Phase = ([string]$Phase).Trim().ToUpperInvariant()
 if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
-if ($Inner -and $Phase -notin @('PRE', 'POST', 'HEALTH')) { throw "Invalid -Phase '$Phase' (use PRE, POST or HEALTH)." }
+if ($Inner -and $Phase -notin @('PRE', 'POST', 'HEALTH', 'CLEANUP')) { throw "Invalid -Phase '$Phase' (use PRE, POST, HEALTH or CLEANUP)." }
 if ($Instances) { $Instances = @($Instances -split ',' | ForEach-Object { $_.Trim(" '`"") } | Where-Object { $_ }) }
 
 # What to compare per section: Key = identifies a row, Compare = must be equal,
@@ -240,6 +245,7 @@ function Get-TargetInstances {
         return $targets
     }
     if ($Config.IncludeLocalInstances) { $targets += Get-LocalSqlInstances }
+    foreach ($x in @($Config.ExtraInstances)) { if ([string]$x) { $targets += [pscustomobject]@{ Instance = ([string]$x).Trim(); Service = ''; Status = 'Listed' } } }
     if (Test-Path $Config.ServersFile) {
         Get-Content $Config.ServersFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') } |
             ForEach-Object { $targets += [pscustomobject]@{ Instance = $_; Service = ''; Status = 'Listed' } }
@@ -247,6 +253,28 @@ function Get-TargetInstances {
     $seen = @{}; $unique = @()
     foreach ($t in $targets) { $k = $t.Instance.ToUpperInvariant(); if (-not $seen.ContainsKey($k)) { $seen[$k] = $true; $unique += $t } }
     return $unique
+}
+
+function Invoke-Cleanup([int]$Hours = $Config.CleanupHours, [int]$KeepPreDays = $Config.KeepPreWithoutPostDays) {
+    # Reports / Logs: files older than $Hours. Snapshots: only once the ticket has a POST
+    # (a PRE still waiting for its POST is kept $KeepPreDays days). Empty ticket folders are removed.
+    if ($Hours -le 0) { return }
+    $cutoff = (Get-Date).AddHours(-$Hours); $preCutoff = (Get-Date).AddDays(-$KeepPreDays); $n = 0
+    $del = { param($f) try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $true } catch { Write-Step "  could not delete $($f.FullName): $($_.Exception.Message)" 'DarkGray'; $false } }
+    foreach ($folder in @($Config.ReportsFolder, $Config.LogsFolder)) {
+        if (-not (Test-Path $folder)) { continue }
+        Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff } | ForEach-Object { if (& $del $_) { $n++ } }
+    }
+    if (Test-Path $Config.SnapshotRoot) {
+        foreach ($dir in Get-ChildItem -Path $Config.SnapshotRoot -Directory -ErrorAction SilentlyContinue) {
+            $files   = @(Get-ChildItem -Path $dir.FullName -File -ErrorAction SilentlyContinue)
+            $hasPost = @($files | Where-Object { $_.Name -like '*_POST_*' }).Count -gt 0
+            $limit   = if ($hasPost) { $cutoff } else { $preCutoff }
+            foreach ($f in $files) { if ($f.LastWriteTime -lt $limit) { if (& $del $f) { $n++ } } }
+            if (-not (Get-ChildItem -Path $dir.FullName -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    Write-Step "Cleanup    : $n file(s) older than $Hours h removed (PRE without POST kept $KeepPreDays days)" 'DarkGray'
 }
 
 function New-SqlConnection([string]$Instance) {
@@ -584,11 +612,26 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
 # =============================================================================
 #  OUTER: prompts + log on as your account (used for SQL connections)
 # =============================================================================
+if ($Phase -eq 'CLEANUP') {
+    Write-Step '=== Cleanup of old Snapshots / Reports / Logs ===' 'Green'
+    $h = if ($Config.CleanupHours -gt 0) { $Config.CleanupHours } else { 48 }
+    Invoke-Cleanup $h $Config.KeepPreWithoutPostDays
+    if (-not $Inner) { Read-Host 'Press Enter to close' }
+    exit 0
+}
 if (-not $Inner) {
     Write-Step '=== SQL Server PRE / POST change check ===' 'Green'
     while ($Phase -notin @('PRE', 'POST', 'HEALTH')) {
-        $Phase = (Read-Host 'Phase - PRE (before a change), POST (after a change) or HEALTH (health check only)').Trim().ToUpperInvariant()
-        if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
+        Write-Host '  1 = PRE      snapshot before a change'
+        Write-Host '  2 = POST     compare after the change with PRE'
+        Write-Host '  3 = HEALTH   health check report only'
+        Write-Host '  4 = CLEANUP  delete old snapshots / reports / logs'
+        $Phase = (Read-Host 'Choose 1-4 (or type PRE / POST / HEALTH / CLEANUP)').Trim().ToUpperInvariant()
+        $Phase = switch ($Phase) { '1' { 'PRE' } '2' { 'POST' } '3' { 'HEALTH' } 'HC' { 'HEALTH' } '4' { 'CLEANUP' } default { $Phase } }
+        if ($Phase -eq 'CLEANUP') {
+            Invoke-Cleanup $(if ($Config.CleanupHours -gt 0) { $Config.CleanupHours } else { 48 }) $Config.KeepPreWithoutPostDays
+            Read-Host 'Press Enter to close'; exit 0
+        }
     }
     if (-not $PSBoundParameters.ContainsKey('Ticket')) {
         $Ticket = if ($Phase -eq 'HEALTH') { Read-Host 'Ticket / label (optional, Enter = DAILY)' }
@@ -681,6 +724,7 @@ foreach ($key in @('SnapshotRoot', 'ReportsFolder', 'LogsFolder')) {
 }
 $logFile = Join-Path $Config.LogsFolder "PrePostCheck_${Phase}_${Ticket}_$stamp.log"
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { }
+if (-not $script:RetryErrors) { try { Invoke-Cleanup } catch { Write-Step "Cleanup skipped: $($_.Exception.Message)" 'DarkGray' } }
 
 $summary = @()
 if ($script:HandOffRows) { $summary = @($script:HandOffRows) }
