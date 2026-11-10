@@ -59,6 +59,8 @@ param(
 $Config = @{
     Recipients            = 'dba-team@yourcompany.com'   # ; separated
     CopyRecipients        = ''
+    FromAddress           = ''                           # optional, e.g. 'SQL Alerts <sqlalerts@yourcompany.com>' ('' = profile's account)
+    ReplyTo               = ''                           # optional reply-to address
     MailProfile           = 'DBA_Mail'                   # preferred; else default / only profile on the instance
     ReportTitle           = 'SQL Server Change Check'
     HealthReportTitle     = 'SQL Server Health Check'      # used for -Phase HEALTH
@@ -599,6 +601,8 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
     [void]$cmd.Parameters.AddWithValue('@profile_name', $MailProfileName)
     [void]$cmd.Parameters.AddWithValue('@recipients', $Config.Recipients)
     if ($Config.CopyRecipients) { [void]$cmd.Parameters.AddWithValue('@copy_recipients', $Config.CopyRecipients) }
+    if ($Config.FromAddress) { [void]$cmd.Parameters.AddWithValue('@from_address', $Config.FromAddress) }
+    if ($Config.ReplyTo)     { [void]$cmd.Parameters.AddWithValue('@reply_to', $Config.ReplyTo) }
     [void]$cmd.Parameters.AddWithValue('@subject', $Subject)
     $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
     [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
