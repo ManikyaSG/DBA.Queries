@@ -11,6 +11,8 @@ Ready-to-run DMV queries for day-to-day DBA work and incident troubleshooting, o
 3. Values you need to change are marked `-- <== change`.
 4. Statements that change things (KILL, failover, ALTER, DROP) are **commented out** or only *generated* as text. Review before running.
 
+**Prefer objects to scripts?** `dba-database/DBAdmin_HC_Deploy.sql` installs these sections as `DBAdmin.dbo.HC_*` views, functions and procedures (`SELECT * FROM DBAdmin.dbo.HC_catalog;` lists them). See [dba-database/README.md](dba-database/README.md).
+
 ## On-call quick card
 
 **Paged for a P1:**
