@@ -95,7 +95,7 @@ Run-PrePostCheck.bat -Phase CLEANUP
 
 ## Permissions and troubleshooting
 
-Your account needs `VIEW SERVER STATE`, read access to `msdb`, and `DatabaseMailUserRole` (or sysadmin) on every instance. Both your account and the RDP account need write access to the folder (snapshots, reports and logs are written by whichever account checks the instance).
+Your account needs `VIEW SERVER STATE`, read access to `msdb`, and `DatabaseMailUserRole` (or sysadmin) on every instance. Both your account and the RDP account need write access to the folder (snapshots, reports and logs are written by whichever account checks the instance). The script grants both accounts Modify on the folder at the start of each run (`icacls`, inherited by all subfolders). If that isn't allowed, a snapshot it can't save goes to that account's `%TEMP%\DBA_PrePostCheck\Snapshots\<ticket>` and the report says so; copy it into `Snapshots\<ticket>` before the POST run.
 For the SSIS / SSRS / SSAS sections it also needs:
 - **SSIS:** read access to `SSISDB` (sysadmin, or `ssis_admin`). Otherwise the section is skipped and a warning is added.
 - **SSRS:** read access to the report server database (for example `ReportServer`). It must be on the same instance; a remote report server catalog isn't seen.
