@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    PRE / POST change health check for every SQL Server instance on this VM.
+    PRE / POST change check and HEALTH check (with performance window) for every SQL Server
+    instance on this VM.  (v2: performance window + scheduling; jobs/logins/roles removed)
     PRE  : collects a full health-check snapshot (HC_Snapshot.sql), stores it on the VM
            as JSON and emails a "PRE captured" report.
     POST : collects the same snapshot, compares it with the stored PRE and emails
@@ -25,12 +26,20 @@
       instance settings, services, sp_configure, global trace flags, databases (state,
       recovery model, compat, owner, options, AG role/sync, backup folders), AG replicas
       (roles, primary, modes, health, listeners), AG databases per replica, cluster &
-      quorum, disks, data/log files (paths, growth, max size), jobs (enabled, owner),
-      logins, server role members, linked servers, endpoints, certificates, XE sessions,
+      quorum, disks, data/log files (paths, growth, max size), linked servers,
+      endpoints, certificates, XE sessions,
       and NEW problems (issues present after but not before).
     Expected changes (listed, not failures): build / CU / KB / product level, SQL start time.
     Size drift is ignored unless big: file/DB size change > FileSizeDriftPct % and
     > FileSizeDriftMinMB MB, disk free space change > DiskFreeDriftPct % of the disk.
+
+    HEALTH performance window (v2): after the health check, samples every instance every
+    PerfSampleSec seconds for PerfDurationMin minutes: throughput, compilations, connections and
+    connection pool usage, locking/blocking/deadlocks, memory, wait stats per interval, file
+    latency, tempdb, Always On queues/delay and listener connections, plus queries over
+    LongQuerySec seconds and the top 20 Query Store queries of the window. Sets 'blocked process
+    threshold' to BlockedProcessThresholdSec and a temporary XE session, both reverted at the end.
+    Option 5 (SCHEDULE) creates a Windows scheduled task that runs it unattended.
 
     Requirements: Windows PowerShell 5.1. No modules, sqlcmd or internet needed.
     Your SQL permissions: VIEW SERVER STATE, read msdb, DatabaseMailUserRole (or sysadmin).
@@ -41,6 +50,10 @@
     .\Invoke-PrePostCheck.ps1 -Phase PRE  -Ticket CHG0012345
 .EXAMPLE
     .\Invoke-PrePostCheck.ps1 -Phase POST -Ticket CHG0012345 -UseCurrentUser
+.EXAMPLE
+    .\Invoke-PrePostCheck.ps1 -Phase HEALTH -SampleSec 30 -DurationMin 15     # performance window 15 min
+.EXAMPLE
+    .\Invoke-PrePostCheck.ps1 -Phase HEALTH -Unattended -Ticket SCHEDULED       # what the scheduled task runs
 #>
 [CmdletBinding()]
 param(
@@ -50,7 +63,11 @@ param(
     [string[]] $Instances,
     [string]   $SqlFile,
     [switch]   $Inner,
-    [string]   $HandOff               # internal: result file shared with the original (RDP) window
+    [string]   $HandOff,              # internal: result file shared with the original (RDP) window
+    [int]      $SampleSec = 0,        # HEALTH performance window: seconds between samples (0 = $Config value)
+    [int]      $DurationMin = -1,     # HEALTH performance window: minutes (-1 = $Config value, 0 = skip)
+    [switch]   $NoPerf,               # HEALTH without the performance window
+    [switch]   $Unattended            # no prompts (Task Scheduler): runs as the task's account, no pauses
 )
 
 # =============================================================================
@@ -81,12 +98,23 @@ $Config = @{
     PerInstanceReports    = $false   # also save one HTML file per instance
     CleanupHours          = 48       # each run deletes Reports / Logs / finished Snapshots older than this (0 = off)
     KeepPreWithoutPostDays = 7       # a PRE still waiting for its POST is kept this long
+
+    # ---- HEALTH performance window ----
+    PerfSampling          = $true    # run the performance window after the HEALTH check
+    PerfSampleSec         = 60       # seconds between samples
+    PerfDurationMin       = 30       # length of the window in minutes
+    PerfDatabases         = @()      # databases for 'Trans/s' e.g. @('MARS', 'CLR'); @() = all databases
+    BlockedProcessThresholdSec = 5   # 'blocked process threshold' during the window (restored after)
+    LongQuerySec          = 5        # capture every query running longer than this (XE)
+    PerfThresholds        = @{ PleMin = 300; DataReadMs = 20; LogWriteMs = 10; AgSendQueueMB = 100 }
+    ScheduledTaskName     = 'DBA SQL Health Check'      # prefix of the Windows scheduled tasks created by option 5
 }
 
 $ErrorActionPreference = 'Stop'
 $Phase = ([string]$Phase).Trim().ToUpperInvariant()
 if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
-if ($Inner -and $Phase -notin @('PRE', 'POST', 'HEALTH', 'CLEANUP')) { throw "Invalid -Phase '$Phase' (use PRE, POST, HEALTH or CLEANUP)." }
+if ($Unattended) { $UseCurrentUser = $true; if (-not $Phase) { $Phase = 'HEALTH' } }
+if (($Inner -or $Unattended) -and $Phase -notin @('PRE', 'POST', 'HEALTH', 'CLEANUP')) { throw "Invalid -Phase '$Phase' (use PRE, POST, HEALTH or CLEANUP)." }
 if ($Instances) { $Instances = @($Instances -split ',' | ForEach-Object { $_.Trim(" '`"") } | Where-Object { $_ }) }
 
 # What to compare per section: Key = identifies a row, Compare = must be equal,
@@ -109,9 +137,6 @@ $Spec = [ordered]@{
     cluster        = @{ Title = 'Cluster & quorum';    Key = @('member_name');   Compare = @('quorum_type', 'quorum_state', 'member_type', 'member_state', 'votes') }
     disks          = @{ Title = 'Disks';               Key = @('volume');        Compare = @('total_gb'); Drift = @{ free_gb = 'disk' } }
     files          = @{ Title = 'Data & log files';    Key = @('database_name', 'logical_name'); Compare = @('type', 'physical_name', 'state', 'growth', 'max_size'); Drift = @{ size_mb = 'pct' } }
-    jobs           = @{ Title = 'Agent jobs';          Key = @('name');          Compare = @('enabled', 'owner', 'category') }
-    logins         = @{ Title = 'Logins';              Key = @('name');          Compare = @('type', 'is_disabled', 'default_database') }
-    server_roles   = @{ Title = 'Server role members'; Key = @('role', 'member'); Compare = @() }
     linked_servers = @{ Title = 'Linked servers';      Key = @('name');          Compare = @('product', 'provider', 'data_source') }
     endpoints      = @{ Title = 'Endpoints';           Key = @('name');          Compare = @('type', 'state', 'port') }
     certificates   = @{ Title = 'Certificates';        Key = @('name');          Compare = @('thumbprint', 'expiry') }
@@ -203,7 +228,8 @@ function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value
 function Get-Val($Row, [string]$Col) {
     if ($null -eq $Row) { return '' }
     if ($Row -is [System.Collections.IDictionary]) {
-        if ($Row.ContainsKey($Col) -and $null -ne $Row[$Col]) { return ([string]$Row[$Col]).Trim() }
+        $has = if ($Row -is [System.Collections.Specialized.OrderedDictionary]) { $Row.Contains($Col) } else { $Row.ContainsKey($Col) }
+        if ($has -and $null -ne $Row[$Col]) { return ([string]$Row[$Col]).Trim() }
         return ''
     }
     $p = $Row.PSObject.Properties[$Col]
@@ -429,6 +455,407 @@ function Get-Snapshot($Connection, [string]$SqlText) {
     return @{ sections = $sections; columns = $columns }
 }
 
+# =============================================================================
+#  PERFORMANCE WINDOW (HEALTH): sample every N seconds, then report trends
+# =============================================================================
+function Get-SqlBlocks([string]$Text) {
+    # HC_Snapshot.sql = health-check part, then --##PERF_* blocks run separately
+    $blocks = @{}; $name = 'HC'; $sb = New-Object System.Text.StringBuilder
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^--##(PERF_\w+)\s*$') { $blocks[$name] = $sb.ToString(); $name = $Matches[1]; $sb = New-Object System.Text.StringBuilder; continue }
+        [void]$sb.AppendLine($line)
+    }
+    $blocks[$name] = $sb.ToString()
+    return $blocks
+}
+
+function Expand-SqlTokens([string]$Sql, [hashtable]$Tokens) {
+    foreach ($k in $Tokens.Keys) { $Sql = $Sql.Replace('{{' + $k + '}}', [string]$Tokens[$k]) }
+    return $Sql
+}
+
+function ConvertTo-Num($Value) {
+    $d = 0.0
+    if ([double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d }
+    return 0.0
+}
+
+function Get-PcMap($Snap) {
+    $m = @{}
+    foreach ($r in @(Get-Rows $Snap 'pc')) { $m[('{0}|{1}|{2}' -f $r['obj'], $r['ctr'], $r['inst'])] = (ConvertTo-Num $r['val']) }
+    return $m
+}
+function Get-Pc($Map, [string]$Key) { if ($Map.ContainsKey($Key)) { return [double]$Map[$Key] }; return 0.0 }
+function Get-SampleTime($Snap) {
+    $t = Get-Val (@(Get-Rows $Snap 'sample') | Select-Object -First 1) 'sample_time'
+    return [datetime]::ParseExact($t, 'yyyy-MM-dd HH:mm:ss.fff', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+function R1([double]$v) { return [math]::Round($v, 1) }
+
+function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$DurationMin) {
+    # $Items: objects with Instance, Conn, Safe. Adds Samples, Setup, End, Notes, StartTime.
+    $tok = @{ BPT_SEC = [int]$Config.BlockedProcessThresholdSec; LONG_SEC = [int]$Config.LongQuerySec; LONG_US = [int64]$Config.LongQuerySec * 1000000 }
+    foreach ($it in $Items) {
+        $it | Add-Member -NotePropertyName Samples -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
+        $it | Add-Member -NotePropertyName Notes -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
+        $it | Add-Member -NotePropertyName Setup -NotePropertyValue $null -Force
+        $it | Add-Member -NotePropertyName End -NotePropertyValue $null -Force
+        $it | Add-Member -NotePropertyName StartTime -NotePropertyValue ((Get-Date).ToString('o')) -Force
+        $it | Add-Member -NotePropertyName RestoreFile -NotePropertyValue (Join-Path $Config.LogsFolder ("perf_restore_{0}.txt" -f $it.Safe)) -Force
+        # A run that was interrupted left the threshold changed: put the value it recorded back first
+        if (Test-Path -LiteralPath $it.RestoreFile) {
+            $old = ([string](Get-Content -LiteralPath $it.RestoreFile -Raw)).Trim()
+            if ($old -match '^\d+$') {
+                try { [void](Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_TEARDOWN'] @{ RESTORE = 1; ORIG = $old })); Write-Step "  $($it.Instance): restored blocked process threshold ($old) left by an interrupted run" 'Yellow' } catch { }
+            }
+            Remove-Item -LiteralPath $it.RestoreFile -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            $r = Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_START'] $tok)
+            $it.Setup = @(Get-Rows $r 'perf_setup') | Select-Object -First 1
+            if ($it.Setup) {
+                $it.StartTime = $it.Setup['start_time']
+                if ($it.Setup['threshold_set'] -eq '1') { try { Set-Content -LiteralPath $it.RestoreFile -Value $it.Setup['orig_threshold'] } catch { } }
+                if ($it.Setup['message']) { [void]$it.Notes.Add([string]$it.Setup['message']); Write-Step "  $($it.Instance): $($it.Setup['message'])" 'Yellow' }
+                $xeTxt = if ($it.Setup['xe_started'] -eq '1') { 'XE session DBA_PerfWindow started' } else { 'no XE session (DMV sampling only)' }
+                Write-Step ("  {0}: blocked process threshold {1} s -> {2} s, {3}" -f $it.Instance, $it.Setup['orig_threshold'], $(if ($it.Setup['threshold_set'] -eq '1') { $Config.BlockedProcessThresholdSec } else { $it.Setup['orig_threshold'] }), $xeTxt) 'DarkGray'
+            }
+        }
+        catch { [void]$it.Notes.Add("Setup failed: $($_.Exception.Message)"); Write-Step "  $($it.Instance): setup failed - $($_.Exception.Message)" 'Yellow' }
+    }
+
+    $n = [math]::Max(1, [int][math]::Floor($DurationMin * 60 / $SampleSec))
+    Write-Step ("Performance window: {0} intervals of {1} s, ends about {2}{3}" -f $n, $SampleSec, (Get-Date).AddSeconds($n * $SampleSec).ToString('HH:mm'), $(if ($Unattended) { '' } else { ' (press Q to stop early)' })) 'Green'
+    try {
+        for ($i = 0; $i -le $n; $i++) {
+            $t0 = Get-Date
+            foreach ($it in $Items) {
+                try { [void]$it.Samples.Add((Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_SAMPLE'] $tok))) }
+                catch { [void]$it.Notes.Add("Sample at $($t0.ToString('HH:mm:ss')) failed: $($_.Exception.Message)") }
+            }
+            Write-Host ("`r  sample {0}/{1} at {2}   " -f $i, $n, (Get-Date -Format 'HH:mm:ss')) -NoNewline
+            if ($i -ge $n) { break }
+            $stop = $false
+            while (((Get-Date) - $t0).TotalSeconds -lt $SampleSec) {
+                Start-Sleep -Milliseconds 500
+                if (-not $Unattended) { try { if ([Console]::KeyAvailable -and ([Console]::ReadKey($true)).Key -eq 'Q') { $stop = $true; break } } catch { } }
+            }
+            if ($stop) { Write-Host ''; Write-Step 'Stopping early - taking the last sample now.' 'Yellow'; $n = $i + 1 }
+        }
+        Write-Host ''
+        foreach ($it in $Items) {
+            try { $it.End = Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_END'] @{ START = $it.StartTime; LONG_SEC = $Config.LongQuerySec }) }
+            catch { [void]$it.Notes.Add("Blocked process / deadlock / Query Store collection failed: $($_.Exception.Message)") }
+        }
+    }
+    finally {
+        # Always put the server back: drop the XE session, restore the original threshold
+        foreach ($it in $Items) {
+            $restore = if ($it.Setup -and $it.Setup['threshold_set'] -eq '1') { 1 } else { 0 }
+            $orig = if ($it.Setup) { $it.Setup['orig_threshold'] } else { '0' }
+            try {
+                $td = @(Get-Rows (Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_TEARDOWN'] @{ RESTORE = $restore; ORIG = $orig })) 'perf_teardown') | Select-Object -First 1
+                if ($td -and $td['message']) { [void]$it.Notes.Add([string]$td['message']); Write-Step "  $($it.Instance): $($td['message'])" 'Yellow' }
+                else { Remove-Item -LiteralPath $it.RestoreFile -Force -ErrorAction SilentlyContinue }
+                if ($restore) { Write-Step "  $($it.Instance): blocked process threshold restored to $orig s, XE session dropped" 'DarkGray' }
+            }
+            catch {
+                $fix = "EXEC sp_configure 'blocked process threshold (s)', $orig; RECONFIGURE; DROP EVENT SESSION DBA_PerfWindow ON SERVER;"
+                [void]$it.Notes.Add("Clean-up failed ($($_.Exception.Message)) - run: $fix")
+                Write-Step "  WARNING: $($it.Instance) clean-up failed - run: $fix" 'Red'
+            }
+        }
+    }
+}
+
+function Get-PerfResult($It, [int]$SampleSec) {
+    # Turns the samples into per-interval rows, window summary, issues and HTML.
+    $th = $Config.PerfThresholds
+    $S = @($It.Samples)
+    $issues = New-Object System.Collections.ArrayList
+    $addIssue = { param($sev, $area, $item, $detail) [void]$issues.Add([ordered]@{ severity = $sev; area = $area; item = $item; detail = $detail }) }
+    $iv = New-Object System.Collections.ArrayList
+    $wv = New-Object System.Collections.ArrayList
+    $waitGroups = @('LCK_M_*', 'PAGEIOLATCH_*', 'PAGELATCH_*', 'WRITELOG', 'CXPACKET', 'CXCONSUMER', 'SOS_SCHEDULER_YIELD', 'HADR_SYNC_COMMIT', 'RESOURCE_SEMAPHORE')
+    $waitTot = @{}; foreach ($g in $waitGroups) { $waitTot[$g] = 0.0 }
+    $tx = @{}; $deadlocks = 0.0; $timeouts = 0.0
+    $pool = @{}; $ag = @{}; $lsn = @{}
+    $skipDb = @('_Total', 'mssqlsystemresource')
+
+    for ($k = 1; $k -lt $S.Count; $k++) {
+        $a = $S[$k - 1]; $b = $S[$k]
+        try { $ta = Get-SampleTime $a; $tb = Get-SampleTime $b } catch { continue }
+        $dt = ($tb - $ta).TotalSeconds; if ($dt -le 0) { continue }
+        $ma = Get-PcMap $a; $mb = Get-PcMap $b
+        $rate = { param($key) [math]::Max(0.0, ((Get-Pc $mb $key) - (Get-Pc $ma $key)) / $dt) }
+        $delta = { param($key) [math]::Max(0.0, (Get-Pc $mb $key) - (Get-Pc $ma $key)) }
+
+        # transactions/sec per database
+        $tps = 0.0
+        foreach ($key in @($mb.Keys | Where-Object { $_ -like 'Databases|Transactions/sec|*' })) {
+            $db = $key.Substring('Databases|Transactions/sec|'.Length)
+            if ($skipDb -contains $db) { continue }
+            $v = & $rate $key
+            if (-not $tx.ContainsKey($db)) { $tx[$db] = New-Object System.Collections.ArrayList }
+            [void]$tx[$db].Add($v)
+            if (@($Config.PerfDatabases).Count -gt 0) { if (@($Config.PerfDatabases) -contains $db) { $tps += $v } }
+        }
+        if (@($Config.PerfDatabases).Count -eq 0) { $tps = & $rate 'Databases|Transactions/sec|_Total' }
+
+        # file latency (all databases)
+        $io = @{}
+        foreach ($snap in @($a, $b)) { foreach ($r in @(Get-Rows $snap 'io')) { $io[('{0}|{1}|{2}' -f [object]::ReferenceEquals($snap, $a), $r['db'], $r['ftype'])] = $r } }
+        $dR = 0.0; $dRs = 0.0; $dW = 0.0; $dWs = 0.0
+        foreach ($r in @(Get-Rows $b 'io')) {
+            $p = $io[('True|{0}|{1}' -f $r['db'], $r['ftype'])]; if (-not $p) { continue }
+            if ($r['ftype'] -eq 'DATA') { $dR += [math]::Max(0, (ConvertTo-Num $r['reads']) - (ConvertTo-Num $p['reads'])); $dRs += [math]::Max(0, (ConvertTo-Num $r['read_stall_ms']) - (ConvertTo-Num $p['read_stall_ms'])) }
+            else { $dW += [math]::Max(0, (ConvertTo-Num $r['writes']) - (ConvertTo-Num $p['writes'])); $dWs += [math]::Max(0, (ConvertTo-Num $r['write_stall_ms']) - (ConvertTo-Num $p['write_stall_ms'])) }
+        }
+
+        $blk = @(Get-Rows $b 'blocking') | Select-Object -First 1
+        $tdb = @(Get-Rows $b 'tempdb') | Select-Object -First 1
+        $agRows = @(Get-Rows $b 'ag')
+        $mirr = & $delta 'Database Replica|Mirrored Write Transactions/sec|_Total'
+        $bchrBase = Get-Pc $mb 'Buffer Manager|Buffer cache hit ratio base|'
+        $deadlocks += & $delta 'Locks|Number of Deadlocks/sec|_Total'
+        $timeouts  += & $delta 'Locks|Lock Timeouts/sec|_Total'
+
+        [void]$iv.Add([ordered]@{
+            'Time'               = $tb.ToString('HH:mm:ss')
+            'Batch req/s'        = R1 (& $rate 'SQL Statistics|Batch Requests/sec|')
+            'Trans/s'            = R1 $tps
+            'Compiles/s'         = R1 (& $rate 'SQL Statistics|SQL Compilations/sec|')
+            'Recompiles/s'       = R1 (& $rate 'SQL Statistics|SQL Re-Compilations/sec|')
+            'User conns'         = Get-Pc $mb 'General Statistics|User Connections|'
+            'Lock waits/s'       = R1 (& $rate 'Locks|Lock Waits/sec|_Total')
+            'Lock wait ms/s'     = R1 (& $rate 'Locks|Lock Wait Time (ms)|_Total')
+            'Lock timeouts/s'    = R1 (& $rate 'Locks|Lock Timeouts/sec|_Total')
+            'Deadlocks/s'        = [math]::Round((& $rate 'Locks|Number of Deadlocks/sec|_Total'), 3)
+            'Blocked >5s'        = ConvertTo-Num (Get-Val $blk 'blocked')
+            'Max block s'        = R1 ((ConvertTo-Num (Get-Val $blk 'max_wait_ms')) / 1000)
+            'PLE s'              = Get-Pc $mb 'Buffer Manager|Page life expectancy|'
+            'Buffer hit %'       = $(if ($bchrBase -gt 0) { R1 ((Get-Pc $mb 'Buffer Manager|Buffer cache hit ratio|') / $bchrBase * 100) } else { 0 })
+            'Grants pending'     = Get-Pc $mb 'Memory Manager|Memory Grants Pending|'
+            'Target MB'          = [math]::Round((Get-Pc $mb 'Memory Manager|Target Server Memory (KB)|') / 1024)
+            'Total MB'           = [math]::Round((Get-Pc $mb 'Memory Manager|Total Server Memory (KB)|') / 1024)
+            'Data read ms'       = $(if ($dR -gt 0) { R1 ($dRs / $dR) } else { 0 })
+            'Log write ms'       = $(if ($dW -gt 0) { R1 ($dWs / $dW) } else { 0 })
+            'Log flush wait ms/s'= R1 (& $rate 'Databases|Log Flush Wait Time|_Total')
+            'Log MB/s'           = [math]::Round((& $rate 'Databases|Log Bytes Flushed/sec|_Total') / 1MB, 2)
+            'TempDB used MB'     = R1 ((ConvertTo-Num (Get-Val $tdb 'user_mb')) + (ConvertTo-Num (Get-Val $tdb 'internal_mb')) + (ConvertTo-Num (Get-Val $tdb 'version_mb')))
+            'Version store MB'   = R1 ((Get-Pc $mb 'Transactions|Version Store Size (KB)|') / 1024)
+            'TempDB alloc waits' = ConvertTo-Num (Get-Val $tdb 'alloc_waiters')
+            'AG send queue MB'   = R1 ((@($agRows | ForEach-Object { ConvertTo-Num $_['send_queue_kb'] }) + 0 | Measure-Object -Maximum).Maximum / 1024)
+            'AG redo queue MB'   = R1 ((@($agRows | ForEach-Object { ConvertTo-Num $_['redo_queue_kb'] }) + 0 | Measure-Object -Maximum).Maximum / 1024)
+            'AG trans delay ms'  = $(if ($mirr -gt 0) { R1 ((& $delta 'Database Replica|Transaction Delay|_Total') / $mirr) } else { 0 })
+            'Listener conns'     = (@(Get-Rows $b 'listener' | ForEach-Object { ConvertTo-Num $_['connections'] }) + 0 | Measure-Object -Sum).Sum
+        })
+
+        # waits per interval (ms waited in the interval)
+        $wa = @{}; foreach ($r in @(Get-Rows $a 'waits')) { $wa[$r['grp']] = ConvertTo-Num $r['wait_ms'] }
+        $wrow = [ordered]@{ 'Time' = $tb.ToString('HH:mm:ss') }
+        foreach ($g in $waitGroups) {
+            $wb = 0.0; foreach ($r in @(Get-Rows $b 'waits')) { if ($r['grp'] -eq $g) { $wb = ConvertTo-Num $r['wait_ms'] } }
+            $d = [math]::Max(0.0, $wb - $(if ($wa.ContainsKey($g)) { $wa[$g] } else { $wb }))
+            $wrow[$g] = [math]::Round($d); $waitTot[$g] += $d
+        }
+        [void]$wv.Add($wrow)
+    }
+
+    # connection pool usage, Always On and listeners across all samples
+    foreach ($snap in $S) {
+        foreach ($r in @(Get-Rows $snap 'sessions')) {
+            $key = '{0}|{1}|{2}' -f $r['program'], $r['host'], $r['login']
+            if (-not $pool.ContainsKey($key)) { $pool[$key] = @{ program = $r['program']; host = $r['host']; login = $r['login']; max = 0.0; sum = 0.0; maxActive = 0.0 } }
+            $p = $pool[$key]; $c = ConvertTo-Num $r['sessions']
+            $p.sum += $c; if ($c -gt $p.max) { $p.max = $c }
+            $ac = ConvertTo-Num $r['active']; if ($ac -gt $p.maxActive) { $p.maxActive = $ac }
+        }
+        foreach ($r in @(Get-Rows $snap 'ag')) {
+            $key = '{0}|{1}|{2}' -f $r['ag_name'], $r['db'], $r['replica']
+            if (-not $ag.ContainsKey($key)) { $ag[$key] = @{ ag = $r['ag_name']; db = $r['db']; replica = $r['replica']; states = @{}; send = 0.0; redo = 0.0; last = '' } }
+            $g = $ag[$key]; $g.states[$r['sync_state']] = $true; $g.last = $r['sync_state']
+            $sq = ConvertTo-Num $r['send_queue_kb']; if ($sq -gt $g.send) { $g.send = $sq }
+            $rq = ConvertTo-Num $r['redo_queue_kb']; if ($rq -gt $g.redo) { $g.redo = $rq }
+        }
+        foreach ($r in @(Get-Rows $snap 'listener')) {
+            $key = '{0}|{1}' -f $r['listener'], $r['ip_address']
+            if (-not $lsn.ContainsKey($key)) { $lsn[$key] = @{ listener = $r['listener']; ip = $r['ip_address']; min = [double]::MaxValue; max = 0.0; sum = 0.0; n = 0 } }
+            $l = $lsn[$key]; $c = ConvertTo-Num $r['connections']; $l.sum += $c; $l.n++
+            if ($c -gt $l.max) { $l.max = $c }; if ($c -lt $l.min) { $l.min = $c }
+        }
+    }
+    $first = if ($S.Count) { $S[0] } else { $null }; $last = if ($S.Count) { $S[$S.Count - 1] } else { $null }
+    $mf = Get-PcMap $first; $ml = Get-PcMap $last
+
+    # ---- tables ----
+    $nS = [math]::Max(1, $S.Count)
+    $poolRows = @($pool.Values | Sort-Object { $_.max } -Descending | Select-Object -First 15 | ForEach-Object {
+        [ordered]@{ 'Program' = $_.program; 'Host' = $_.host; 'Login' = $_.login; 'Peak sessions' = $_.max; 'Avg sessions' = R1 ($_.sum / $nS); 'Peak active' = $_.maxActive } })
+    $txRows = @($tx.Keys | ForEach-Object {
+        $vals = @($tx[$_]); [ordered]@{ 'Database' = $_; 'Avg trans/s' = R1 (($vals | Measure-Object -Average).Average); 'Peak trans/s' = R1 (($vals | Measure-Object -Maximum).Maximum) } } |
+        Where-Object { @($Config.PerfDatabases).Count -eq 0 -or @($Config.PerfDatabases) -contains $_['Database'] } |
+        Sort-Object { $_['Avg trans/s'] } -Descending | Select-Object -First 15)
+    $ioRows = @()
+    if ($first -and $last) {
+        $fio = @{}; foreach ($r in @(Get-Rows $first 'io')) { $fio[('{0}|{1}' -f $r['db'], $r['ftype'])] = $r }
+        $ioRows = @(Get-Rows $last 'io' | ForEach-Object {
+            $p = $fio[('{0}|{1}' -f $_['db'], $_['ftype'])]; if (-not $p) { return }
+            $rd = [math]::Max(0, (ConvertTo-Num $_['reads']) - (ConvertTo-Num $p['reads'])); $wr = [math]::Max(0, (ConvertTo-Num $_['writes']) - (ConvertTo-Num $p['writes']))
+            $rs = [math]::Max(0, (ConvertTo-Num $_['read_stall_ms']) - (ConvertTo-Num $p['read_stall_ms'])); $ws = [math]::Max(0, (ConvertTo-Num $_['write_stall_ms']) - (ConvertTo-Num $p['write_stall_ms']))
+            if ($rd + $wr -eq 0) { return }
+            [ordered]@{ 'Database' = $_['db']; 'File type' = $_['ftype']; 'Reads' = $rd; 'Avg read ms' = $(if ($rd) { R1 ($rs / $rd) } else { 0 }); 'Writes' = $wr; 'Avg write ms' = $(if ($wr) { R1 ($ws / $wr) } else { 0 }) }
+        } | Sort-Object { [math]::Max($_['Avg read ms'], $_['Avg write ms']) } -Descending)
+    }
+    $agRows2 = @($ag.Values | Sort-Object { $_.ag }, { $_.db }, { $_.replica } | ForEach-Object {
+        $dbKey = $_.db
+        $dly = (Get-Pc $ml "Database Replica|Transaction Delay|$dbKey") - (Get-Pc $mf "Database Replica|Transaction Delay|$dbKey")
+        $mw  = (Get-Pc $ml "Database Replica|Mirrored Write Transactions/sec|$dbKey") - (Get-Pc $mf "Database Replica|Mirrored Write Transactions/sec|$dbKey")
+        $bad = @($_.states.Keys | Where-Object { $_ -and $_ -notin @('SYNCHRONIZED', 'SYNCHRONIZING') })
+        [ordered]@{ 'status' = $(if ($bad.Count) { 'CRITICAL' } else { '' }); 'AG' = $_.ag; 'Database' = $_.db; 'Replica' = $_.replica; 'Sync state (last)' = $_.last
+                    'States seen' = (@($_.states.Keys) -join ', '); 'Max send queue MB' = R1 ($_.send / 1024); 'Max redo queue MB' = R1 ($_.redo / 1024)
+                    'Avg trans delay ms' = $(if ($mw -gt 0) { R1 ($dly / $mw) } else { '' }) } })
+    $lsnRows = @($lsn.Values | Sort-Object { $_.listener } | ForEach-Object {
+        [ordered]@{ 'Listener' = $_.listener; 'IP' = $_.ip; 'Min conns' = $(if ($_.n) { $_.min } else { 0 }); 'Avg conns' = $(if ($_.n) { R1 ($_.sum / $_.n) } else { 0 }); 'Max conns' = $_.max } })
+
+    # ---- window summary (avg / min / max of every interval metric) ----
+    $areas = [ordered]@{
+        'Throughput' = @('Batch req/s', 'Trans/s'); 'Compilation' = @('Compiles/s', 'Recompiles/s'); 'Connections' = @('User conns')
+        'Locking' = @('Lock waits/s', 'Lock wait ms/s', 'Lock timeouts/s', 'Deadlocks/s', 'Blocked >5s', 'Max block s')
+        'Memory' = @('PLE s', 'Buffer hit %', 'Grants pending', 'Target MB', 'Total MB')
+        'I/O' = @('Data read ms', 'Log write ms', 'Log flush wait ms/s', 'Log MB/s')
+        'TempDB' = @('TempDB used MB', 'Version store MB', 'TempDB alloc waits')
+        'Always On' = @('AG send queue MB', 'AG redo queue MB', 'AG trans delay ms', 'Listener conns')
+    }
+    $sum = New-Object System.Collections.ArrayList
+    foreach ($area in $areas.Keys) {
+        foreach ($m in $areas[$area]) {
+            $vals = @($iv | ForEach-Object { [double]$_[$m] })
+            if (-not $vals.Count) { continue }
+            $st = $vals | Measure-Object -Average -Minimum -Maximum
+            [void]$sum.Add([ordered]@{ 'Area' = $area; 'Metric' = $m; 'Avg' = R1 $st.Average; 'Min' = R1 $st.Minimum; 'Max' = R1 $st.Maximum })
+        }
+    }
+    $metric = { param($name, $stat) $r = $sum | Where-Object { $_['Metric'] -eq $name } | Select-Object -First 1; if ($r) { [double]$r[$stat] } else { 0.0 } }
+
+    # ---- issues ----
+    $xeBlocked = @(Get-Rows $It.End 'xe_blocked'); $xeDl = @(Get-Rows $It.End 'xe_deadlocks'); $xeLong = @(Get-Rows $It.End 'xe_long')
+    $blockedNow = @($S | ForEach-Object { Get-Rows $_ 'blocked_now' })
+    if ($iv.Count -and (& $metric 'PLE s' 'Min') -lt $th.PleMin) { & $addIssue 'WARNING' 'Memory' 'Page Life Expectancy' ("Dropped to {0} s (threshold {1} s)" -f (& $metric 'PLE s' 'Min'), $th.PleMin) }
+    if ((& $metric 'Grants pending' 'Max') -gt 0) { & $addIssue 'WARNING' 'Memory' 'Memory Grants Pending' ("Up to {0} queries waiting for memory" -f (& $metric 'Grants pending' 'Max')) }
+    if ($waitTot['RESOURCE_SEMAPHORE'] -gt 0) { & $addIssue 'WARNING' 'Memory' 'RESOURCE_SEMAPHORE waits' ("{0:N0} ms waited for query memory" -f $waitTot['RESOURCE_SEMAPHORE']) }
+    $dlCount = [math]::Max([math]::Round($deadlocks), $xeDl.Count)
+    if ($dlCount -gt 0) { & $addIssue 'WARNING' 'Locking' 'Deadlocks' "$dlCount deadlock(s) in the window" }
+    if ((& $metric 'Blocked >5s' 'Max') -gt 0 -or $xeBlocked.Count -gt 0) { & $addIssue 'WARNING' 'Locking' 'Blocking' ("Sessions blocked over {0} s: up to {1} at a time, {2} blocked process report(s), longest {3} s" -f $Config.BlockedProcessThresholdSec, (& $metric 'Blocked >5s' 'Max'), $xeBlocked.Count, (& $metric 'Max block s' 'Max')) }
+    if ($timeouts -gt 0) { & $addIssue 'WARNING' 'Locking' 'Lock timeouts' ("{0:N0} lock timeout(s)" -f $timeouts) }
+    if ((& $metric 'Data read ms' 'Avg') -gt $th.DataReadMs) { & $addIssue 'WARNING' 'I/O' 'Data file read latency' ("Average {0} ms (threshold {1} ms)" -f (& $metric 'Data read ms' 'Avg'), $th.DataReadMs) }
+    if ((& $metric 'Log write ms' 'Avg') -gt $th.LogWriteMs) { & $addIssue 'WARNING' 'I/O' 'Log file write latency' ("Average {0} ms (threshold {1} ms)" -f (& $metric 'Log write ms' 'Avg'), $th.LogWriteMs) }
+    if ((& $metric 'TempDB alloc waits' 'Max') -gt 0) { & $addIssue 'WARNING' 'TempDB' 'Allocation contention' ("Up to {0} tasks waiting on tempdb allocation pages (PAGELATCH)" -f (& $metric 'TempDB alloc waits' 'Max')) }
+    foreach ($r in @($agRows2 | Where-Object { $_['status'] -eq 'CRITICAL' })) { & $addIssue 'CRITICAL' 'Always On' "$($r['Database']) on $($r['Replica'])" "Not synchronizing during the window (states: $($r['States seen']))" }
+    if ((& $metric 'AG send queue MB' 'Max') -gt $th.AgSendQueueMB) { & $addIssue 'WARNING' 'Always On' 'Log send queue' ("Peaked at {0} MB (threshold {1} MB)" -f (& $metric 'AG send queue MB' 'Max'), $th.AgSendQueueMB) }
+    if ($xeLong.Count -gt 0) { & $addIssue 'WARNING' 'Queries' "Queries over $($Config.LongQuerySec) s" ("{0} query(ies), longest {1} s" -f $xeLong.Count, (Get-Val $xeLong[0] 'duration_s')) }
+    foreach ($note in @($It.Notes)) { & $addIssue 'WARNING' 'Collection' 'Performance window' $note }
+
+    $crit = @($issues | Where-Object { $_.severity -eq 'CRITICAL' }).Count
+    $warn = @($issues | Where-Object { $_.severity -eq 'WARNING' }).Count
+
+    # ---- HTML ----
+    $t1 = if ($S.Count) { try { (Get-SampleTime $S[0]).ToString('yyyy-MM-dd HH:mm') } catch { '' } } else { '' }
+    $t2 = if ($S.Count) { try { (Get-SampleTime $S[$S.Count - 1]).ToString('HH:mm') } catch { '' } } else { '' }
+    $cols = { param($rows) if (@($rows).Count) { @(@($rows)[0].Keys) } else { @() } }
+    $tbl = { param($title, $rows, $statusCol = '') $r = @($rows); "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count) { [string](ConvertTo-HtmlTable $r (& $cols $r) '' $statusCol) } else { '<div style="color:#2e7d32">None</div>' }) }
+    $endTbl = { param($title, $sec) $r = @(Get-Rows $It.End $sec); $c = if ($It.End -and $It.End['columns'].ContainsKey($sec)) { @($It.End['columns'][$sec]) } else { @() }
+                "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count -and $c.Count) { [string](ConvertTo-HtmlTable $r $c) } else { '<div style="color:#2e7d32">None</div>' }) }
+    $qsInfo = @(Get-Rows $It.End 'qs_info') | Select-Object -First 1
+    $qsNote = if ($qsInfo) { "Query Store is on for $(Get-Val $qsInfo 'qs_databases') of $(Get-Val $qsInfo 'user_databases') user databases. Query Store groups runtime stats into intervals (60 min by default), so totals include the whole intervals that overlap the window. $(Get-Val $qsInfo 'errors')" } else { 'Query Store data not collected.' }
+
+    $short = (@(
+        "<h2>Performance window: $t1 - $t2 ($($iv.Count) intervals of $SampleSec s)</h2>"
+        & $tbl 'Performance - needs attention' $issues 'severity'
+        & $tbl 'Performance summary for the window' $sum
+    ) -join '')
+    $full = $short + (@(
+        & $tbl 'Per interval' $iv
+        "<h3>Wait stats per interval - ms waited</h3>" + $(if ($wv.Count) { [string](ConvertTo-HtmlTable $wv (& $cols $wv)) } else { '<div>None</div>' })
+        & $tbl 'Transactions/sec per database' $txRows
+        & $tbl 'Data / log file latency in the window' $ioRows
+        & $tbl 'Connection pool usage (sessions per application / host / login)' $poolRows
+        & $tbl 'Always On during the window' $agRows2 'status'
+        & $tbl 'Listener connections' $lsnRows
+        & $endTbl "Blocked process reports (over $($Config.BlockedProcessThresholdSec) s)" 'xe_blocked'
+        & $tbl "Blocked sessions seen in samples (over $($Config.BlockedProcessThresholdSec) s)" @($blockedNow | ForEach-Object { $h = [ordered]@{}; foreach ($c in @('seen_at', 'session_id', 'blocked_by', 'wait_type', 'wait_s', 'db', 'sql_text')) { $h[$c] = $_[$c] }; $h })
+        & $endTbl 'Deadlocks' 'xe_deadlocks'
+        & $endTbl "Queries over $($Config.LongQuerySec) s" 'xe_long'
+        "<div style='color:#555;margin-top:12px'>$(Enc $qsNote)</div>"
+        & $endTbl 'Top 20 queries by duration (Query Store)' 'qs_duration'
+        & $endTbl 'Top 20 queries by CPU (Query Store)' 'qs_cpu'
+        & $endTbl 'Top 20 queries by logical reads (Query Store)' 'qs_reads'
+    ) -join '')
+    return [pscustomobject]@{ Short = $short; Full = $full; Crit = $crit; Warn = $warn; Intervals = $iv.Count }
+}
+
+function Register-HealthTask {
+    # Option 5: create / remove a Windows scheduled task that runs the HEALTH check (with performance window) unattended
+    Write-Step '=== Schedule the HEALTH check (Windows Task Scheduler) ===' 'Green'
+    $prefix = $Config.ScheduledTaskName
+    $existing = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "$prefix*" })
+    if ($existing.Count) {
+        Write-Step 'Existing scheduled checks:'
+        $existing | ForEach-Object { $i = Get-ScheduledTaskInfo -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction SilentlyContinue; [pscustomobject]@{ Task = $_.TaskName; State = $_.State; RunAs = $_.Principal.UserId; NextRun = $i.NextRunTime; LastRun = $i.LastRunTime; LastResult = $i.LastTaskResult } } |
+            Format-Table -AutoSize | Out-String | Write-Host
+    }
+    $ans = (Read-Host 'A = add or replace a schedule, D = delete one, Enter = cancel').Trim().ToUpperInvariant()
+    if ($ans -eq 'D') {
+        $n = Read-Host 'Task name to delete (as listed above)'
+        if ($n) { try { Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction Stop; Write-Step "Deleted $n" 'Green' } catch { Write-Step "Could not delete: $($_.Exception.Message)" 'Red' } }
+        return
+    }
+    if ($ans -ne 'A') { return }
+
+    $label = ((Read-Host 'Label for the report and task name (Enter = SCHEDULED)').Trim() -replace '[^A-Za-z0-9_-]', '')
+    if (-not $label) { $label = 'SCHEDULED' }
+    do { $freq = (Read-Host 'Run: D = daily, W = weekly on chosen days, O = once').Trim().ToUpperInvariant() } while ($freq -notin @('D', 'W', 'O'))
+    do { $time = (Read-Host 'Start time (HH:mm, 24-hour, this VM''s time zone)').Trim() } while ($time -notmatch '^([01]?\d|2[0-3]):[0-5]\d$')
+    $at = [datetime]::ParseExact($time.PadLeft(5, '0'), 'HH:mm', $null)
+    switch ($freq) {
+        'D' { $trigger = New-ScheduledTaskTrigger -Daily -At $at; $when = "daily at $time" }
+        'W' {
+            do { $daysTxt = Read-Host 'Days (e.g. Mon,Wed,Fri)'; $days = @($daysTxt -split '[,; ]+' | Where-Object { $_ } | ForEach-Object {
+                     $d = $_.Substring(0, [math]::Min(3, $_.Length)).ToLower(); @{ mon = 'Monday'; tue = 'Tuesday'; wed = 'Wednesday'; thu = 'Thursday'; fri = 'Friday'; sat = 'Saturday'; sun = 'Sunday' }[$d] } | Where-Object { $_ }) } while (-not $days.Count)
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $days -At $at; $when = "every $($days -join ', ') at $time"
+        }
+        'O' {
+            do { $dTxt = (Read-Host 'Date (yyyy-MM-dd)').Trim(); $ok = $dTxt -match '^\d{4}-\d{2}-\d{2}$' } while (-not $ok)
+            $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::ParseExact("$dTxt $($time.PadLeft(5, '0'))", 'yyyy-MM-dd HH:mm', $null)); $when = "once on $dTxt at $time"
+        }
+    }
+    $s = Read-Host "Performance window - sample every N seconds (Enter = $($Config.PerfSampleSec), 0 = no performance window)"
+    $s = if ($s -match '^\d+$') { [int]$s } else { [int]$Config.PerfSampleSec }
+    $m = 0
+    if ($s -gt 0) { $m = Read-Host "Window length in minutes (Enter = $($Config.PerfDurationMin))"; $m = if ($m -match '^\d+$') { [int]$m } else { [int]$Config.PerfDurationMin } }
+    $perfArgs = if ($s -gt 0 -and $m -gt 0) { "-SampleSec $s -DurationMin $m" } else { '-NoPerf' }
+
+    $cred = $null
+    try { $cred = Get-Credential -Message 'Windows account the task runs as (needs SQL access on every instance). Task Scheduler stores the password.' } catch { }
+    if (-not $cred) { Write-Step 'Cancelled - no account entered.' 'Yellow'; return }
+
+    $bat = Join-Path $PSScriptRoot 'Run-PrePostCheck.bat'
+    $action = New-ScheduledTaskAction -Execute $bat -Argument "-Phase HEALTH -Unattended -Ticket $label $perfArgs" -WorkingDirectory $PSScriptRoot
+    $limitH = [math]::Max(2, [math]::Ceiling(($m + 60) / 60))
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours $limitH)
+    $taskName = "$prefix - $label"
+    try {
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User $cred.UserName -Password $cred.GetNetworkCredential().Password `
+            -Description "SQL Server HEALTH check for every instance on this VM ($perfArgs). Created by Invoke-PrePostCheck.ps1." -Force -ErrorAction Stop | Out-Null
+        Write-Step "Scheduled '$taskName': $when as $($cred.UserName) ($perfArgs)." 'Green'
+        Write-Step "Test it now with: Start-ScheduledTask -TaskName '$taskName'  (report emailed and saved in Reports\, log in Logs\)" 'DarkGray'
+    }
+    catch {
+        Write-Step "Could not create the task: $($_.Exception.Message)" 'Red'
+        Write-Step '  Run Run-PrePostCheck.bat as administrator, and check the account has "Log on as a batch job" on this VM.' 'Yellow'
+    }
+}
+
 function Get-MachineBiSnapshot {
     # SSIS / SSRS / SSAS Windows services on THIS VM (not visible from T-SQL) and SSAS databases via the MSOLAP provider.
     $sections = @{}; $columns = @{}
@@ -636,9 +1063,10 @@ if ($Phase -eq 'CLEANUP') {
     Write-Step '=== Cleanup of old Snapshots / Reports / Logs ===' 'Green'
     $h = if ($Config.CleanupHours -gt 0) { $Config.CleanupHours } else { 48 }
     Invoke-Cleanup $h $Config.KeepPreWithoutPostDays
-    if (-not $Inner) { Read-Host 'Press Enter to close' }
+    if (-not $Inner -and -not $Unattended) { Read-Host 'Press Enter to close' }
     exit 0
 }
+if ($Phase -eq 'SCHEDULE') { Register-HealthTask; Read-Host 'Press Enter to close'; exit 0 }
 if (-not $Inner) {
     Write-Step '=== SQL Server PRE / POST change check ===' 'Green'
     while ($Phase -notin @('PRE', 'POST', 'HEALTH')) {
@@ -646,19 +1074,26 @@ if (-not $Inner) {
         Write-Host '  2 = POST     compare after the change with PRE'
         Write-Host '  3 = HEALTH   health check report only'
         Write-Host '  4 = CLEANUP  delete old snapshots / reports / logs'
-        $Phase = (Read-Host 'Choose 1-4 (or type PRE / POST / HEALTH / CLEANUP)').Trim().ToUpperInvariant()
-        $Phase = switch ($Phase) { '1' { 'PRE' } '2' { 'POST' } '3' { 'HEALTH' } 'HC' { 'HEALTH' } '4' { 'CLEANUP' } default { $Phase } }
+        Write-Host '  5 = SCHEDULE run the HEALTH check from Windows Task Scheduler'
+        $Phase = (Read-Host 'Choose 1-5 (or type PRE / POST / HEALTH / CLEANUP / SCHEDULE)').Trim().ToUpperInvariant()
+        $Phase = switch ($Phase) { '1' { 'PRE' } '2' { 'POST' } '3' { 'HEALTH' } 'HC' { 'HEALTH' } '4' { 'CLEANUP' } '5' { 'SCHEDULE' } default { $Phase } }
+        if ($Phase -eq 'SCHEDULE') { Register-HealthTask; Read-Host 'Press Enter to close'; exit 0 }
         if ($Phase -eq 'CLEANUP') {
             Invoke-Cleanup $(if ($Config.CleanupHours -gt 0) { $Config.CleanupHours } else { 48 }) $Config.KeepPreWithoutPostDays
             Read-Host 'Press Enter to close'; exit 0
         }
     }
-    if (-not $PSBoundParameters.ContainsKey('Ticket')) {
+    if (-not $Unattended -and -not $PSBoundParameters.ContainsKey('Ticket')) {
         $Ticket = if ($Phase -eq 'HEALTH') { Read-Host 'Ticket / label (optional, Enter = DAILY)' }
                   else { Read-Host 'Change ticket (used to pair PRE and POST, e.g. CHG0012345)' }
     }
     $Ticket = ([string]$Ticket).Trim() -replace '[^A-Za-z0-9_-]', ''
     if (-not $Ticket) { $Ticket = if ($Phase -eq 'HEALTH') { 'DAILY' } else { 'NO-TICKET' } }
+    if ($Phase -eq 'HEALTH' -and $Config.PerfSampling -and -not $NoPerf -and -not $Unattended -and $DurationMin -lt 0 -and $SampleSec -le 0) {
+        $ans = Read-Host "Performance window - Enter = every $($Config.PerfSampleSec) s for $($Config.PerfDurationMin) min, 0 = skip, or <seconds>/<minutes> e.g. 30/15"
+        if ($ans.Trim() -eq '0') { $NoPerf = $true }
+        elseif ($ans -match '^\s*(\d+)\s*/\s*(\d+)\s*$') { $SampleSec = [int]$Matches[1]; $DurationMin = [int]$Matches[2] }
+    }
 
     $rdpUser = "$env:USERDOMAIN\$env:USERNAME"
     $cred = $null
@@ -682,6 +1117,9 @@ if (-not $Inner) {
             $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket, '-HandOff', "`"$handOffFile`"")
             if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
             if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
+            if ($NoPerf)           { $argList += '-NoPerf' }
+            if ($SampleSec -gt 0)  { $argList += @('-SampleSec', $SampleSec) }
+            if ($DurationMin -ge 0) { $argList += @('-DurationMin', $DurationMin) }
             Write-Step "Starting the check as $($cred.UserName) in a new window..." 'Green'
             try {
                 Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -Wait -ErrorAction Stop
@@ -737,7 +1175,7 @@ foreach ($key in @('SnapshotRoot', 'ReportsFolder', 'LogsFolder')) {
         $probe = Join-Path $Config[$key] ('.write_test_' + $stamp); [System.IO.File]::WriteAllText($probe, 'x'); Remove-Item $probe -Force
     }
     catch {
-        if ($key -eq 'SnapshotRoot' -and -not $script:RetryErrors) { Write-Step "ERROR: no write access to $($Config[$key]). Snapshots must be stored there - fix folder permissions." 'Red'; Read-Host 'Press Enter to close'; exit 1 }
+        if ($key -eq 'SnapshotRoot' -and -not $script:RetryErrors) { Write-Step "ERROR: no write access to $($Config[$key]). Snapshots must be stored there - fix folder permissions." 'Red'; if (-not $Unattended) { Read-Host 'Press Enter to close' }; exit 1 }
         $fallback = Join-Path $env:TEMP ('DBA_PrePostCheck\' + (Split-Path $Config[$key] -Leaf))
         New-Item -ItemType Directory -Path $fallback -Force | Out-Null
         Write-Warning "No write access to $($Config[$key]) - using $fallback"; $Config[$key] = $fallback
@@ -756,7 +1194,8 @@ try {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     Write-Step "Running as : $me"
     Write-Step "Phase      : $Phase    Ticket: $Ticket"
-    $sqlText = [System.IO.File]::ReadAllText((Get-SqlFilePath))
+    $sqlBlocks = Get-SqlBlocks ([System.IO.File]::ReadAllText((Get-SqlFilePath)))
+    $sqlText = $sqlBlocks['HC']
     $targets = Get-TargetInstances
     if (-not $targets) { throw 'No SQL Server instances found on this VM and servers.txt is empty.' }
     if ($script:RetryErrors) { $targets = @($targets | Where-Object { $script:RetryErrors.ContainsKey([string]$_.Instance) }) }
@@ -876,7 +1315,7 @@ try {
                     if ($cand) {
                         $cm = $Json.DeserializeObject([System.IO.File]::ReadAllText($cand.FullName))['meta']
                         Write-Step "No PRE snapshot for ticket $Ticket on this instance." 'Yellow'
-                        $ans = Read-Host ("Latest PRE is ticket {0}, taken {1} by {2}. Use it as the baseline? (Y/N)" -f $cm['ticket'], $cm['taken_at'], $cm['taken_by'])
+                        $ans = if ($Unattended) { 'N' } else { Read-Host ("Latest PRE is ticket {0}, taken {1} by {2}. Use it as the baseline? (Y/N)" -f $cm['ticket'], $cm['taken_at'], $cm['taken_by']) }
                         if ($ans -match '^[Yy]') { $preFile = $cand }
                     }
                 }
@@ -947,6 +1386,37 @@ try {
         }
         finally { if ($conn) { $conn.Dispose() } }
         $summary += [pscustomobject]$row
+    }
+
+    # ---- HEALTH: performance window on every instance that was checked -------------------
+    $perfSec = if ($SampleSec -gt 0) { $SampleSec } else { [int]$Config.PerfSampleSec }
+    $perfMin = if ($DurationMin -ge 0) { $DurationMin } else { [int]$Config.PerfDurationMin }
+    if ($Phase -eq 'HEALTH' -and $Config.PerfSampling -and -not $NoPerf -and $perfMin -gt 0 -and $perfSec -gt 0 -and $sqlBlocks.ContainsKey('PERF_SAMPLE')) {
+        $perfItems = @()
+        foreach ($r in @($summary | Where-Object { $_.State -in @('OK', 'WARN', 'CRIT') -and -not ($script:HandOffRows -and $script:HandOffRows -contains $_) })) {
+            try {
+                $oc = Open-SqlConnection $r.Instance -NoImpersonation:([bool]$script:RetryErrors)
+                $perfItems += [pscustomobject]@{ Instance = $r.Instance; Conn = $oc.Connection; Safe = (Get-SafeFileName $r.Instance); Row = $r }
+            }
+            catch { Write-Step "Performance window skipped on $($r.Instance): $($_.Exception.Message)" 'Yellow' }
+        }
+        if ($perfItems.Count) {
+            Write-Step "`n--- Performance window on $($perfItems.Count) instance(s) ---" 'Green'
+            try { Invoke-PerfWindow $perfItems $sqlBlocks $perfSec $perfMin }
+            finally {
+                foreach ($pi in $perfItems) {
+                    try {
+                        $pr = Get-PerfResult $pi $perfSec
+                        $pi.Row.ShortHtml += $pr.Short; $pi.Row.FullHtml += $pr.Full
+                        if ($pr.Crit -gt 0) { $pi.Row.State = 'CRIT' } elseif ($pr.Warn -gt 0 -and $pi.Row.State -eq 'OK') { $pi.Row.State = 'WARN' }
+                        $pi.Row.Outcome += "; performance: $($pr.Crit) critical, $($pr.Warn) warning(s)"
+                        Write-Step ("{0}: performance window {1} intervals - {2} critical, {3} warning(s)" -f $pi.Instance, $pr.Intervals, $pr.Crit, $pr.Warn) $(if ($pr.Crit) { 'Red' } elseif ($pr.Warn) { 'Yellow' } else { 'Green' })
+                    }
+                    catch { Write-Step "Performance report failed for $($pi.Instance): $($_.Exception.Message)" 'Yellow' }
+                    finally { $pi.Conn.Dispose() }
+                }
+            }
+        }
     }
 
     # Run as your account (new window) and some instances failed: hand them to the original window
@@ -1074,12 +1544,12 @@ finally {
     Write-Step "Reports   : $($Config.ReportsFolder)"
     Write-Step "Report    : $combinedFile"
     # No email sent: open the combined report in the browser
-    if ($combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
+    if (-not $Unattended -and $combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
         Write-Step 'Opening the combined report...' 'Yellow'
         try { Invoke-Item -LiteralPath $combinedFile } catch { Write-Step "Could not open it: $($_.Exception.Message)" 'Yellow' }
     }
     Write-Step "Log       : $logFile"
     try { Stop-Transcript | Out-Null } catch { }
-    Read-Host "`nPress Enter to close"
+    if (-not $Unattended) { Read-Host "`nPress Enter to close" }
     }
 }

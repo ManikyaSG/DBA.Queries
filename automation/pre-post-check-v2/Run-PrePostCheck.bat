@@ -4,20 +4,25 @@ REM  One-click SQL Server check for all instances on this VM.
 REM  Double-click while logged in with the generic admin account, then choose:
 REM    1 PRE     - snapshot stored on this VM + emailed (before a change)
 REM    2 POST    - compared with PRE, emails SUCCESS or DIFFERENCES FOUND
-REM    3 HEALTH  - health check report only
+REM    3 HEALTH  - health check + performance window (sampled every N seconds)
 REM    4 CLEANUP - delete old snapshots / reports / logs (also done on every run)
+REM    5 SCHEDULE- create a Windows scheduled task for the HEALTH check
 REM  It starts the Secondary Logon service, asks for YOUR Windows account and
 REM  runs as that account; instances it can't use are retried as the RDP account.
 REM  Command line:  Run-PrePostCheck.bat -Phase HEALTH
 REM                 Run-PrePostCheck.bat -Phase CLEANUP   (e.g. from Task Scheduler)
+REM                 Run-PrePostCheck.bat -Phase HEALTH -Unattended -SampleSec 60 -DurationMin 30
 REM  Only 3 files, kept together in a folder your account can read and write:
 REM    Run-PrePostCheck.bat, Invoke-PrePostCheck.ps1, HC_Snapshot.sql
 REM ==========================================================================
 setlocal
-title SQL Server PRE-POST / Health Check
+title SQL Server PRE-POST / Health Check (v2)
 cd /d "%~dp0"
 
-REM Cleanup only: no Secondary Logon / credentials needed
+REM Cleanup / scheduled (unattended) runs: no Secondary Logon / credentials / pauses
+set "UNATTENDED="
+echo %* | find /i "UNATTENDED" >nul && set "UNATTENDED=1"
+if defined UNATTENDED goto :run
 echo %* | find /i "CLEANUP" >nul && goto :run
 
 REM --- Make sure the Secondary Logon service (needed for "run as different user") is running ---
@@ -55,5 +60,5 @@ if not exist "%~dp0Invoke-PrePostCheck.ps1" (
 
 "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Invoke-PrePostCheck.ps1" %*
 set RC=%ERRORLEVEL%
-if not "%RC%"=="0" pause
+if not defined UNATTENDED if not "%RC%"=="0" pause
 endlocal & exit /b %RC%
