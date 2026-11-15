@@ -279,6 +279,22 @@ function Invoke-Cleanup([int]$Hours = $Config.CleanupHours, [int]$KeepPreDays = 
     Write-Step "Cleanup    : $n file(s) older than $Hours h removed (PRE without POST kept $KeepPreDays days)" 'DarkGray'
 }
 
+function Grant-FolderAccess([string[]]$Accounts) {
+    # Your account (run-as window) and the RDP account (fail-safe) both write snapshots, reports and logs.
+    # Give both Modify on this folder, inherited by everything below it, so neither gets "Access denied".
+    $ErrorActionPreference = 'Continue'      # icacls writes failures to stderr
+    foreach ($f in @($Config.SnapshotRoot, $Config.ReportsFolder, $Config.LogsFolder)) {
+        if (-not (Test-Path $f)) { try { New-Item -ItemType Directory -Path $f -Force | Out-Null } catch { } }
+    }
+    foreach ($a in @($Accounts | Where-Object { $_ } | Select-Object -Unique)) {
+        $acct = if ($a -match '\\|@') { $a } else { "$env:USERDOMAIN\$a" }
+        $out = & icacls.exe "$PSScriptRoot" /grant "$($acct):(OI)(CI)M" /T /C /Q 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Step "Folder access : $acct can write to $PSScriptRoot" 'DarkGray' }
+        else { Write-Step "WARNING: could not give $acct write access to $PSScriptRoot - $(($out | Out-String).Trim())" 'Yellow'
+               Write-Step '  Ask a local admin to grant it Modify on this folder, or snapshots for some instances may fail with Access denied.' 'Yellow' }
+    }
+}
+
 function New-SqlConnection([string]$Instance) {
     $enc = if ($Config.Encrypt) { 'True' } else { 'False' }
     $cs = "Server=$Instance;Database=master;Integrated Security=SSPI;Application Name=DBA PrePostCheck;" +
@@ -659,6 +675,7 @@ if (-not $Inner) {
     }
     if ($cred) {
         $launched = $false
+        Grant-FolderAccess @($rdpUser, $cred.UserName)
         if (-not (Test-Path $Config.LogsFolder)) { try { New-Item -ItemType Directory -Path $Config.LogsFolder -Force | Out-Null } catch { } }
         $handOffFile = Join-Path $Config.LogsFolder ("handoff_{0}_{1}.json" -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID)
         if (Start-SecondaryLogonService) {
@@ -807,8 +824,16 @@ try {
             $snapFile = Join-Path $ticketDir ("{0}_{1}_{2}.json" -f $safe, $Phase, $stamp)
             if ($Phase -ne 'HEALTH') {
                 $jsonText = ConvertTo-Json -InputObject (ConvertTo-PlainObject $snap) -Depth 20 -Compress
-                [System.IO.File]::WriteAllText($snapFile, $jsonText, [System.Text.Encoding]::UTF8)
-                Write-Step "Snapshot saved : $snapFile"
+                try { [System.IO.File]::WriteAllText($snapFile, $jsonText, [System.Text.Encoding]::UTF8); Write-Step "Snapshot saved : $snapFile" }
+                catch {
+                    # Don't lose the check: save to this account's TEMP folder and say so in the report
+                    $tmpDir = Join-Path $env:TEMP ("DBA_PrePostCheck\Snapshots\" + $Ticket)
+                    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+                    $snapFile2 = Join-Path $tmpDir (Split-Path $snapFile -Leaf)
+                    [System.IO.File]::WriteAllText($snapFile2, $jsonText, [System.Text.Encoding]::UTF8)
+                    Write-Step "WARNING: no write access to $ticketDir as $($row.ConnectedAs) - snapshot saved to $snapFile2 instead. Copy it into $ticketDir before the POST run." 'Yellow'
+                    $snapFile = "$snapFile2 (NOT in $ticketDir - copy it there before POST)"
+                }
             }
             $issues = @(Get-Rows $snap 'issues')
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
