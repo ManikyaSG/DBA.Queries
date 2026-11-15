@@ -1,6 +1,6 @@
-# One-click PRE / POST change check
+# One-click PRE / POST change check and HEALTH check with performance window (v2)
 
-> **Working copy for a new requirement.** Copied from [`../pre-post-check`](../pre-post-check/README.md), which stays the stable version in use. Changes for the new requirement are made here only.
+> **v2** of [`../pre-post-check`](../pre-post-check/README.md) (which stays the stable version). New in v2: the **HEALTH** check is followed by a **performance window** sampled every N seconds, it can be **scheduled** with Windows Task Scheduler (option 5), and **Agent jobs, logins and server role members are no longer collected or compared**. Failed Agent job steps in the last 24 hours are still reported as problems.
 
 > **Just 3 files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`. Copy them together to a folder on the VM, for example `C:\DBA\PrePostCheck`. The older `automation/health-check` folder (script 44) isn't needed.
 
@@ -10,8 +10,9 @@ Double-click `Run-PrePostCheck.bat` and choose:
 |---|---|---|
 | 1 | **PRE** | Snapshot before a change, stored on the VM and emailed |
 | 2 | **POST** | Snapshot after the change, compared with PRE, emailed as SUCCESS or DIFFERENCES |
-| 3 | **HEALTH** | Health check only: one combined report with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject. Nothing is stored for comparison |
+| 3 | **HEALTH** | Health check, then a **performance window** (default: a sample every 60 s for 30 min) on every instance. One combined report with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject. Nothing is stored for comparison |
 | 4 | **CLEANUP** | Delete old snapshots, reports and logs (this also runs automatically at the start of every check) |
+| 5 | **SCHEDULE** | Create (or delete) a Windows scheduled task that runs HEALTH unattended - daily, weekly or once |
 
 Before a change (patching, CU, in-place upgrade, failover test, config change), run it with **PRE**. After the change, run it with **POST**. It checks **every SQL instance on the VM**:
 
@@ -26,7 +27,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
 - The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the whole report goes in the email body instead.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
-Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
+Snapshots (JSON) and reports stay on the VM as evidence. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
 
 ## Files
 
@@ -55,7 +56,7 @@ Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\`
    - Cancel at the prompt runs it as the RDP account only.
 4. Read the summary in the window and check your mailbox.
 
-**When to run POST:** after services are up and the **AG databases are SYNCHRONIZED** again. If they're still catching up, the check will rightly report it as a difference. Also resume any jobs you paused, otherwise jobs left disabled will show up as differences.
+**When to run POST:** after services are up and the **AG databases are SYNCHRONIZED** again. If they're still catching up, the check will rightly report it as a difference.
 
 If POST finds no PRE for that ticket, it offers the **latest PRE for that instance** and shows its ticket, time and user, then asks you to confirm. If you decline or none exists, it sends the POST report as *NO BASELINE*.
 
@@ -70,7 +71,7 @@ If POST finds no PRE for that ticket, it offers the **latest PRE for that instan
 | Always On | each replica's role, **primary replica**, commit/failover mode, connected, health, readable, endpoint, backup priority, listeners; **listener IPs**: static or **DHCP**, subnet mask, network subnet, IP state, port (DNN listeners don't appear here); each DB's role, sync state, health and suspended flag on every replica | |
 | Cluster | quorum type/state, member type/state, votes | |
 | Disks / files | disk size, file paths, type, state, growth, max size | free space and size changes within tolerance |
-| Jobs / security / objects | job enabled/owner/category; logins (type, disabled, default DB); server role members; linked servers; endpoints; certificates; XE sessions | |
+| Objects | linked servers; endpoints; certificates; XE sessions (Agent jobs, logins and server role members are not collected in v2) | |
 | SSIS | SSIS service state; SSISDB catalog settings; projects (package count, version, deployed by); environments (variable count). Failed package executions in the last 24 h are reported as problems | catalog `SCHEMA_BUILD` / `SCHEMA_VERSION` |
 | SSRS | Reporting Services / Power BI Report Server service; for each report server database on the instance: counts of folders, reports, data sources, datasets and schedules; each subscription (report, owner, enabled, failing). Failing subscriptions and failed report executions (24 h) are reported as problems | |
 | SSAS | Analysis Services service; whether the instance can be queried; each database (compatibility level, type) | SSAS version, database `date_modified` |
@@ -82,10 +83,48 @@ If POST finds no PRE for that ticket, it offers the **latest PRE for that instan
 
 Last-backup *times*, log usage %, queue sizes and CPU are not compared, because they always move. A change of AG primary is **flagged on purpose**, so you'll notice if a failback was missed.
 
+## HEALTH performance window
+
+After the health check, the script samples **every instance at the same time** every `PerfSampleSec` seconds for `PerfDurationMin` minutes. When you run HEALTH by hand it asks: **Enter** = the defaults, **0** = skip, or `seconds/minutes` such as `30/15`. Press **Q** to stop early; it takes one last sample and reports what it has.
+
+| Area | What's reported |
+|---|---|
+| Throughput | Batch Requests/sec; Transactions/sec for the databases in `PerfDatabases` (for example `@('MARS', 'CLR')`; empty = all), plus a per-database table |
+| Compilation | SQL Compilations/sec, SQL Re-Compilations/sec |
+| Connections | User Connections; **connection pool usage** = sessions per application / host / login (peak, average, peak active) |
+| Locking | Lock Waits/sec, Lock Wait Time, Lock Timeouts/sec, Deadlocks/sec, sessions blocked longer than 5 s; **blocked process reports** and **deadlocks** from a temporary Extended Events session |
+| Memory | Page Life Expectancy, Buffer cache hit ratio, Memory Grants Pending, Target vs Total Server Memory |
+| Wait stats | ms waited **per interval** for LCK_M_\*, PAGEIOLATCH_\*, PAGELATCH_\*, WRITELOG, CXPACKET, CXCONSUMER, SOS_SCHEDULER_YIELD, HADR_SYNC_COMMIT, RESOURCE_SEMAPHORE |
+| Queries | **every query over 5 s** (Extended Events: duration, CPU, reads, database, app, host, login, text) and the **top 20 by duration, CPU and logical reads** from Query Store |
+| I/O | data file read and log file write latency per interval and per database, Log Flush Wait Time, Log Bytes Flushed/sec |
+| TempDB | space used (user, internal, version store), version store size, allocation contention (tasks waiting on tempdb PAGELATCH) |
+| Always On | synchronization state, log send queue, redo queue, transaction delay per database/replica; connections per listener IP |
+
+The email shows a **Performance - needs attention** table and a **summary** (average / min / max of every metric); the attached report also has the per-interval tables and query lists.
+
+**What it changes on the server, and puts back:** at the start it sets `blocked process threshold (s)` to `BlockedProcessThresholdSec` (5) and creates the XE session `DBA_PerfWindow`. At the end, even if the run fails or you press Ctrl+C, it drops the session and restores the original threshold. If a run is killed hard, the next run on that VM restores the value it recorded. That needs `ALTER SETTINGS` and `ALTER ANY EVENT SESSION` (sysadmin has both); without them it carries on read-only (live blocking from DMVs, no blocked process reports / deadlocks / long-query capture) and says so in the report.
+
+**Query Store note:** Query Store groups statistics into intervals (60 min by default), so its top 20 includes the whole intervals that overlap the window. Databases without Query Store are listed in the report; the "queries over 5 s" list comes from Extended Events and is exact to the window.
+
+**Thresholds** (`PerfThresholds` in `$Config`): PLE below 300 s, data read latency over 20 ms, log write latency over 10 ms, AG send queue over 100 MB. Deadlocks, blocking over 5 s, lock timeouts, memory grants pending, RESOURCE_SEMAPHORE waits, tempdb allocation waits and queries over 5 s are flagged whenever they happen. An AG database that stops synchronizing is CRITICAL.
+
+**AG note:** run it on the VM hosting the primary replica to see send/redo queues for every replica; a secondary only sees its own.
+
+## Scheduling (option 5)
+
+Choose **5 = SCHEDULE** (run `Run-PrePostCheck.bat` as administrator). It shows the existing scheduled checks and lets you:
+- **A** - add or replace a schedule: label, daily / weekly (chosen days) / once, start time, sample interval and window length, and the **Windows account the task runs as** (it needs SQL access on every instance; Task Scheduler stores its password and runs it whether anyone is logged on or not).
+- **D** - delete one.
+
+The task runs `Run-PrePostCheck.bat -Phase HEALTH -Unattended -Ticket <label> -SampleSec N -DurationMin M`. Unattended runs never prompt or pause, don't need Secondary Logon, and email the report as usual; the log is in `Logs\`. Test one straight away with `Start-ScheduledTask -TaskName "DBA SQL Health Check - <label>"`. The account needs the **Log on as a batch job** right on the VM.
+
 ## Command line (optional)
 
 ```bat
 Run-PrePostCheck.bat -Phase HEALTH
+Run-PrePostCheck.bat -Phase HEALTH -SampleSec 30 -DurationMin 15
+Run-PrePostCheck.bat -Phase HEALTH -NoPerf
+Run-PrePostCheck.bat -Phase SCHEDULE
 Run-PrePostCheck.bat -Phase CLEANUP
 ```
 
