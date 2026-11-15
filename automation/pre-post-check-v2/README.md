@@ -104,6 +104,8 @@ The email shows a **Performance - needs attention** table and a **summary** (ave
 
 **What it changes on the server, and puts back:** at the start it sets `blocked process threshold (s)` to `BlockedProcessThresholdSec` (5) and creates the XE session `DBA_PerfWindow`. At the end, even if the run fails or you press Ctrl+C, it drops the session and restores the original threshold. If a run is killed hard, the next run on that VM restores the value it recorded. That needs `ALTER SETTINGS` and `ALTER ANY EVENT SESSION` (sysadmin has both); without them it carries on read-only (live blocking from DMVs, no blocked process reports / deadlocks / long-query capture) and says so in the report.
 
+**Busy servers:** the Query Store step at the end is the heaviest part. With `PerfDatabases` set, it reads Query Store only for those databases (`QueryStoreLimitToPerfDatabases = $true`); set `QueryStoreTop = $false` to skip it. The sampling itself is light (in-memory DMVs once per interval); keep the interval at 60 s or more on heavy servers.
+
 **Query Store note:** Query Store groups statistics into intervals (60 min by default), so its top 20 includes the whole intervals that overlap the window. Databases without Query Store are listed in the report; the "queries over 5 s" list comes from Extended Events and is exact to the window.
 
 **Thresholds** (`PerfThresholds` in `$Config`): PLE below 300 s, data read latency over 20 ms, log write latency over 10 ms, AG send queue over 100 MB. Deadlocks, blocking over 5 s, lock timeouts, memory grants pending, RESOURCE_SEMAPHORE waits, tempdb allocation waits and queries over 5 s are flagged whenever they happen. An AG database that stops synchronizing is CRITICAL.

@@ -106,6 +106,8 @@ $Config = @{
     PerfDatabases         = @()      # databases for 'Trans/s' e.g. @('MARS', 'CLR'); @() = all databases
     BlockedProcessThresholdSec = 5   # 'blocked process threshold' during the window (restored after)
     LongQuerySec          = 5        # capture every query running longer than this (XE)
+    QueryStoreTop         = $true    # top 20 queries from Query Store at the end of the window ($false = skip; heaviest step)
+    QueryStoreLimitToPerfDatabases = $true   # read Query Store only for PerfDatabases (when PerfDatabases is set)
     PerfThresholds        = @{ PleMin = 300; DataReadMs = 20; LogWriteMs = 10; AgSendQueueMB = 100 }
     ScheduledTaskName     = 'DBA SQL Health Check'      # prefix of the Windows scheduled tasks created by option 5
 }
@@ -474,6 +476,19 @@ function Expand-SqlTokens([string]$Sql, [hashtable]$Tokens) {
     return $Sql
 }
 
+function Set-QueryStoreScope([string]$Sql) {
+    # Limits (or skips) the Query Store step of PERF_END - the heaviest part on busy servers
+    $marker = 'AND is_query_store_on = 1 AND HAS_DBACCESS(name) = 1;'
+    if (-not $Sql.Contains($marker)) { return $Sql }
+    if (-not $Config.QueryStoreTop) { return $Sql.Replace($marker, 'AND 1 = 0;') }
+    $dbs = @($Config.PerfDatabases | Where-Object { $_ })
+    if ($Config.QueryStoreLimitToPerfDatabases -and $dbs.Count) {
+        $list = ($dbs | ForEach-Object { "N'" + ([string]$_).Replace("'", "''") + "'" }) -join ', '
+        return $Sql.Replace($marker, "AND is_query_store_on = 1 AND HAS_DBACCESS(name) = 1 AND name IN ($list);")
+    }
+    return $Sql
+}
+
 function ConvertTo-Num($Value) {
     $d = 0.0
     if ([double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d }
@@ -544,7 +559,7 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
         }
         Write-Host ''
         foreach ($it in $Items) {
-            try { $it.End = Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_END'] @{ START = $it.StartTime; LONG_SEC = $Config.LongQuerySec }) }
+            try { $it.End = Get-Snapshot $it.Conn (Set-QueryStoreScope (Expand-SqlTokens $Blocks['PERF_END'] @{ START = $it.StartTime; LONG_SEC = $Config.LongQuerySec })) }
             catch { [void]$it.Notes.Add("Blocked process / deadlock / Query Store collection failed: $($_.Exception.Message)") }
         }
     }
@@ -767,7 +782,7 @@ function Get-PerfResult($It, [int]$SampleSec) {
     $endTbl = { param($title, $sec) $r = @(Get-Rows $It.End $sec); $c = if ($It.End -and $It.End['columns'].ContainsKey($sec)) { @($It.End['columns'][$sec]) } else { @() }
                 "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count -and $c.Count) { [string](ConvertTo-HtmlTable $r $c) } else { '<div style="color:#2e7d32">None</div>' }) }
     $qsInfo = @(Get-Rows $It.End 'qs_info') | Select-Object -First 1
-    $qsNote = if ($qsInfo) { "Query Store is on for $(Get-Val $qsInfo 'qs_databases') of $(Get-Val $qsInfo 'user_databases') user databases. Query Store groups runtime stats into intervals (60 min by default), so totals include the whole intervals that overlap the window. $(Get-Val $qsInfo 'errors')" } else { 'Query Store data not collected.' }
+    $qsNote = if (-not $Config.QueryStoreTop) { 'Query Store top queries skipped (QueryStoreTop = $false).' } elseif ($qsInfo) { "Query Store is on for $(Get-Val $qsInfo 'qs_databases') of $(Get-Val $qsInfo 'user_databases') user databases$(if ($Config.QueryStoreLimitToPerfDatabases -and @($Config.PerfDatabases | Where-Object { $_ }).Count) { '; read only for ' + (@($Config.PerfDatabases) -join ', ') }). Query Store groups runtime stats into intervals (60 min by default), so totals include the whole intervals that overlap the window. $(Get-Val $qsInfo 'errors')" } else { 'Query Store data not collected.' }
 
     $short = (@(
         "<h2>Performance window: $t1 - $t2 ($($iv.Count) intervals of $SampleSec s)</h2>"
