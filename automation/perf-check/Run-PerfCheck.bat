@@ -22,6 +22,6 @@ if not exist "%~dp0Invoke-PerfCheck.ps1" (
 )
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Invoke-PerfCheck.ps1" %*
 set RC=%ERRORLEVEL%
-REM 0 = OK, 1 = warnings, 2 = critical / failed instance, 3 = script error
+REM 0 = OK, 1 = warnings, 2 = critical / failed instance, 3 = script error, 4 = email not sent
 if not defined UNATTENDED if "%RC%"=="3" pause
 exit /b %RC%
