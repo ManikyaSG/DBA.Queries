@@ -47,6 +47,13 @@ Samples **every SQL Server instance on the VM** every **60 s for 30 min** (confi
 
 Start it when the load test starts; with the defaults the email arrives about 31 minutes later.
 
+## Test it in SSMS
+
+`PerfCheck.sql` also runs as-is in SSMS (as a login with the permissions above):
+- **F5 on the whole file** = a quick end-to-end test: START (threshold + XE session + plan cache baseline), **one** sample, END (blocked process reports, deadlocks, long queries and top queries since START) and TEARDOWN (threshold restored, XE session dropped). The result grids are the same sections the script reads.
+- **Block by block** (select the text between two `GO` lines and press F5), all in the **same query window** so the temp tables carry over: START, then SAMPLE a few times while you generate load, then END, then TEARDOWN. Always finish with TEARDOWN.
+- Each block starts with its `DECLARE @p_...` parameters (threshold, long-query limit, top queries on/off); change them there for a manual test. The script sets them from `$Config`.
+
 ## Schedule it (Windows Task Scheduler)
 
 1. Save the SQL login once (first run above). If the task will run as a different account, add it to `CredentialReaders` and run `Run-PerfCheck.bat -ResetCredential` to save the file again.
