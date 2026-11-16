@@ -95,7 +95,7 @@ After the health check, the script samples **every instance at the same time** e
 | Locking | Lock Waits/sec, Lock Wait Time, Lock Timeouts/sec, Deadlocks/sec, sessions blocked longer than 5 s; **blocked process reports** and **deadlocks** from a temporary Extended Events session |
 | Memory | Page Life Expectancy, Buffer cache hit ratio, Memory Grants Pending, Target vs Total Server Memory |
 | Wait stats | ms waited **per interval** for LCK_M_\*, PAGEIOLATCH_\*, PAGELATCH_\*, WRITELOG, CXPACKET, CXCONSUMER, SOS_SCHEDULER_YIELD, HADR_SYNC_COMMIT, RESOURCE_SEMAPHORE |
-| Queries | **every query over 5 s** (Extended Events: duration, CPU, reads, database, app, host, login, text) and the **top 20 by duration, CPU and logical reads** from Query Store |
+| Queries | **every query over 5 s** (Extended Events: duration, CPU, reads, database, app, host, login, text) and the **top 20 by duration, CPU and logical reads** in the window, from the plan cache (`sys.dm_exec_query_stats` at the start vs the end). Query Store isn't needed |
 | I/O | data file read and log file write latency per interval and per database, Log Flush Wait Time, Log Bytes Flushed/sec |
 | TempDB | space used (user, internal, version store), version store size, allocation contention (tasks waiting on tempdb PAGELATCH) |
 | Always On | synchronization state, log send queue, redo queue, transaction delay per database/replica; connections per listener IP |
@@ -104,9 +104,9 @@ The email shows a **Performance - needs attention** table and a **summary** (ave
 
 **What it changes on the server, and puts back:** at the start it sets `blocked process threshold (s)` to `BlockedProcessThresholdSec` (5) and creates the XE session `DBA_PerfWindow`. At the end, even if the run fails or you press Ctrl+C, it drops the session and restores the original threshold. If a run is killed hard, the next run on that VM restores the value it recorded. That needs `ALTER SETTINGS` and `ALTER ANY EVENT SESSION` (sysadmin has both); without them it carries on read-only (live blocking from DMVs, no blocked process reports / deadlocks / long-query capture) and says so in the report.
 
-**Busy servers:** the Query Store step at the end is the heaviest part. With `PerfDatabases` set, it reads Query Store only for those databases (`QueryStoreLimitToPerfDatabases = $true`); set `QueryStoreTop = $false` to skip it. The sampling itself is light (in-memory DMVs once per interval); keep the interval at 60 s or more on heavy servers.
+**Busy servers:** the sampling is light (in-memory DMVs once per interval); keep the interval at 60 s or more. The top-queries step reads `sys.dm_exec_query_stats` twice, at the start and at the end, which takes a few seconds on a server with a very large plan cache; set `TopQueries = $false` to skip it.
 
-**Query Store note:** Query Store groups statistics into intervals (60 min by default), so its top 20 includes the whole intervals that overlap the window. Databases without Query Store are listed in the report; the "queries over 5 s" list comes from Extended Events and is exact to the window.
+**Top queries note:** the top 20 compares the plan cache at the end of the window with the start, grouped by `query_hash` so the same query with different values counts once. Plans evicted or recompiled during the window, and `OPTION (RECOMPILE)` statements, aren't counted; anything that ran longer than 5 s is still caught by the Extended Events list, which is exact to the window.
 
 **Thresholds** (`PerfThresholds` in `$Config`): PLE below 300 s, data read latency over 20 ms, log write latency over 10 ms, AG send queue over 100 MB. Deadlocks, blocking over 5 s, lock timeouts, memory grants pending, RESOURCE_SEMAPHORE waits, tempdb allocation waits and queries over 5 s are flagged whenever they happen. An AG database that stops synchronizing is CRITICAL.
 
