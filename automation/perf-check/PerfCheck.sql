@@ -2,10 +2,16 @@
  File    : PerfCheck.sql   (automation/perf-check)
  Purpose : Performance window for every SQL Server instance on a VM. Run by
            Invoke-PerfCheck.ps1 (double-click Run-PerfCheck.bat): each --##PERF_*
-           block below is run separately; tokens {{...}} come from $Config.
-   PERF_START    : sets 'blocked process threshold' to {{BPT_SEC}} s, starts the XE
+           block below is run separately; the script sets the @p_ parameter
+           values at the top of each block from $Config.
+ SSMS    : the file also runs as-is in SSMS (F5) as a quick end-to-end test:
+           START, ONE sample, END (top queries / XE since START) and TEARDOWN
+           (restores the threshold, drops the XE session). Or select and run the
+           blocks one by one in the SAME query window, e.g. START, a few
+           SAMPLEs while you generate load, then END and TEARDOWN.
+   PERF_START    : sets 'blocked process threshold' to @p_BptSec s, starts the XE
                    session DBA_PerfWindow (blocked process reports, deadlocks,
-                   queries longer than {{LONG_SEC}} s) and takes a plan cache
+                   queries longer than @p_LongUs microseconds) and takes a plan cache
                    baseline for the window's top queries.
    PERF_SAMPLE   : one sample every N seconds (counters, waits, file I/O,
                    sessions, blocking, tempdb, Always On, listener connections).
@@ -39,16 +45,19 @@ ALTER ROLE DatabaseMailUserRole ADD MEMBER [dba_perfcheck];   -- send the report
 
 --##PERF_START
 SET NOCOUNT ON;
+DECLARE @p_BptSec int = 5;               -- blocked process threshold (s) during the window
+DECLARE @p_LongUs bigint = 5000000;      -- capture queries longer than this, in microseconds (5000000 = 5 s)
+DECLARE @p_TopQ bit = 1;                 -- 1 = plan cache baseline for the top 20 queries
 DECLARE @orig int, @adv int, @thr bit = 0, @xe bit = 0, @msg nvarchar(2000) = N'';
 SELECT @orig = CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'blocked process threshold (s)';
 SELECT @adv  = CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'show advanced options';
 IF HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER SETTINGS') = 1
 BEGIN
     BEGIN TRY
-        IF @orig <> {{BPT_SEC}}
+        IF @orig <> @p_BptSec
         BEGIN
             IF @adv = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE; END;
-            EXEC sys.sp_configure N'blocked process threshold (s)', {{BPT_SEC}}; RECONFIGURE;
+            EXEC sys.sp_configure N'blocked process threshold (s)', @p_BptSec; RECONFIGURE;
             IF @adv = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 0; RECONFIGURE; END;
         END;
         SET @thr = 1;
@@ -62,17 +71,18 @@ BEGIN
     BEGIN TRY
         IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'DBA_PerfWindow')
             DROP EVENT SESSION DBA_PerfWindow ON SERVER;
-        EXEC (N'CREATE EVENT SESSION DBA_PerfWindow ON SERVER
+        DECLARE @xeSql nvarchar(max) = REPLACE(N'CREATE EVENT SESSION DBA_PerfWindow ON SERVER
 ADD EVENT sqlserver.blocked_process_report,
 ADD EVENT sqlserver.xml_deadlock_report,
 ADD EVENT sqlserver.rpc_completed (
     ACTION (sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
-    WHERE duration > {{LONG_US}}),
+    WHERE duration > #LONG#),
 ADD EVENT sqlserver.sql_batch_completed (
     ACTION (sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
-    WHERE duration > {{LONG_US}})
+    WHERE duration > #LONG#)
 ADD TARGET package0.ring_buffer (SET max_memory = 8192, max_events_limit = 2000)
-WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, STARTUP_STATE = OFF);');
+WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, STARTUP_STATE = OFF);', N'#LONG#', CAST(@p_LongUs AS nvarchar(20)));
+        EXEC (@xeSql);
         ALTER EVENT SESSION DBA_PerfWindow ON SERVER STATE = START;
         SET @xe = 1;
     END TRY
@@ -83,16 +93,22 @@ ELSE SET @msg += N'No ALTER ANY EVENT SESSION permission - blocked process repor
 -- Plan cache baseline for the window's top queries (session #temp table, compared at PERF_END)
 IF OBJECT_ID('tempdb..#qstart') IS NOT NULL DROP TABLE #qstart;
 CREATE TABLE #qstart (query_hash binary(8) PRIMARY KEY, ec bigint, el bigint, cpu bigint, rd bigint);
-IF {{TOPQ}} = 1
+IF @p_TopQ = 1
     INSERT #qstart (query_hash, ec, el, cpu, rd)
     SELECT query_hash, SUM(execution_count), SUM(total_elapsed_time), SUM(total_worker_time), SUM(total_logical_reads)
     FROM sys.dm_exec_query_stats WHERE query_hash IS NOT NULL GROUP BY query_hash;
 
+-- Remember the original values in this session (used by TEARDOWN when run from SSMS)
+IF OBJECT_ID('tempdb..#perf_state') IS NOT NULL DROP TABLE #perf_state;
+SELECT @orig AS orig, @thr AS thr_set, SYSDATETIMEOFFSET() AS start_time INTO #perf_state;
+
 SELECT N'perf_setup' AS _section, CAST(@orig AS nvarchar(10)) AS orig_threshold, CAST(@thr AS nvarchar(1)) AS threshold_set,
        CAST(@xe AS nvarchar(1)) AS xe_started, CONVERT(nvarchar(40), SYSDATETIMEOFFSET(), 127) AS start_time, @msg AS message;
 
+GO
 --##PERF_SAMPLE
 SET NOCOUNT ON;
+DECLARE @p_BptSec int = 5;               -- report sessions blocked at least this long (s)
 SELECT N'sample' AS _section, CONVERT(nvarchar(23), SYSDATETIME(), 121) AS sample_time;
 
 SELECT N'pc' AS _section,
@@ -134,14 +150,14 @@ WHERE s.is_user_process = 1
 GROUP BY s.program_name, s.host_name, s.login_name;
 
 SELECT N'blocking' AS _section, CAST(COUNT(*) AS nvarchar(10)) AS blocked, CAST(ISNULL(MAX(wait_time), 0) AS nvarchar(20)) AS max_wait_ms
-FROM sys.dm_exec_requests WHERE blocking_session_id > 0 AND wait_time >= {{BPT_SEC}} * 1000;
+FROM sys.dm_exec_requests WHERE blocking_session_id > 0 AND wait_time >= @p_BptSec * 1000;
 
 SELECT TOP (5) N'blocked_now' AS _section, CONVERT(nvarchar(19), GETDATE(), 120) AS seen_at, CAST(r.session_id AS nvarchar(10)) AS session_id,
        CAST(r.blocking_session_id AS nvarchar(10)) AS blocked_by, r.wait_type, CAST(r.wait_time / 1000 AS nvarchar(20)) AS wait_s,
        ISNULL(DB_NAME(r.database_id), N'') AS db, ISNULL(LEFT(t.text, 200), N'') AS sql_text
 FROM sys.dm_exec_requests AS r
 OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
-WHERE r.blocking_session_id > 0 AND r.wait_time >= {{BPT_SEC}} * 1000
+WHERE r.blocking_session_id > 0 AND r.wait_time >= @p_BptSec * 1000
 ORDER BY r.wait_time DESC;
 
 SELECT N'tempdb' AS _section,
@@ -170,11 +186,16 @@ BEGIN
     GROUP BY l.dns_name, ip.ip_address;
 END;
 
+GO
 --##PERF_END
 SET NOCOUNT ON;
-DECLARE @s datetimeoffset = CAST(N'{{START}}' AS datetimeoffset), @e datetimeoffset = SYSDATETIMEOFFSET();
+DECLARE @p_Start nvarchar(40) = NULL;    -- window start; NULL = from PERF_START in this session
+DECLARE @p_TopQ bit = 1;                 -- 1 = top 20 queries from the plan cache
+DECLARE @s datetimeoffset = TRY_CAST(@p_Start AS datetimeoffset), @e datetimeoffset = SYSDATETIMEOFFSET();
+IF @s IS NULL AND OBJECT_ID('tempdb..#perf_state') IS NOT NULL SELECT @s = start_time FROM #perf_state;
+IF @s IS NULL SET @s = DATEADD(MINUTE, -30, @e);
 
--- Extended Events (blocked process reports, deadlocks, queries > {{LONG_SEC}} s)
+-- Extended Events (blocked process reports, deadlocks, long queries)
 IF OBJECT_ID('tempdb..#xe') IS NOT NULL DROP TABLE #xe;
 CREATE TABLE #xe (ev xml);
 IF EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'DBA_PerfWindow')
@@ -230,7 +251,7 @@ CREATE TABLE #qtop (query_hash binary(8), executions bigint, total_duration_ms d
                     total_cpu_ms decimal(19, 1), total_logical_reads bigint, sql_handle varbinary(64), plan_handle varbinary(64),
                     stmt_start int, stmt_end int, rn_d int, rn_c int, rn_r int);
 DECLARE @cached int = 0;
-IF {{TOPQ}} = 1 AND OBJECT_ID('tempdb..#qstart') IS NOT NULL
+IF @p_TopQ = 1 AND OBJECT_ID('tempdb..#qstart') IS NOT NULL
 BEGIN
     SELECT query_hash, sql_handle, plan_handle, statement_start_offset, statement_end_offset,
            execution_count, total_elapsed_time, total_worker_time, total_logical_reads,
@@ -271,7 +292,7 @@ FROM #qtop AS q
 OUTER APPLY sys.dm_exec_sql_text(q.sql_handle) AS t
 OUTER APPLY (SELECT value FROM sys.dm_exec_plan_attributes(q.plan_handle) WHERE attribute = N'dbid') AS pa;
 
-SELECT N'topq_info' AS _section, CAST({{TOPQ}} AS nvarchar(1)) AS collected, CAST(@cached AS nvarchar(20)) AS plan_cache_entries;
+SELECT N'topq_info' AS _section, CAST(@p_TopQ AS nvarchar(1)) AS collected, CAST(@cached AS nvarchar(20)) AS plan_cache_entries;
 SELECT TOP (20) N'top_duration' AS _section, db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, CAST(executions AS nvarchar(20)) AS executions,
        CAST(total_duration_ms AS nvarchar(30)) AS total_duration_ms, CAST(avg_duration_ms AS nvarchar(30)) AS avg_duration_ms,
        CAST(total_cpu_ms AS nvarchar(30)) AS total_cpu_ms, CAST(total_logical_reads AS nvarchar(30)) AS total_logical_reads, query_text
@@ -285,27 +306,34 @@ SELECT TOP (20) N'top_reads' AS _section, db, object_name, CONVERT(nvarchar(20),
        CAST(total_cpu_ms AS nvarchar(30)) AS total_cpu_ms, query_text
 FROM #qtx WHERE rn_r <= 20 ORDER BY rn_r;
 
+GO
 --##PERF_TEARDOWN
 SET NOCOUNT ON;
+DECLARE @p_Restore bit = NULL;           -- 1 = restore the threshold; NULL = as recorded by PERF_START in this session
+DECLARE @p_Orig int = NULL;              -- value to restore; NULL = as recorded by PERF_START in this session
 DECLARE @adv int, @msg nvarchar(2000) = N'';
+IF @p_Restore IS NULL AND OBJECT_ID('tempdb..#perf_state') IS NOT NULL
+    SELECT @p_Restore = thr_set, @p_Orig = orig FROM #perf_state;
 BEGIN TRY
     IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'DBA_PerfWindow')
         DROP EVENT SESSION DBA_PerfWindow ON SERVER;
 END TRY
 BEGIN CATCH SET @msg += N'XE session not dropped: ' + ERROR_MESSAGE() + N' '; END CATCH;
-IF {{RESTORE}} = 1
+IF @p_Restore = 1 AND @p_Orig IS NOT NULL
 BEGIN
     BEGIN TRY
-        IF (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'blocked process threshold (s)') <> {{ORIG}}
+        IF (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'blocked process threshold (s)') <> @p_Orig
         BEGIN
             SELECT @adv = CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'show advanced options';
             IF @adv = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE; END;
-            EXEC sys.sp_configure N'blocked process threshold (s)', {{ORIG}}; RECONFIGURE;
+            EXEC sys.sp_configure N'blocked process threshold (s)', @p_Orig; RECONFIGURE;
             IF @adv = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 0; RECONFIGURE; END;
         END;
     END TRY
     BEGIN CATCH SET @msg += N'Threshold not restored: ' + ERROR_MESSAGE() + N' '; END CATCH;
 END;
 IF OBJECT_ID('tempdb..#qstart') IS NOT NULL DROP TABLE #qstart;
+IF OBJECT_ID('tempdb..#perf_state') IS NOT NULL DROP TABLE #perf_state;
 SELECT N'perf_teardown' AS _section,
        (SELECT CAST(value_in_use AS nvarchar(10)) FROM sys.configurations WHERE name = N'blocked process threshold (s)') AS threshold_now, @msg AS message;
+GO

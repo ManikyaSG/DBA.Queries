@@ -206,6 +206,7 @@ function Get-SqlBlocks([string]$Text) {
     # PerfCheck.sql: header, then --##PERF_* blocks run separately
     $blocks = @{}; $name = 'HC'; $sb = New-Object System.Text.StringBuilder
     foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^\s*GO\s*$') { continue }      # SSMS batch separator
         if ($line -match '^--##(PERF_\w+)\s*$') { $blocks[$name] = $sb.ToString(); $name = $Matches[1]; $sb = New-Object System.Text.StringBuilder; continue }
         [void]$sb.AppendLine($line)
     }
@@ -213,8 +214,13 @@ function Get-SqlBlocks([string]$Text) {
     return $blocks
 }
 
-function Expand-SqlTokens([string]$Sql, [hashtable]$Tokens) {
-    foreach ($k in $Tokens.Keys) { $Sql = $Sql.Replace('{{' + $k + '}}', [string]$Tokens[$k]) }
+function Set-SqlParams([string]$Sql, [hashtable]$Params) {
+    # Sets the default of each "DECLARE @p_Name type = value;" line at the top of a PerfCheck.sql block
+    foreach ($k in $Params.Keys) {
+        $v = $Params[$k]
+        $lit = if ($null -eq $v) { 'NULL' } elseif ($v -is [string]) { "N'" + $v.Replace("'", "''") + "'" } else { [string]$v }
+        $Sql = [regex]::Replace($Sql, '(?m)^(\s*DECLARE\s+@' + [regex]::Escape($k) + '\s+[\w\(\)]+\s*=\s*)[^;]*;', { param($m) $m.Groups[1].Value + $lit + ';' }.GetNewClosure())
+    }
     return $Sql
 }
 
@@ -241,7 +247,7 @@ function R1([double]$v) { return [math]::Round($v, 1) }
 
 function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$DurationMin) {
     # $Items: objects with Instance, Conn, Safe. Adds Samples, Setup, End, Notes, StartTime.
-    $tok = @{ BPT_SEC = [int]$Config.BlockedProcessThresholdSec; LONG_SEC = [int]$Config.LongQuerySec; LONG_US = [int64]$Config.LongQuerySec * 1000000; TOPQ = $(if ($Config.TopQueries) { 1 } else { 0 }) }
+    $tok = @{ p_BptSec = [int]$Config.BlockedProcessThresholdSec; p_LongUs = [int64]$Config.LongQuerySec * 1000000; p_TopQ = $(if ($Config.TopQueries) { 1 } else { 0 }) }
     foreach ($it in $Items) {
         $it | Add-Member -NotePropertyName Samples -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
         $it | Add-Member -NotePropertyName Notes -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
@@ -253,12 +259,12 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
         if (Test-Path -LiteralPath $it.RestoreFile) {
             $old = ([string](Get-Content -LiteralPath $it.RestoreFile -Raw)).Trim()
             if ($old -match '^\d+$') {
-                try { [void](Invoke-SqlSections $it.Conn (Expand-SqlTokens $Blocks['PERF_TEARDOWN'] @{ RESTORE = 1; ORIG = $old })); Write-Step "  $($it.Instance): restored blocked process threshold ($old) left by an interrupted run" 'Yellow' } catch { }
+                try { [void](Invoke-SqlSections $it.Conn (Set-SqlParams $Blocks['PERF_TEARDOWN'] @{ p_Restore = 1; p_Orig = [int]$old })); Write-Step "  $($it.Instance): restored blocked process threshold ($old) left by an interrupted run" 'Yellow' } catch { }
             }
             Remove-Item -LiteralPath $it.RestoreFile -Force -ErrorAction SilentlyContinue
         }
         try {
-            $r = Invoke-SqlSections $it.Conn (Expand-SqlTokens $Blocks['PERF_START'] $tok)
+            $r = Invoke-SqlSections $it.Conn (Set-SqlParams $Blocks['PERF_START'] $tok)
             $it.Setup = @(Get-Rows $r 'perf_setup') | Select-Object -First 1
             if ($it.Setup) {
                 $it.StartTime = $it.Setup['start_time']
@@ -277,7 +283,7 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
         for ($i = 0; $i -le $n; $i++) {
             $t0 = Get-Date
             foreach ($it in $Items) {
-                try { [void]$it.Samples.Add((Invoke-SqlSections $it.Conn (Expand-SqlTokens $Blocks['PERF_SAMPLE'] $tok))) }
+                try { [void]$it.Samples.Add((Invoke-SqlSections $it.Conn (Set-SqlParams $Blocks['PERF_SAMPLE'] $tok))) }
                 catch { [void]$it.Notes.Add("Sample at $($t0.ToString('HH:mm:ss')) failed: $($_.Exception.Message)") }
             }
             Write-Host ("`r  sample {0}/{1} at {2}   " -f $i, $n, (Get-Date -Format 'HH:mm:ss')) -NoNewline
@@ -291,7 +297,7 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
         }
         Write-Host ''
         foreach ($it in $Items) {
-            try { $it.End = Invoke-SqlSections $it.Conn (Expand-SqlTokens $Blocks['PERF_END'] @{ START = $it.StartTime; LONG_SEC = $Config.LongQuerySec; TOPQ = $tok.TOPQ }) }
+            try { $it.End = Invoke-SqlSections $it.Conn (Set-SqlParams $Blocks['PERF_END'] @{ p_Start = [string]$it.StartTime; p_TopQ = $tok.p_TopQ }) }
             catch { [void]$it.Notes.Add("Blocked process / deadlock / top query collection failed: $($_.Exception.Message)") }
         }
     }
@@ -301,7 +307,7 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
             $restore = if ($it.Setup -and $it.Setup['threshold_set'] -eq '1') { 1 } else { 0 }
             $orig = if ($it.Setup) { $it.Setup['orig_threshold'] } else { '0' }
             try {
-                $td = @(Get-Rows (Invoke-SqlSections $it.Conn (Expand-SqlTokens $Blocks['PERF_TEARDOWN'] @{ RESTORE = $restore; ORIG = $orig })) 'perf_teardown') | Select-Object -First 1
+                $td = @(Get-Rows (Invoke-SqlSections $it.Conn (Set-SqlParams $Blocks['PERF_TEARDOWN'] @{ p_Restore = [int]$restore; p_Orig = [int]$orig })) 'perf_teardown') | Select-Object -First 1
                 if ($td -and $td['message']) { [void]$it.Notes.Add([string]$td['message']); Write-Step "  $($it.Instance): $($td['message'])" 'Yellow' }
                 else { Remove-Item -LiteralPath $it.RestoreFile -Force -ErrorAction SilentlyContinue }
                 if ($restore) { Write-Step "  $($it.Instance): blocked process threshold restored to $orig s, XE session dropped" 'DarkGray' }
