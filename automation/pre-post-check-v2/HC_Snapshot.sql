@@ -587,7 +587,8 @@ FROM #issues ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, area, ite
                    tempdb, Always On, listener connections). Deltas per interval
                    are calculated by the script.
    PERF_END      : blocked process reports, deadlocks, long queries (XE) and the
-                   top queries of the window from Query Store.
+                   top queries of the window from the plan cache
+                   (sys.dm_exec_query_stats at window start vs end - no Query Store).
    PERF_TEARDOWN : drops the XE session and restores the original threshold.
 *******************************************************************************/
 --##PERF_START
@@ -632,6 +633,14 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
     BEGIN CATCH SET @msg += N'XE session not started: ' + ERROR_MESSAGE() + N' '; END CATCH;
 END
 ELSE SET @msg += N'No ALTER ANY EVENT SESSION permission - blocked process reports, deadlocks and long queries come from DMVs only. ';
+
+-- Plan cache baseline for the window's top queries (session #temp table, compared at PERF_END)
+IF OBJECT_ID('tempdb..#qstart') IS NOT NULL DROP TABLE #qstart;
+CREATE TABLE #qstart (query_hash binary(8) PRIMARY KEY, ec bigint, el bigint, cpu bigint, rd bigint);
+IF {{TOPQ}} = 1
+    INSERT #qstart (query_hash, ec, el, cpu, rd)
+    SELECT query_hash, SUM(execution_count), SUM(total_elapsed_time), SUM(total_worker_time), SUM(total_logical_reads)
+    FROM sys.dm_exec_query_stats WHERE query_hash IS NOT NULL GROUP BY query_hash;
 
 SELECT N'perf_setup' AS _section, CAST(@orig AS nvarchar(10)) AS orig_threshold, CAST(@thr AS nvarchar(1)) AS threshold_set,
        CAST(@xe AS nvarchar(1)) AS xe_started, CONVERT(nvarchar(40), SYSDATETIMEOFFSET(), 127) AS start_time, @msg AS message;
@@ -766,55 +775,69 @@ SELECT TOP (200) N'xe_long' AS _section,
 FROM #xe WHERE ev.value('(event/@name)[1]', 'nvarchar(60)') IN (N'rpc_completed', N'sql_batch_completed')
 ORDER BY ev.value('(event/data[@name="duration"]/value)[1]', 'bigint') DESC;
 
--- Query Store: top queries in the window (every online database with Query Store on)
-IF OBJECT_ID('tempdb..#qs') IS NOT NULL DROP TABLE #qs;
-CREATE TABLE #qs (db sysname, query_id bigint, executions bigint, total_duration_ms decimal(19, 1), avg_duration_ms decimal(19, 1),
-                  total_cpu_ms decimal(19, 1), total_logical_reads decimal(19, 0), query_text nvarchar(300));
-DECLARE @db sysname, @sql nvarchar(max), @qsErr nvarchar(max) = N'';
-DECLARE qsdb CURSOR LOCAL FAST_FORWARD FOR
-    SELECT name FROM sys.databases WHERE state = 0 AND database_id > 4 AND is_query_store_on = 1 AND HAS_DBACCESS(name) = 1;
-OPEN qsdb; FETCH NEXT FROM qsdb INTO @db;
-WHILE @@FETCH_STATUS = 0
+-- Top queries of the window from the plan cache: sys.dm_exec_query_stats now minus the baseline taken at
+-- PERF_START (#qstart, same connection), grouped by query_hash so the same query with different literals or
+-- plans counts once. Not seen: plans evicted / recompiled during the window and OPTION (RECOMPILE) statements.
+IF OBJECT_ID('tempdb..#qraw') IS NOT NULL DROP TABLE #qraw;
+IF OBJECT_ID('tempdb..#qtop') IS NOT NULL DROP TABLE #qtop;
+CREATE TABLE #qtop (query_hash binary(8), executions bigint, total_duration_ms decimal(19, 1), avg_duration_ms decimal(19, 1),
+                    total_cpu_ms decimal(19, 1), total_logical_reads bigint, sql_handle varbinary(64), plan_handle varbinary(64),
+                    stmt_start int, stmt_end int, rn_d int, rn_c int, rn_r int);
+DECLARE @cached int = 0;
+IF {{TOPQ}} = 1 AND OBJECT_ID('tempdb..#qstart') IS NOT NULL
 BEGIN
-    SET @sql = N'USE ' + QUOTENAME(@db) + N';
-INSERT #qs SELECT DB_NAME(), query_id, executions, total_duration_ms, avg_duration_ms, total_cpu_ms, total_logical_reads, query_text
-FROM (SELECT q.query_id, SUM(rs.count_executions) AS executions,
-             CAST(SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS decimal(19, 1)) AS total_duration_ms,
-             CAST(SUM(rs.avg_duration * rs.count_executions) / 1000.0 / NULLIF(SUM(rs.count_executions), 0) AS decimal(19, 1)) AS avg_duration_ms,
-             CAST(SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS decimal(19, 1)) AS total_cpu_ms,
-             CAST(SUM(rs.avg_logical_io_reads * rs.count_executions) AS decimal(19, 0)) AS total_logical_reads,
-             LEFT(MAX(qt.query_sql_text), 300) AS query_text,
-             ROW_NUMBER() OVER (ORDER BY SUM(rs.avg_duration * rs.count_executions) DESC) AS rn_d,
-             ROW_NUMBER() OVER (ORDER BY SUM(rs.avg_cpu_time * rs.count_executions) DESC) AS rn_c,
-             ROW_NUMBER() OVER (ORDER BY SUM(rs.avg_logical_io_reads * rs.count_executions) DESC) AS rn_r
-      FROM sys.query_store_runtime_stats AS rs
-      JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
-      JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
-      JOIN sys.query_store_query AS q ON q.query_id = p.query_id
-      JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
-      WHERE i.end_time > @s AND i.start_time < @e
-      GROUP BY q.query_id) AS a
-WHERE rn_d <= 20 OR rn_c <= 20 OR rn_r <= 20;';
-    BEGIN TRY EXEC sys.sp_executesql @sql, N'@s datetimeoffset, @e datetimeoffset', @s, @e; END TRY
-    BEGIN CATCH SET @qsErr += @db + N': ' + ERROR_MESSAGE() + N' '; END CATCH;
-    FETCH NEXT FROM qsdb INTO @db;
-END;
-CLOSE qsdb; DEALLOCATE qsdb;
+    SELECT query_hash, sql_handle, plan_handle, statement_start_offset, statement_end_offset,
+           execution_count, total_elapsed_time, total_worker_time, total_logical_reads,
+           ROW_NUMBER() OVER (PARTITION BY query_hash ORDER BY total_elapsed_time DESC) AS rn
+    INTO #qraw
+    FROM sys.dm_exec_query_stats
+    WHERE query_hash IS NOT NULL;
+    SET @cached = @@ROWCOUNT;
 
-SELECT N'qs_info' AS _section, CAST((SELECT COUNT(*) FROM sys.databases WHERE state = 0 AND database_id > 4 AND is_query_store_on = 1) AS nvarchar(10)) AS qs_databases,
-       CAST((SELECT COUNT(*) FROM sys.databases WHERE state = 0 AND database_id > 4) AS nvarchar(10)) AS user_databases, @qsErr AS errors;
-SELECT TOP (20) N'qs_duration' AS _section, db, CAST(query_id AS nvarchar(20)) AS query_id, CAST(executions AS nvarchar(20)) AS executions,
+    WITH e AS (
+        SELECT query_hash, SUM(execution_count) AS ec, SUM(total_elapsed_time) AS el, SUM(total_worker_time) AS cpu, SUM(total_logical_reads) AS rd,
+               MAX(CASE WHEN rn = 1 THEN sql_handle END) AS sh, MAX(CASE WHEN rn = 1 THEN plan_handle END) AS ph,
+               MAX(CASE WHEN rn = 1 THEN statement_start_offset END) AS so, MAX(CASE WHEN rn = 1 THEN statement_end_offset END) AS eo
+        FROM #qraw GROUP BY query_hash),
+    d AS (   -- delta; if the plan was recompiled / re-cached (counters went down) use the current values
+        SELECT e.query_hash, e.sh, e.ph, e.so, e.eo,
+               CASE WHEN s.query_hash IS NULL OR e.ec < s.ec THEN e.ec  ELSE e.ec  - s.ec  END AS ec,
+               CASE WHEN s.query_hash IS NULL OR e.ec < s.ec THEN e.el  ELSE e.el  - s.el  END AS el,
+               CASE WHEN s.query_hash IS NULL OR e.ec < s.ec THEN e.cpu ELSE e.cpu - s.cpu END AS cpu,
+               CASE WHEN s.query_hash IS NULL OR e.ec < s.ec THEN e.rd  ELSE e.rd  - s.rd  END AS rd
+        FROM e LEFT JOIN #qstart AS s ON s.query_hash = e.query_hash),
+    r AS (
+        SELECT *, ROW_NUMBER() OVER (ORDER BY el DESC) AS rn_d, ROW_NUMBER() OVER (ORDER BY cpu DESC) AS rn_c, ROW_NUMBER() OVER (ORDER BY rd DESC) AS rn_r
+        FROM d WHERE ec > 0)
+    INSERT #qtop
+    SELECT query_hash, ec, CAST(el / 1000.0 AS decimal(19, 1)), CAST(el / 1000.0 / ec AS decimal(19, 1)), CAST(cpu / 1000.0 AS decimal(19, 1)), rd,
+           sh, ph, so, eo, rn_d, rn_c, rn_r
+    FROM r WHERE rn_d <= 20 OR rn_c <= 20 OR rn_r <= 20;
+END;
+
+IF OBJECT_ID('tempdb..#qtx') IS NOT NULL DROP TABLE #qtx;
+SELECT q.*, ISNULL(DB_NAME(COALESCE(t.dbid, CONVERT(int, pa.value))), N'') AS db,
+       ISNULL(LEFT(LTRIM(SUBSTRING(t.text, q.stmt_start / 2 + 1,
+              (CASE WHEN q.stmt_end = -1 THEN DATALENGTH(t.text) ELSE q.stmt_end END - q.stmt_start) / 2 + 1)), 300), N'') AS query_text,
+       ISNULL(OBJECT_NAME(t.objectid, t.dbid), N'') AS object_name
+INTO #qtx
+FROM #qtop AS q
+OUTER APPLY sys.dm_exec_sql_text(q.sql_handle) AS t
+OUTER APPLY (SELECT value FROM sys.dm_exec_plan_attributes(q.plan_handle) WHERE attribute = N'dbid') AS pa;
+
+SELECT N'topq_info' AS _section, CAST({{TOPQ}} AS nvarchar(1)) AS collected, CAST(@cached AS nvarchar(20)) AS plan_cache_entries;
+SELECT TOP (20) N'top_duration' AS _section, db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, CAST(executions AS nvarchar(20)) AS executions,
        CAST(total_duration_ms AS nvarchar(30)) AS total_duration_ms, CAST(avg_duration_ms AS nvarchar(30)) AS avg_duration_ms,
        CAST(total_cpu_ms AS nvarchar(30)) AS total_cpu_ms, CAST(total_logical_reads AS nvarchar(30)) AS total_logical_reads, query_text
-FROM #qs ORDER BY total_duration_ms DESC;
-SELECT TOP (20) N'qs_cpu' AS _section, db, CAST(query_id AS nvarchar(20)) AS query_id, CAST(executions AS nvarchar(20)) AS executions,
+FROM #qtx WHERE rn_d <= 20 ORDER BY rn_d;
+SELECT TOP (20) N'top_cpu' AS _section, db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, CAST(executions AS nvarchar(20)) AS executions,
        CAST(total_cpu_ms AS nvarchar(30)) AS total_cpu_ms, CAST(total_duration_ms AS nvarchar(30)) AS total_duration_ms,
        CAST(total_logical_reads AS nvarchar(30)) AS total_logical_reads, query_text
-FROM #qs ORDER BY total_cpu_ms DESC;
-SELECT TOP (20) N'qs_reads' AS _section, db, CAST(query_id AS nvarchar(20)) AS query_id, CAST(executions AS nvarchar(20)) AS executions,
+FROM #qtx WHERE rn_c <= 20 ORDER BY rn_c;
+SELECT TOP (20) N'top_reads' AS _section, db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, CAST(executions AS nvarchar(20)) AS executions,
        CAST(total_logical_reads AS nvarchar(30)) AS total_logical_reads, CAST(total_duration_ms AS nvarchar(30)) AS total_duration_ms,
        CAST(total_cpu_ms AS nvarchar(30)) AS total_cpu_ms, query_text
-FROM #qs ORDER BY total_logical_reads DESC;
+FROM #qtx WHERE rn_r <= 20 ORDER BY rn_r;
 
 --##PERF_TEARDOWN
 SET NOCOUNT ON;
@@ -837,5 +860,6 @@ BEGIN
     END TRY
     BEGIN CATCH SET @msg += N'Threshold not restored: ' + ERROR_MESSAGE() + N' '; END CATCH;
 END;
+IF OBJECT_ID('tempdb..#qstart') IS NOT NULL DROP TABLE #qstart;
 SELECT N'perf_teardown' AS _section,
        (SELECT CAST(value_in_use AS nvarchar(10)) FROM sys.configurations WHERE name = N'blocked process threshold (s)') AS threshold_now, @msg AS message;

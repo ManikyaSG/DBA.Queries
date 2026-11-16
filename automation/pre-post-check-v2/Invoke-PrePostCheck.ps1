@@ -37,7 +37,7 @@
     PerfSampleSec seconds for PerfDurationMin minutes: throughput, compilations, connections and
     connection pool usage, locking/blocking/deadlocks, memory, wait stats per interval, file
     latency, tempdb, Always On queues/delay and listener connections, plus queries over
-    LongQuerySec seconds and the top 20 Query Store queries of the window. Sets 'blocked process
+    LongQuerySec seconds and the top 20 queries of the window (plan cache, start vs end - no Query Store). Sets 'blocked process
     threshold' to BlockedProcessThresholdSec and a temporary XE session, both reverted at the end.
     Option 5 (SCHEDULE) creates a Windows scheduled task that runs it unattended.
 
@@ -106,8 +106,7 @@ $Config = @{
     PerfDatabases         = @()      # databases for 'Trans/s' e.g. @('MARS', 'CLR'); @() = all databases
     BlockedProcessThresholdSec = 5   # 'blocked process threshold' during the window (restored after)
     LongQuerySec          = 5        # capture every query running longer than this (XE)
-    QueryStoreTop         = $true    # top 20 queries from Query Store at the end of the window ($false = skip; heaviest step)
-    QueryStoreLimitToPerfDatabases = $true   # read Query Store only for PerfDatabases (when PerfDatabases is set)
+    TopQueries            = $true    # top 20 queries of the window from the plan cache (dm_exec_query_stats start vs end); $false = skip
     PerfThresholds        = @{ PleMin = 300; DataReadMs = 20; LogWriteMs = 10; AgSendQueueMB = 100 }
     ScheduledTaskName     = 'DBA SQL Health Check'      # prefix of the Windows scheduled tasks created by option 5
 }
@@ -476,19 +475,6 @@ function Expand-SqlTokens([string]$Sql, [hashtable]$Tokens) {
     return $Sql
 }
 
-function Set-QueryStoreScope([string]$Sql) {
-    # Limits (or skips) the Query Store step of PERF_END - the heaviest part on busy servers
-    $marker = 'AND is_query_store_on = 1 AND HAS_DBACCESS(name) = 1;'
-    if (-not $Sql.Contains($marker)) { return $Sql }
-    if (-not $Config.QueryStoreTop) { return $Sql.Replace($marker, 'AND 1 = 0;') }
-    $dbs = @($Config.PerfDatabases | Where-Object { $_ })
-    if ($Config.QueryStoreLimitToPerfDatabases -and $dbs.Count) {
-        $list = ($dbs | ForEach-Object { "N'" + ([string]$_).Replace("'", "''") + "'" }) -join ', '
-        return $Sql.Replace($marker, "AND is_query_store_on = 1 AND HAS_DBACCESS(name) = 1 AND name IN ($list);")
-    }
-    return $Sql
-}
-
 function ConvertTo-Num($Value) {
     $d = 0.0
     if ([double]::TryParse([string]$Value, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d }
@@ -509,7 +495,7 @@ function R1([double]$v) { return [math]::Round($v, 1) }
 
 function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$DurationMin) {
     # $Items: objects with Instance, Conn, Safe. Adds Samples, Setup, End, Notes, StartTime.
-    $tok = @{ BPT_SEC = [int]$Config.BlockedProcessThresholdSec; LONG_SEC = [int]$Config.LongQuerySec; LONG_US = [int64]$Config.LongQuerySec * 1000000 }
+    $tok = @{ BPT_SEC = [int]$Config.BlockedProcessThresholdSec; LONG_SEC = [int]$Config.LongQuerySec; LONG_US = [int64]$Config.LongQuerySec * 1000000; TOPQ = $(if ($Config.TopQueries) { 1 } else { 0 }) }
     foreach ($it in $Items) {
         $it | Add-Member -NotePropertyName Samples -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
         $it | Add-Member -NotePropertyName Notes -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
@@ -559,8 +545,8 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
         }
         Write-Host ''
         foreach ($it in $Items) {
-            try { $it.End = Get-Snapshot $it.Conn (Set-QueryStoreScope (Expand-SqlTokens $Blocks['PERF_END'] @{ START = $it.StartTime; LONG_SEC = $Config.LongQuerySec })) }
-            catch { [void]$it.Notes.Add("Blocked process / deadlock / Query Store collection failed: $($_.Exception.Message)") }
+            try { $it.End = Get-Snapshot $it.Conn (Expand-SqlTokens $Blocks['PERF_END'] @{ START = $it.StartTime; LONG_SEC = $Config.LongQuerySec; TOPQ = $tok.TOPQ }) }
+            catch { [void]$it.Notes.Add("Blocked process / deadlock / top query collection failed: $($_.Exception.Message)") }
         }
     }
     finally {
@@ -781,8 +767,10 @@ function Get-PerfResult($It, [int]$SampleSec) {
     $tbl = { param($title, $rows, $statusCol = '') $r = @($rows); "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count) { [string](ConvertTo-HtmlTable $r (& $cols $r) '' $statusCol) } else { '<div style="color:#2e7d32">None</div>' }) }
     $endTbl = { param($title, $sec) $r = @(Get-Rows $It.End $sec); $c = if ($It.End -and $It.End['columns'].ContainsKey($sec)) { @($It.End['columns'][$sec]) } else { @() }
                 "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count -and $c.Count) { [string](ConvertTo-HtmlTable $r $c) } else { '<div style="color:#2e7d32">None</div>' }) }
-    $qsInfo = @(Get-Rows $It.End 'qs_info') | Select-Object -First 1
-    $qsNote = if (-not $Config.QueryStoreTop) { 'Query Store top queries skipped (QueryStoreTop = $false).' } elseif ($qsInfo) { "Query Store is on for $(Get-Val $qsInfo 'qs_databases') of $(Get-Val $qsInfo 'user_databases') user databases$(if ($Config.QueryStoreLimitToPerfDatabases -and @($Config.PerfDatabases | Where-Object { $_ }).Count) { '; read only for ' + (@($Config.PerfDatabases) -join ', ') }). Query Store groups runtime stats into intervals (60 min by default), so totals include the whole intervals that overlap the window. $(Get-Val $qsInfo 'errors')" } else { 'Query Store data not collected.' }
+    $tqInfo = @(Get-Rows $It.End 'topq_info') | Select-Object -First 1
+    $qsNote = if (-not $Config.TopQueries) { 'Top queries skipped (TopQueries = $false).' }
+              elseif ($tqInfo) { "Top queries = plan cache (sys.dm_exec_query_stats) at the end of the window minus the start, grouped by query_hash ($(Get-Val $tqInfo 'plan_cache_entries') cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted; those over $($Config.LongQuerySec) s are still in the list above." }
+              else { 'Top queries not collected.' }
 
     $short = (@(
         "<h2>Performance window: $t1 - $t2 ($($iv.Count) intervals of $SampleSec s)</h2>"
@@ -802,9 +790,9 @@ function Get-PerfResult($It, [int]$SampleSec) {
         & $endTbl 'Deadlocks' 'xe_deadlocks'
         & $endTbl "Queries over $($Config.LongQuerySec) s" 'xe_long'
         "<div style='color:#555;margin-top:12px'>$(Enc $qsNote)</div>"
-        & $endTbl 'Top 20 queries by duration (Query Store)' 'qs_duration'
-        & $endTbl 'Top 20 queries by CPU (Query Store)' 'qs_cpu'
-        & $endTbl 'Top 20 queries by logical reads (Query Store)' 'qs_reads'
+        & $endTbl 'Top 20 queries in the window by duration' 'top_duration'
+        & $endTbl 'Top 20 queries in the window by CPU' 'top_cpu'
+        & $endTbl 'Top 20 queries in the window by logical reads' 'top_reads'
     ) -join '')
     return [pscustomobject]@{ Short = $short; Full = $full; Crit = $crit; Warn = $warn; Intervals = $iv.Count }
 }
