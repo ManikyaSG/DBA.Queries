@@ -106,6 +106,12 @@ $Config = @{
     Encrypt               = $false
     MailCheckDelaySec     = 20
     AttachReport          = $true    # attach the full report (falls back to the email body)
+    # ---- Fallback when no instance can send through Database Mail (or it reports 'failed') ----
+    SmtpServer            = ''       # e.g. 'smtp.yourcompany.com' - sends directly from this VM with .NET; '' = no fallback
+    SmtpPort              = 25
+    SmtpFrom              = ''       # '' = FromAddress, else sqlperfcheck@<VM name>
+    SmtpUseSsl            = $false
+    SmtpUseDefaultCredentials = $false   # $true = authenticate as the Windows account running the script
 }
 
 $ErrorActionPreference = 'Stop'
@@ -187,6 +193,10 @@ function Get-MailProfileName($Connection) {
 SELECT TOP (1) p.name
 FROM msdb.dbo.sysmail_profile AS p
 LEFT JOIN msdb.dbo.sysmail_principalprofile AS pp ON pp.profile_id = p.profile_id AND pp.is_default = 1
+WHERE EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profileaccount AS pa WHERE pa.profile_id = p.profile_id)      -- has an SMTP account
+  AND (   IS_SRVROLEMEMBER(N'sysadmin') = 1                                                                   -- usable by this login
+       OR EXISTS (SELECT 1 FROM msdb.dbo.sysmail_principalprofile AS x
+                  WHERE x.profile_id = p.profile_id AND (x.principal_sid = 0x00 OR x.principal_sid = SUSER_SID())))
 ORDER BY CASE WHEN p.name = @pref THEN 0 WHEN pp.profile_id IS NOT NULL THEN 1 ELSE 2 END, p.profile_id;
 "@
     $r = Invoke-Scalar $Connection $q @{ '@pref' = $Config.MailProfile }
@@ -831,6 +841,76 @@ function Get-FullReportHtml($Snap, $Sections = $ReportSections) {
     return $sb.ToString()
 }
 
+function Send-SmtpMail([string]$Subject, [string]$Html, [string]$Importance, [string[]]$Attachments) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $msg = New-Object System.Net.Mail.MailMessage
+    $from = if ($Config.SmtpFrom) { $Config.SmtpFrom } elseif ($Config.FromAddress) { $Config.FromAddress } else { "sqlperfcheck@$([Environment]::MachineName.ToLower())" }
+    $msg.From = New-Object System.Net.Mail.MailAddress $from
+    foreach ($r in @($Config.Recipients -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) { $msg.To.Add($r) }
+    foreach ($r in @([string]$Config.CopyRecipients -split '[;,]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) { $msg.CC.Add($r) }
+    if ($Config.ReplyTo) { $msg.ReplyToList.Add($Config.ReplyTo) }
+    $msg.Subject = $Subject; $msg.Body = $Html; $msg.IsBodyHtml = $true
+    if ($Importance -eq 'High') { $msg.Priority = [System.Net.Mail.MailPriority]::High }
+    foreach ($a in @($Attachments | Where-Object { $_ -and (Test-Path -LiteralPath $_) })) { $msg.Attachments.Add((New-Object System.Net.Mail.Attachment $a)) }
+    $client = New-Object System.Net.Mail.SmtpClient ($Config.SmtpServer, [int]$Config.SmtpPort)
+    $client.EnableSsl = [bool]$Config.SmtpUseSsl
+    if ($Config.SmtpUseDefaultCredentials) { $client.UseDefaultCredentials = $true }
+    try { $client.Send($msg) } finally { $msg.Dispose(); $client.Dispose() }
+}
+
+function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$BodySummary, [string[]]$Files, [string]$Importance, $Candidates) {
+    # Tries every instance with Database Mail (local first) until one accepts and does not report 'failed',
+    # then the SMTP fallback. Returns @{ Sent; Status }.
+    $attempts = @()
+    foreach ($sender in @($Candidates | Sort-Object @{ Expression = { -not $_.Local } })) {
+        $c = $null
+        try {
+            $c = (Open-SqlConnection $sender.Instance).Connection
+            $maxBytes = 0
+            try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
+            $okFiles = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($maxBytes -le 0 -or (Get-Item -LiteralPath $_).Length -le $maxBytes) })
+            $mailId = $null; $how = ''
+            if ($Config.AttachReport -and $okFiles.Count -and $BodyAttached) {
+                try { $mailId = Send-DbMail $c $sender.Profile $Subject $BodyAttached $Importance ($okFiles -join ';'); $how = "with $($okFiles.Count) attachment(s)" }
+                catch { Write-Step "  Attachment not possible via $($sender.Instance) ($($_.Exception.Message)) - sending without it." 'Yellow' }
+            }
+            if (-not $mailId) { $mailId = Send-DbMail $c $sender.Profile $Subject $BodySummary $Importance; $how = 'summary only, full report on the VM' }
+            Write-Step "Email      : queued as mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)' ($how)" 'Green'
+            # wait for Database Mail to hand it to the SMTP server
+            $st = $null; $deadline = (Get-Date).AddSeconds([math]::Max(20, 3 * $Config.MailCheckDelaySec))
+            do {
+                Start-Sleep -Seconds 5
+                $st = Invoke-Scalar $c "SELECT sent_status FROM msdb.dbo.sysmail_allitems WHERE mailitem_id = @id;" @{ '@id' = $mailId }
+                $st = if ($null -eq $st -or $st -is [DBNull]) { 'unknown' } else { [string]$st }
+            } while ($st -in @('unsent', 'retrying') -and (Get-Date) -lt $deadline)
+            if ($st -eq 'failed') {
+                $why = Invoke-Scalar $c "SELECT TOP (1) LEFT(description, 300) FROM msdb.dbo.sysmail_event_log WHERE mailitem_id = @id ORDER BY log_id DESC;" @{ '@id' = $mailId }
+                $attempts += "$($sender.Instance): Database Mail failed - $why"
+                Write-Step "  Database Mail on $($sender.Instance) failed to deliver ($why) - trying the next option." 'Yellow'
+                continue
+            }
+            $note = if ($st -eq 'sent') { 'sent' } else { "$st (still in the Database Mail queue)" }
+            return @{ Sent = $true; Status = "$note via $($sender.Instance) / '$($sender.Profile)' ($how)" }
+        }
+        catch {
+            $attempts += "$($sender.Instance): $($_.Exception.Message)"
+            Write-Step "  Could not send via $($sender.Instance): $($_.Exception.Message) - trying the next option." 'Yellow'
+        }
+        finally { if ($c) { $c.Dispose() } }
+    }
+    if ($Config.SmtpServer) {
+        try {
+            $body = if ($Config.AttachReport -and @($Files).Count -and $BodyAttached) { $BodyAttached } else { $BodySummary }
+            Send-SmtpMail $Subject $body $Importance $(if ($Config.AttachReport) { $Files } else { @() })
+            Write-Step "Email      : sent directly via SMTP $($Config.SmtpServer):$($Config.SmtpPort)" 'Green'
+            return @{ Sent = $true; Status = "sent via SMTP $($Config.SmtpServer)" }
+        }
+        catch { $attempts += "SMTP $($Config.SmtpServer): $($_.Exception.Message)" }
+    }
+    if (-not $attempts.Count) { $attempts += 'no instance has a usable Database Mail profile and no SmtpServer is set in $Config' }
+    return @{ Sent = $false; Status = 'NOT SENT - ' + ($attempts -join ' | ') }
+}
+
 # =============================================================================
 #  MAIN
 # =============================================================================
@@ -840,7 +920,7 @@ $logFile = Join-Path $Config.LogsFolder ("PerfCheck_{0}_{1}.log" -f $Label, $sta
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { }
 
 $me = "$env:USERDOMAIN\$env:USERNAME"
-$summary = @(); $combinedFile = $null; $mailStatus = 'Not sent'; $exitCode = 0
+$summary = @(); $combinedFile = $null; $mailStatus = 'Not sent'; $exitCode = 0; $mailCandidates = @(); $script:MailSent = $false
 $sampleSecUsed = if ($SampleSec -gt 0) { $SampleSec } else { [int]$Config.SampleSec }
 $durationUsed  = if ($DurationMin -gt 0) { $DurationMin } else { [int]$Config.DurationMin }
 
@@ -881,7 +961,7 @@ try {
     }
 
     # ---- connect to every instance (+ health check) ----
-    $items = @(); $mailCandidates = @()
+    $items = @()
     foreach ($t in $targets) {
         $row = [pscustomobject][ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; ShortHtml = ''; FullHtml = ''
                                            HealthCrit = 0; HealthWarn = 0; HealthShort = ''; HealthFull = ''; PerfCrit = 0; PerfWarn = 0; PerfShort = ''; PerfFull = ''; PerfNote = '' }
@@ -894,7 +974,11 @@ try {
             $oc = Open-SqlConnection $t.Instance
             $row.ConnectedAs = $oc.As
             Write-Step "$($t.Instance): connected as $($oc.As)" 'Green'
-            try { $p = Get-MailProfileName $oc.Connection; if ($p) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $p; Local = ($t.Status -ne 'Listed') } } } catch { }
+            try {
+                $p = Get-MailProfileName $oc.Connection
+                if ($p) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $p; Local = ($t.Status -ne 'Listed') } }
+                else { Write-Step "  $($t.Instance): no usable Database Mail profile for $($oc.As) (XPs off, no profile / account, or profile not public)" 'DarkGray' }
+            } catch { Write-Step "  $($t.Instance): could not read Database Mail profiles - $($_.Exception.Message)" 'DarkGray' }
             $items += [pscustomobject]@{ Instance = $t.Instance; Conn = $oc.Connection; Safe = (Get-SafeFileName $t.Instance); Row = $row; Local = ($t.Status -ne 'Listed') }
             if (-not $NoHealth) {
                 Write-Step "$($t.Instance): health check..."
@@ -992,55 +1076,30 @@ try {
     Write-Step "`nReport     : $combinedFile" 'Green'
 
     $subject = "[$tag] $($Config.ReportTitle) [$Label] - $env:COMPUTERNAME - $($summary.Count) instance(s)"
-    $sender = @($mailCandidates | Sort-Object @{ Expression = { -not $_.Local } }) | Select-Object -First 1
-    if (-not $sender) {
-        $mailStatus = 'Not sent - no instance with Database Mail'
-        Write-Step 'No instance has Database Mail configured/enabled - email not sent.' 'Yellow'
-    }
-    else {
-        $c = $null
-        try {
-            $c = (Open-SqlConnection $sender.Instance).Connection
-            $shortHtml = [string]$HtmlHead + $headerShort + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
-            $sizeBytes = (Get-Item -LiteralPath $combinedFile).Length; $maxBytes = 0
-            try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
-            $attach = $Config.AttachReport -and ($maxBytes -le 0 -or $sizeBytes -le $maxBytes)
-            if ($Config.AttachReport -and -not $attach) { Write-Step ("Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) - not attached." -f ($sizeBytes / 1KB), ($maxBytes / 1KB)) 'Yellow' }
-            $mailId = $null
-            if ($attach) {
-                try {
-                    $body = $shortHtml + "<p style='color:#555'>The full report (per-interval tables and query lists) is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
-                    $files = @($combinedFile) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
-                    $mailId = Send-DbMail $c $sender.Profile $subject $body $importance ($files -join ';')
-                    $mailStatus = if ($files.Count -gt 1) { "Queued with attachments (report + $($files.Count - 1) deadlock graph(s))" } else { 'Queued with attachment' }
-                }
-                catch {
-                    Write-Step "Attachment not possible ($($_.Exception.Message))." 'Yellow'
-                    Write-Step '  (the SQL Server service account must be able to read the Reports folder on a local disk)' 'DarkGray'
-                }
-            }
-            if (-not $mailId) {
-                # Keep the email short: summary + needs attention; the full report stays on the VM
-                $body = $shortHtml + "<p style='color:#555'>Full report saved on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p></body></html>"
-                $mailId = Send-DbMail $c $sender.Profile $subject $body $importance
-                $mailStatus = 'Queued (summary only, full report on the VM)'
-            }
-            Write-Step "Email      : mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)'" 'Green'
-            Start-Sleep -Seconds $Config.MailCheckDelaySec
-            $q = @"
-SELECT a.sent_status + CASE WHEN a.sent_status = 'failed'
-       THEN ' - ' + ISNULL((SELECT TOP (1) LEFT(l.description, 200) FROM msdb.dbo.sysmail_event_log l WHERE l.mailitem_id = a.mailitem_id ORDER BY l.log_id DESC), '') ELSE '' END
-FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
-"@
-            $st = Invoke-Scalar $c $q @{ '@id' = $mailId }
-            $mailStatus = "$mailStatus - " + $(if ($null -eq $st -or $st -is [DBNull]) { 'status not found' } else { [string]$st })
-        }
-        catch { $mailStatus = 'Send failed: ' + $_.Exception.Message; Write-Step "WARNING: email not sent - $($_.Exception.Message)" 'Yellow' }
-        finally { if ($c) { $c.Dispose() } }
-    }
+    $shortHtml = [string]$HtmlHead + $headerShort + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
+    $bodyAttached = $shortHtml + "<p style='color:#555'>The full report (per-interval tables and query lists) is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
+    $bodySummary  = $shortHtml + "<p style='color:#555'>Full report saved on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p></body></html>"
+    $files = @($combinedFile) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
+    $res = Send-Notification $subject $bodyAttached $bodySummary $files $importance $mailCandidates
+    $script:MailSent = $res.Sent; $mailStatus = $res.Status
+    if (-not $res.Sent) { Write-Step "EMAIL NOT SENT: $mailStatus" 'Red' }
     if ($nCrit) { $exitCode = 2 } elseif ($nWarn) { $exitCode = 1 }
+    if (-not $script:MailSent) { $exitCode = 4 }
 }
-catch { Write-Step ('ERROR: ' + $_.Exception.Message) 'Red'; $exitCode = 3 }
+catch {
+    $err = $_.Exception.Message
+    Write-Step ('ERROR: ' + $err) 'Red'; $exitCode = 3
+    # Still tell the team: the check itself failed
+    if (-not $script:MailSent) {
+        try {
+            $subj = "[FAILED] $($Config.ReportTitle) [$Label] - $env:COMPUTERNAME"
+            $html = [string]$HtmlHead + "<h2>$(Enc $Config.ReportTitle) - $(Enc $env:COMPUTERNAME)</h2><div class='banner' style='background:#f8d7da'>The check failed: $(Enc $err)</div><div>Run by $(Enc $me) at $(Get-Date -Format 'yyyy-MM-dd HH:mm'). Log: $(Enc $logFile)</div></body></html>"
+            $res = Send-Notification $subj '' $html @() 'High' @($mailCandidates)
+            $script:MailSent = $res.Sent; $mailStatus = 'Failure notice: ' + $res.Status
+        }
+        catch { $mailStatus = "Failure notice not sent: $($_.Exception.Message)" }
+    }
+}
 finally {
     foreach ($it in @($items)) { if ($it -and $it.Conn) { try { $it.Conn.Dispose() } catch { } } }
     Write-Step "`n=== SUMMARY ($Label) ===" 'Green'

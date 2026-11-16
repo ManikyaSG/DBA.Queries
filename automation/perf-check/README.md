@@ -49,6 +49,15 @@ SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to
 
 **Flagged:** PLE under 300 s, data read latency over 20 ms, log write latency over 10 ms, AG send queue over 100 MB (`PerfThresholds`); any deadlock, blocking over 5 s, lock timeout, memory grant pending, RESOURCE_SEMAPHORE wait, tempdb allocation wait or query over 5 s. An AG database that stops synchronizing is CRITICAL.
 
+## Email - how it makes sure the report goes out
+
+1. **Database Mail on every instance, one after the other** (local instances first). Only profiles this login can really use are picked: Database Mail XPs on, the profile has an SMTP account, and it is public, granted to the login, or the login is sysadmin (`MailProfile` is preferred). After queueing, the script waits until Database Mail has handed it to the SMTP server; if an instance can't queue it or Database Mail reports **failed**, the next instance is tried.
+2. **SMTP straight from the VM** (fallback) when no instance could send it: set `SmtpServer` (and `SmtpPort`, `SmtpUseSsl`, `SmtpFrom` if needed) in `$Config`. It uses .NET mail from the VM with the same subject, body and attachments, anonymous relay or `SmtpUseDefaultCredentials = $true` (the Windows account running the script).
+3. **If the check itself fails** (script error), a short `[FAILED]` email with the error is sent the same way.
+4. **If nothing worked**, the window shows `EMAIL NOT SENT` in red with every reason, the report opens in the browser (interactive runs), and the exit code is **4**, which Task Scheduler shows as *Last Run Result*.
+
+To set up or repair Database Mail on an instance, use [`scripts/45_database_mail_setup.sql`](../../scripts/45_database_mail_setup.sql) (it makes the profile public and default, which this check needs when it runs as the SQL login).
+
 ## One-time setup
 
 1. **SQL login** - on **every instance** (every AG replica too), run the SETUP block at the top of `PerfCheck.sql` in SSMS as sysadmin, with your own password. It creates `dba_perfcheck` with only what the check needs: `VIEW SERVER STATE`, `VIEW ANY DEFINITION`, `ALTER SETTINGS`, `ALTER ANY EVENT SESSION`, read access to msdb (backup / job history) plus `DatabaseMailUserRole`, and EXECUTE on `xp_readerrorlog`. Optional lines in the block add read access to `SSISDB` and `ReportServer`. Missing access only skips that part, with a warning in the report. On AG replicas, create it with the **same SID** (shown in the block) so it keeps working after a failover. The instance must allow SQL authentication (mixed mode).
@@ -84,7 +93,7 @@ Start it when the load test starts; with the defaults the email arrives about 31
    - **Settings:** *Stop the task if it runs longer than* at least the window length + 30 min; *If the task is already running: Do not start a new instance*.
 3. Right-click > **Run** to test it; the report is emailed and saved in `Reports\`, the log in `Logs\`.
 
-`-Unattended` never prompts or pauses. Exit codes: 0 OK, 1 warnings, 2 critical or a failed instance, 3 script error (visible as *Last Run Result* in Task Scheduler). The account needs **Log on as a batch job** on the VM.
+`-Unattended` never prompts or pauses. Exit codes: 0 OK, 1 warnings, 2 critical or a failed instance, 3 script error, 4 email not sent (visible as *Last Run Result* in Task Scheduler). The account needs **Log on as a batch job** on the VM.
 
 ## What it changes on the server - and puts back
 
