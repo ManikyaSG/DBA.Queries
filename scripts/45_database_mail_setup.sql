@@ -4,7 +4,8 @@
              - Profile missing  -> creates the SMTP account + profile and links them.
              - Profile present but not usable ("disabled") -> fixes whatever is off:
                  'Database Mail XPs' = 0, profile has no account linked, Database Mail
-                 service (external program / queue) STOPPED, profile not public/default.
+                 service (external program / queue) STOPPED, profile not public/default,
+                 attachment limit (MaxFileSize) too small for the HTML reports.
            Existing accounts and profiles are never changed or deleted: anything
            that already exists is reported and left as it is.
  Tags    : [BOX] SQL Server 2016 - 2025 / Azure VM   [MI] (Database Mail works on MI;
@@ -33,7 +34,8 @@ DECLARE
     @UseDefaultCreds    bit           = 0,             -- 1 = authenticate as the SQL Server service account
     @MakePublicDefault  bit           = 1,             -- profile usable by everyone with DatabaseMailUserRole, and the default
     @SetAgentProfile    bit           = 0,             -- 1 = SQL Agent uses this profile for alerts / job notifications (restart Agent after)
-    @FixMsdbBroker      bit           = 0,             -- 1 = enable Service Broker in msdb if it is off (needs exclusive access to msdb!)
+    @FixMsdbBroker      bit           = 0,
+    @MaxFileSizeMB      int           = 10,            -- raise the attachment limit to at least this (default is ~1 MB); NULL = leave it             -- 1 = enable Service Broker in msdb if it is off (needs exclusive access to msdb!)
     @TestRecipient      nvarchar(256) = NULL;          -- e.g. N'dba-team@yourcompany.com' to send a test email at the end
 
 /*=============================================================================*/
@@ -157,6 +159,20 @@ ELSE
 BEGIN
     EXEC msdb.dbo.sysmail_start_sp;
     PRINT N'[FIXED]  Database Mail was ' + ISNULL(@status, N'UNKNOWN') + N' - started.';
+END;
+
+/*---- 7b. Attachment size limit -------------------------------------------*/
+IF @MaxFileSizeMB IS NOT NULL
+BEGIN
+    DECLARE @curMax bigint = (SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize'),
+            @newMax nvarchar(20) = CAST(CAST(@MaxFileSizeMB AS bigint) * 1048576 AS nvarchar(20));
+    IF @curMax >= CAST(@newMax AS bigint)
+        PRINT N'[OK]     Attachment limit (MaxFileSize) is ' + CAST(@curMax / 1048576 AS nvarchar(10)) + N' MB.';
+    ELSE
+    BEGIN
+        EXEC msdb.dbo.sysmail_configure_sp @parameter_name = N'MaxFileSize', @parameter_value = @newMax;
+        PRINT N'[FIXED]  Attachment limit (MaxFileSize) raised from ' + CAST(@curMax / 1024 AS nvarchar(20)) + N' KB to ' + CAST(@MaxFileSizeMB AS nvarchar(10)) + N' MB.';
+    END;
 END;
 
 /*---- 8. SQL Agent mail profile (optional) --------------------------------*/

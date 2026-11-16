@@ -858,39 +858,99 @@ function Send-SmtpMail([string]$Subject, [string]$Html, [string]$Importance, [st
     try { $client.Send($msg) } finally { $msg.Dispose(); $client.Dispose() }
 }
 
-function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$BodySummary, [string[]]$Files, [string]$Importance, $Candidates) {
-    # Tries every instance with Database Mail (local first) until one accepts and does not report 'failed',
-    # then the SMTP fallback. Returns @{ Sent; Status }.
+function Send-DbMailQueryAttachment($Connection, [string]$MailProfileName, [string]$Subject, [string]$Html, [string]$Importance, [string]$FileName, [string]$AttachHtml) {
+    # Attaches the report as a query result (SELECT of the HTML text). Works for SQL logins too:
+    # Database Mail does not allow @file_attachments for SQL-authenticated logins.
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = 'msdb.dbo.sp_send_dbmail'; $cmd.CommandType = [System.Data.CommandType]::StoredProcedure; $cmd.CommandTimeout = 300
+    [void]$cmd.Parameters.AddWithValue('@profile_name', $MailProfileName)
+    [void]$cmd.Parameters.AddWithValue('@recipients', $Config.Recipients)
+    if ($Config.CopyRecipients) { [void]$cmd.Parameters.AddWithValue('@copy_recipients', $Config.CopyRecipients) }
+    if ($Config.FromAddress) { [void]$cmd.Parameters.AddWithValue('@from_address', $Config.FromAddress) }
+    if ($Config.ReplyTo)     { [void]$cmd.Parameters.AddWithValue('@reply_to', $Config.ReplyTo) }
+    [void]$cmd.Parameters.AddWithValue('@subject', $Subject)
+    $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
+    [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
+    [void]$cmd.Parameters.AddWithValue('@importance', $Importance)
+    $pQ = $cmd.Parameters.Add('@query', [System.Data.SqlDbType]::NVarChar, -1); $pQ.Value = "SET NOCOUNT ON; SELECT N'" + $AttachHtml.Replace("'", "''") + "';"
+    [void]$cmd.Parameters.AddWithValue('@execute_query_database', 'master')
+    [void]$cmd.Parameters.AddWithValue('@attach_query_result_as_file', 1)
+    [void]$cmd.Parameters.AddWithValue('@query_attachment_filename', $FileName)
+    [void]$cmd.Parameters.AddWithValue('@query_result_header', 0)
+    [void]$cmd.Parameters.AddWithValue('@query_no_truncate', 1)
+    [void]$cmd.Parameters.AddWithValue('@query_result_no_padding', 1)
+    [void]$cmd.Parameters.AddWithValue('@exclude_query_output', 1)
+    [void]$cmd.Parameters.AddWithValue('@ansi_attachment', 1)
+    $pId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pId.Direction = [System.Data.ParameterDirection]::Output
+    [void]$cmd.ExecuteNonQuery()
+    return [int]$pId.Value
+}
+
+function Wait-DbMailStatus($Connection, [int]$MailId) {
+    # Waits until Database Mail has handed the email to the SMTP server; returns sent / failed / unsent / retrying
+    $st = 'unknown'; $deadline = (Get-Date).AddSeconds([math]::Max(20, 3 * $Config.MailCheckDelaySec))
+    do {
+        Start-Sleep -Seconds 5
+        $v = Invoke-Scalar $Connection "SELECT sent_status FROM msdb.dbo.sysmail_allitems WHERE mailitem_id = @id;" @{ '@id' = $MailId }
+        $st = if ($null -eq $v -or $v -is [DBNull]) { 'unknown' } else { [string]$v }
+    } while ($st -in @('unsent', 'retrying', 'unknown') -and (Get-Date) -lt $deadline)
+    return $st
+}
+
+function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$BodySummary, [string[]]$Files, [string]$Importance, $Candidates, [string]$ReportHtml = '') {
+    # Tries every instance with Database Mail (local first). On each one, in order:
+    #   1. report attached as a file (Windows authentication only - Database Mail rule)
+    #   2. report attached as a query result (works for SQL logins)
+    #   3. summary only
+    # moving on when Database Mail rejects it or reports 'failed'; then the SMTP fallback. Returns @{ Sent; Status }.
     $attempts = @()
     foreach ($sender in @($Candidates | Sort-Object @{ Expression = { -not $_.Local } })) {
         $c = $null
         try {
-            $c = (Open-SqlConnection $sender.Instance).Connection
+            $oc = Open-SqlConnection $sender.Instance; $c = $oc.Connection
+            $isSqlLogin = ([string]$oc.As) -like 'SQL:*'
             $maxBytes = 0
             try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
-            $okFiles = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($maxBytes -le 0 -or (Get-Item -LiteralPath $_).Length -le $maxBytes) })
-            $mailId = $null; $how = ''
-            if ($Config.AttachReport -and $okFiles.Count -and $BodyAttached) {
-                try { $mailId = Send-DbMail $c $sender.Profile $Subject $BodyAttached $Importance ($okFiles -join ';'); $how = "with $($okFiles.Count) attachment(s)" }
-                catch { Write-Step "  Attachment not possible via $($sender.Instance) ($($_.Exception.Message)) - sending without it." 'Yellow' }
+            $reportFile = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) | Select-Object -First 1
+            $methods = @()
+            if ($Config.AttachReport -and $BodyAttached -and $reportFile) {
+                if (-not $isSqlLogin) { $methods += 'file' }
+                if ($ReportHtml) {
+                    $ansiBytes = [System.Text.Encoding]::Default.GetByteCount($ReportHtml)
+                    if ($maxBytes -le 0 -or $ansiBytes -le $maxBytes) { $methods += 'query' }
+                    else { Write-Step ("  Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) on {2} - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB) or set SmtpServer." -f ($ansiBytes / 1KB), ($maxBytes / 1KB), $sender.Instance) 'Yellow' }
+                }
             }
-            if (-not $mailId) { $mailId = Send-DbMail $c $sender.Profile $Subject $BodySummary $Importance; $how = 'summary only, full report on the VM' }
-            Write-Step "Email      : queued as mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)' ($how)" 'Green'
-            # wait for Database Mail to hand it to the SMTP server
-            $st = $null; $deadline = (Get-Date).AddSeconds([math]::Max(20, 3 * $Config.MailCheckDelaySec))
-            do {
-                Start-Sleep -Seconds 5
-                $st = Invoke-Scalar $c "SELECT sent_status FROM msdb.dbo.sysmail_allitems WHERE mailitem_id = @id;" @{ '@id' = $mailId }
-                $st = if ($null -eq $st -or $st -is [DBNull]) { 'unknown' } else { [string]$st }
-            } while ($st -in @('unsent', 'retrying') -and (Get-Date) -lt $deadline)
-            if ($st -eq 'failed') {
-                $why = Invoke-Scalar $c "SELECT TOP (1) LEFT(description, 300) FROM msdb.dbo.sysmail_event_log WHERE mailitem_id = @id ORDER BY log_id DESC;" @{ '@id' = $mailId }
-                $attempts += "$($sender.Instance): Database Mail failed - $why"
-                Write-Step "  Database Mail on $($sender.Instance) failed to deliver ($why) - trying the next option." 'Yellow'
-                continue
+            $methods += 'summary'
+            foreach ($m in $methods) {
+                $mailId = $null; $how = ''
+                $okFiles = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($maxBytes -le 0 -or (Get-Item -LiteralPath $_).Length -le $maxBytes) })
+                if ($m -eq 'file' -and -not $okFiles.Count) { continue }      # report bigger than MaxFileSize
+                try {
+                    switch ($m) {
+                        'file' {
+                            $mailId = Send-DbMail $c $sender.Profile $Subject $BodyAttached $Importance ($okFiles -join ';'); $how = "with $($okFiles.Count) file attachment(s)"
+                        }
+                        'query'   { $mailId = Send-DbMailQueryAttachment $c $sender.Profile $Subject $BodyAttached $Importance (Split-Path $reportFile -Leaf) $ReportHtml; $how = 'with the report attached' }
+                        'summary' { $mailId = Send-DbMail $c $sender.Profile $Subject $BodySummary $Importance; $how = 'summary only, full report on the VM' }
+                    }
+                }
+                catch {
+                    $attempts += "$($sender.Instance) [$m]: $($_.Exception.Message)"
+                    Write-Step "  $($sender.Instance): sending $m failed ($($_.Exception.Message)) - trying the next way." 'Yellow'
+                    continue
+                }
+                Write-Step "Email      : queued as mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)' ($how)" 'Green'
+                $st = Wait-DbMailStatus $c $mailId
+                if ($st -eq 'failed') {
+                    $why = Invoke-Scalar $c "SELECT TOP (1) LEFT(description, 300) FROM msdb.dbo.sysmail_event_log WHERE mailitem_id = @id ORDER BY log_id DESC;" @{ '@id' = $mailId }
+                    $attempts += "$($sender.Instance) [$m]: Database Mail failed - $why"
+                    Write-Step "  Database Mail on $($sender.Instance) failed to deliver it ($why) - trying the next way." 'Yellow'
+                    continue
+                }
+                $note = if ($st -eq 'sent') { 'sent' } else { "$st (still in the Database Mail queue)" }
+                return @{ Sent = $true; Status = "$note via $($sender.Instance) / '$($sender.Profile)' ($how)" }
             }
-            $note = if ($st -eq 'sent') { 'sent' } else { "$st (still in the Database Mail queue)" }
-            return @{ Sent = $true; Status = "$note via $($sender.Instance) / '$($sender.Profile)' ($how)" }
         }
         catch {
             $attempts += "$($sender.Instance): $($_.Exception.Message)"
@@ -1080,7 +1140,7 @@ try {
     $bodyAttached = $shortHtml + "<p style='color:#555'>The full report (per-interval tables and query lists) is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
     $bodySummary  = $shortHtml + "<p style='color:#555'>Full report saved on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p></body></html>"
     $files = @($combinedFile) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
-    $res = Send-Notification $subject $bodyAttached $bodySummary $files $importance $mailCandidates
+    $res = Send-Notification $subject $bodyAttached $bodySummary $files $importance $mailCandidates $combinedHtml
     $script:MailSent = $res.Sent; $mailStatus = $res.Status
     if (-not $res.Sent) { Write-Step "EMAIL NOT SENT: $mailStatus" 'Red' }
     if ($nCrit) { $exitCode = 2 } elseif ($nWarn) { $exitCode = 1 }
