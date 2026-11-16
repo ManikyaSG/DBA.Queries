@@ -1,10 +1,19 @@
 <#
 .SYNOPSIS
-    SQL Server performance window for every instance on this VM: samples every N seconds for
-    M minutes, then emails one combined report (Database Mail) and saves it in Reports\.
+    SQL Server health check + performance window for every instance on this VM: a health check
+    (incl. SSIS / SSRS / SSAS), then samples every N seconds for M minutes, then emails one
+    combined report (Database Mail) and saves it in Reports\.
 
 .DESCRIPTION
-    Double-click Run-PerfCheck.bat. No menu. What it captures per instance:
+    Double-click Run-PerfCheck.bat. No menu.
+    Health check (once, at the start): instance & build, SQL / Windows uptime, services, vitals,
+      databases (state, recovery, backups, CHECKDB, log use, AG role), Always On replicas /
+      listeners (IP, DHCP) / databases, cluster & quorum, disks, failed job steps (24 h), severe
+      error log entries, sp_configure, trace flags, linked servers, endpoints, certificates,
+      XE sessions, SSIS catalog / projects / environments / failures, SSRS content /
+      subscriptions, and for this VM the SSIS / SSRS / SSAS services and SSAS databases.
+      Not included: data/log file list, Agent job list, logins, server role members.
+    Performance window, per instance:
       Throughput   Batch Requests/sec, Transactions/sec (PerfDatabases, e.g. MARS and CLR)
       Compilation  SQL Compilations/sec, SQL Re-Compilations/sec
       Connections  User Connections, connection pool usage (sessions per app / host / login)
@@ -20,6 +29,10 @@
       TempDB       space used, version store size, allocation contention
       Always On    synchronization state, log send queue, redo queue, transaction delay,
                    listener connections
+      Root cause   SPID, login, host, program, database, wait, statement for: blocked sessions,
+                   head blockers (incl. idle sessions with an open transaction), I/O / log /
+                   memory-grant / tempdb waits, long-running requests, big or waiting memory
+                   grants, top tempdb users; every deadlock process + the graph as .xdl files
 
     Login: a dedicated SQL login (default dba_perfcheck, created once with the SETUP block at
     the top of PerfCheck.sql). The first run asks for its password and can save it on this VM
@@ -31,6 +44,7 @@
     Server changes during the window, always put back: 'blocked process threshold (s)' and the
     XE session DBA_PerfWindow (needs ALTER SETTINGS / ALTER ANY EVENT SESSION, else read-only).
 
+    -NoPerf runs the health check only.
     Only 3 files: Run-PerfCheck.bat, Invoke-PerfCheck.ps1, PerfCheck.sql.
 
 .EXAMPLE
@@ -51,6 +65,8 @@ param(
     [switch]   $Unattended,           # no prompts, no pauses (Task Scheduler)
     [switch]   $ResetCredential,      # forget the saved SQL login and ask again
     [switch]   $WindowsAuth,          # skip the SQL login, use Windows authentication only
+    [switch]   $NoPerf,               # health check only (no performance window)
+    [switch]   $NoHealth,             # performance window only (no health check)
     [string]   $SqlFile
 )
 
@@ -63,7 +79,7 @@ $Config = @{
     FromAddress           = ''                           # optional, e.g. 'SQL Perf <sqlperf@yourcompany.com>' ('' = profile's account)
     ReplyTo               = ''
     MailProfile           = 'DBA_Mail'                   # preferred; else default / only profile on the instance
-    ReportTitle           = 'SQL Server Performance Check'
+    ReportTitle           = 'SQL Server Health & Performance Check'
 
     SqlLogin              = 'dba_perfcheck'              # dedicated SQL login (see SETUP in PerfCheck.sql)
     CredentialFile        = Join-Path $PSScriptRoot 'PerfCheck.cred'   # saved, DPAPI-encrypted password (this VM only)
@@ -75,6 +91,8 @@ $Config = @{
     BlockedProcessThresholdSec = 5   # 'blocked process threshold' during the window (restored after)
     LongQuerySec          = 5        # capture every query running longer than this (XE)
     TopQueries            = $true    # top 20 queries of the window from the plan cache; $false = skip
+    BigGrantMB            = 1024     # list memory grants of at least this size (MB); waiting grants are always listed
+    TempdbSessionMB       = 500      # list sessions using at least this much tempdb (MB)
     PerfThresholds        = @{ PleMin = 300; DataReadMs = 20; LogWriteMs = 10; AgSendQueueMB = 100 }
 
     IncludeLocalInstances = $true
@@ -207,7 +225,7 @@ function Get-SqlBlocks([string]$Text) {
     $blocks = @{}; $name = 'HC'; $sb = New-Object System.Text.StringBuilder
     foreach ($line in ($Text -split "`r?`n")) {
         if ($line -match '^\s*GO\s*$') { continue }      # SSMS batch separator
-        if ($line -match '^--##(PERF_\w+)\s*$') { $blocks[$name] = $sb.ToString(); $name = $Matches[1]; $sb = New-Object System.Text.StringBuilder; continue }
+        if ($line -match '^--##(HEALTH|PERF_\w+)\s*$') { $blocks[$name] = $sb.ToString(); $name = $Matches[1]; $sb = New-Object System.Text.StringBuilder; continue }
         [void]$sb.AppendLine($line)
     }
     $blocks[$name] = $sb.ToString()
@@ -247,7 +265,8 @@ function R1([double]$v) { return [math]::Round($v, 1) }
 
 function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$DurationMin) {
     # $Items: objects with Instance, Conn, Safe. Adds Samples, Setup, End, Notes, StartTime.
-    $tok = @{ p_BptSec = [int]$Config.BlockedProcessThresholdSec; p_LongUs = [int64]$Config.LongQuerySec * 1000000; p_TopQ = $(if ($Config.TopQueries) { 1 } else { 0 }) }
+    $tok = @{ p_BptSec = [int]$Config.BlockedProcessThresholdSec; p_LongUs = [int64]$Config.LongQuerySec * 1000000; p_TopQ = $(if ($Config.TopQueries) { 1 } else { 0 })
+              p_LongSec = [int]$Config.LongQuerySec; p_BigGrantMB = [int]$Config.BigGrantMB; p_TempdbMB = [int]$Config.TempdbSessionMB }
     foreach ($it in $Items) {
         $it | Add-Member -NotePropertyName Samples -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
         $it | Add-Member -NotePropertyName Notes -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
@@ -319,6 +338,30 @@ function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$Du
             }
         }
     }
+}
+
+function Merge-SampleRows($Samples, [string]$Section, [string[]]$KeyCols, [string[]]$MaxCols) {
+    # The same session / statement shows up in many samples: one row each, first / last seen, peaks
+    $map = [ordered]@{}; $cols = $null
+    foreach ($snap in @($Samples)) {
+        if (-not $cols -and $snap -and $snap['columns'] -and $snap['columns'].ContainsKey($Section)) { $cols = @($snap['columns'][$Section]) }
+        foreach ($r in @(Get-Rows $snap $Section)) {
+            $key = ($KeyCols | ForEach-Object { Get-Val $r $_ }) -join '|'
+            if (-not $map.Contains($key)) {
+                $o = [ordered]@{ 'first_seen' = (Get-Val $r 'seen_at'); 'last_seen' = (Get-Val $r 'seen_at'); 'samples' = 0 }
+                $map[$key] = $o
+            }
+            $o = $map[$key]; $o['last_seen'] = Get-Val $r 'seen_at'; $o['samples'] = [int]$o['samples'] + 1
+            foreach ($c in @($cols | Where-Object { $_ -ne 'seen_at' })) {
+                $v = Get-Val $r $c
+                if ($MaxCols -contains $c -and $o.Contains($c)) { if ((ConvertTo-Num $v) -gt (ConvertTo-Num $o[$c])) { $o[$c] = $v } }
+                else { $o[$c] = $v }
+            }
+        }
+    }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($v in $map.Values) { [void]$out.Add($v) }
+    return ,$out
 }
 
 function Get-PerfResult($It, [int]$SampleSec) {
@@ -493,7 +536,18 @@ function Get-PerfResult($It, [int]$SampleSec) {
 
     # ---- issues ----
     $xeBlocked = @(Get-Rows $It.End 'xe_blocked'); $xeDl = @(Get-Rows $It.End 'xe_deadlocks'); $xeLong = @(Get-Rows $It.End 'xe_long')
-    $blockedNow = @($S | ForEach-Object { Get-Rows $_ 'blocked_now' })
+    $probRows  = Merge-SampleRows $S 'problem_sessions' @('session_id', 'reason', 'statement') @('wait_ms', 'elapsed_s', 'cpu_ms', 'logical_reads', 'writes', 'granted_mb', 'tempdb_mb')
+    $headRows  = Merge-SampleRows $S 'head_blockers' @('session_id', 'statement') @('blocked_sessions', 'max_blocked_s')
+    $grantRows = Merge-SampleRows $S 'memory_grants' @('session_id', 'statement') @('requested_mb', 'granted_mb', 'used_mb', 'wait_ms')
+    $tdbRows   = Merge-SampleRows $S 'tempdb_sessions' @('session_id', 'statement') @('user_objects_mb', 'internal_objects_mb')
+    $dlProcs   = @(Get-Rows $It.End 'xe_deadlock_procs')
+    # every deadlock graph as a .xdl file (double-click opens the diagram in SSMS)
+    $xdlFiles = @(); $n = 0
+    foreach ($d in @(Get-Rows $It.End 'xe_deadlock_xml')) {
+        $n++
+        $f = Join-Path $Config.ReportsFolder ("{0}_deadlock_{1}_{2:D2}.xdl" -f $It.Safe, ((Get-Val $d 'event_time') -replace '[-: ]', ''), $n)
+        try { [System.IO.File]::WriteAllText($f, [string]$d['deadlock_xml'], [System.Text.Encoding]::UTF8); $xdlFiles += $f } catch { }
+    }
     if ($iv.Count -and (& $metric 'PLE s' 'Min') -lt $th.PleMin) { & $addIssue 'WARNING' 'Memory' 'Page Life Expectancy' ("Dropped to {0} s (threshold {1} s)" -f (& $metric 'PLE s' 'Min'), $th.PleMin) }
     if ((& $metric 'Grants pending' 'Max') -gt 0) { & $addIssue 'WARNING' 'Memory' 'Memory Grants Pending' ("Up to {0} queries waiting for memory" -f (& $metric 'Grants pending' 'Max')) }
     if ($waitTot['RESOURCE_SEMAPHORE'] -gt 0) { & $addIssue 'WARNING' 'Memory' 'RESOURCE_SEMAPHORE waits' ("{0:N0} ms waited for query memory" -f $waitTot['RESOURCE_SEMAPHORE']) }
@@ -506,6 +560,10 @@ function Get-PerfResult($It, [int]$SampleSec) {
     if ((& $metric 'TempDB alloc waits' 'Max') -gt 0) { & $addIssue 'WARNING' 'TempDB' 'Allocation contention' ("Up to {0} tasks waiting on tempdb allocation pages (PAGELATCH)" -f (& $metric 'TempDB alloc waits' 'Max')) }
     foreach ($r in @($agRows2 | Where-Object { $_['status'] -eq 'CRITICAL' })) { & $addIssue 'CRITICAL' 'Always On' "$($r['Database']) on $($r['Replica'])" "Not synchronizing during the window (states: $($r['States seen']))" }
     if ((& $metric 'AG send queue MB' 'Max') -gt $th.AgSendQueueMB) { & $addIssue 'WARNING' 'Always On' 'Log send queue' ("Peaked at {0} MB (threshold {1} MB)" -f (& $metric 'AG send queue MB' 'Max'), $th.AgSendQueueMB) }
+    foreach ($h in @($headRows | Where-Object { $_['statement_source'] -like 'last statement*' -and (ConvertTo-Num $_['open_tran']) -gt 0 })) {
+        & $addIssue 'WARNING' 'Locking' "Idle session $($h['session_id']) holding locks" ("{0} on {1} ({2}) left a transaction open and blocked {3} session(s) for up to {4} s - last statement: {5}" -f $h['login'], $h['host'], $h['program'], $h['blocked_sessions'], $h['max_blocked_s'], $h['statement']) }
+    $waitingGrants = @($grantRows | Where-Object { $_['grant_state'] -eq 'WAITING' })
+    if ($waitingGrants.Count) { & $addIssue 'WARNING' 'Memory' 'Queries waiting for memory' ("{0} query(ies) waited for a memory grant - see 'Memory grants'" -f $waitingGrants.Count) }
     if ($xeLong.Count -gt 0) { & $addIssue 'WARNING' 'Queries' "Queries over $($Config.LongQuerySec) s" ("{0} query(ies), longest {1} s" -f $xeLong.Count, (Get-Val $xeLong[0] 'duration_s')) }
     foreach ($note in @($It.Notes)) { & $addIssue 'WARNING' 'Collection' 'Performance window' $note }
 
@@ -516,7 +574,7 @@ function Get-PerfResult($It, [int]$SampleSec) {
     $t1 = if ($S.Count) { try { (Get-SampleTime $S[0]).ToString('yyyy-MM-dd HH:mm') } catch { '' } } else { '' }
     $t2 = if ($S.Count) { try { (Get-SampleTime $S[$S.Count - 1]).ToString('HH:mm') } catch { '' } } else { '' }
     $cols = { param($rows) if (@($rows).Count) { @(@($rows)[0].Keys) } else { @() } }
-    $tbl = { param($title, $rows, $statusCol = '') $r = @($rows); "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count) { [string](ConvertTo-HtmlTable $r (& $cols $r) '' $statusCol) } else { '<div style="color:#2e7d32">None</div>' }) }
+    $tbl = { param($title, $rows, $statusCol = '') $r = @($rows | Where-Object { $null -ne $_ }); "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count) { [string](ConvertTo-HtmlTable $r (& $cols $r) '' $statusCol) } else { '<div style="color:#2e7d32">None</div>' }) }
     $endTbl = { param($title, $sec) $r = @(Get-Rows $It.End $sec); $c = if ($It.End -and $It.End['columns'].ContainsKey($sec)) { @($It.End['columns'][$sec]) } else { @() }
                 "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count -and $c.Count) { [string](ConvertTo-HtmlTable $r $c) } else { '<div style="color:#2e7d32">None</div>' }) }
     $tqInfo = @(Get-Rows $It.End 'topq_info') | Select-Object -First 1
@@ -527,6 +585,8 @@ function Get-PerfResult($It, [int]$SampleSec) {
     $short = (@(
         "<h2>Performance window: $t1 - $t2 ($($iv.Count) intervals of $SampleSec s)</h2>"
         & $tbl 'Performance - needs attention' $issues 'severity'
+        $(if (@($headRows).Count) { & $tbl 'Head blockers' $headRows })
+        $(if (@($probRows).Count) { & $tbl 'Problem sessions (top 10 by elapsed time - all in the attachment)' (@($probRows | Sort-Object { ConvertTo-Num $_['elapsed_s'] } -Descending | Select-Object -First 10)) })
         & $tbl 'Performance summary for the window' $sum
     ) -join '')
     $full = $short + (@(
@@ -538,15 +598,20 @@ function Get-PerfResult($It, [int]$SampleSec) {
         & $tbl 'Always On during the window' $agRows2 'status'
         & $tbl 'Listener connections' $lsnRows
         & $endTbl "Blocked process reports (over $($Config.BlockedProcessThresholdSec) s)" 'xe_blocked'
-        & $tbl "Blocked sessions seen in samples (over $($Config.BlockedProcessThresholdSec) s)" @($blockedNow | ForEach-Object { $h = [ordered]@{}; foreach ($c in @('seen_at', 'session_id', 'blocked_by', 'wait_type', 'wait_s', 'db', 'sql_text')) { $h[$c] = $_[$c] }; $h })
+        & $tbl 'Head blockers (top of each blocking chain)' $headRows
+        & $tbl 'Problem sessions (blocked, I/O / log / memory / tempdb waits, long running)' $probRows
+        & $tbl 'Memory grants (waiting, or big)' $grantRows
+        & $tbl "TempDB users (over $($Config.TempdbSessionMB) MB)" $tdbRows
         & $endTbl 'Deadlocks' 'xe_deadlocks'
+        & $tbl 'Deadlock processes' $dlProcs
+        $(if ($xdlFiles.Count) { "<div>Deadlock graphs saved on $(Enc $env:COMPUTERNAME) (open in SSMS): $(Enc (($xdlFiles | ForEach-Object { Split-Path $_ -Leaf }) -join ', '))</div>" })
         & $endTbl "Queries over $($Config.LongQuerySec) s" 'xe_long'
         "<div style='color:#555;margin-top:12px'>$(Enc $qsNote)</div>"
         & $endTbl 'Top 20 queries in the window by duration' 'top_duration'
         & $endTbl 'Top 20 queries in the window by CPU' 'top_cpu'
         & $endTbl 'Top 20 queries in the window by logical reads' 'top_reads'
     ) -join '')
-    return [pscustomobject]@{ Short = $short; Full = $full; Crit = $crit; Warn = $warn; Intervals = $iv.Count }
+    return [pscustomobject]@{ Short = $short; Full = $full; Crit = $crit; Warn = $warn; Intervals = $iv.Count; Xdl = $xdlFiles }
 }
 
 function Get-Rows($Snap, [string]$Section) {
@@ -689,6 +754,83 @@ function Open-SqlConnection([string]$Instance) {
     return [pscustomobject]@{ Connection = $conn; As = "Windows: $win" }
 }
 
+# ---- Health check report: order + titles (sections with no rows are skipped) ----
+$ReportSections = [ordered]@{
+    issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases, backups & CHECKDB'
+    ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
+    job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
+    traceflags = 'Global trace flags'; config = 'sp_configure'
+    linked_servers = 'Linked servers'; endpoints = 'Endpoints'; certificates = 'Certificates'; xe_sessions = 'XE sessions'
+    ssis_catalog = 'SSIS catalog settings'; ssis_projects = 'SSIS projects'; ssis_environments = 'SSIS environments'; ssis_failures = 'SSIS failed executions (24 h)'
+    ssrs_summary = 'SSRS content (report server databases)'; ssrs_subscriptions = 'SSRS subscriptions'
+}
+$BiSections = [ordered]@{ issues = 'Needs attention (SSIS / SSRS / SSAS on this VM)'; bi_services = 'SSIS / SSRS / SSAS services'; ssas_server = 'SSAS instances'; ssas_databases = 'SSAS databases' }
+
+function Get-MachineBiSnapshot {
+    # SSIS / SSRS / SSAS Windows services on THIS VM (not visible from T-SQL) and SSAS databases via the MSOLAP provider.
+    $sections = @{}; $columns = @{}
+    $issues = New-Object System.Collections.ArrayList
+    $pattern = '^(MsDtsServer\d*|SSISScaleOutMaster\d*|SSISScaleOutWorker\d*|ReportServer(\$.+)?|SQLServerReportingServices|PowerBIReportServer|MSSQLServerOLAPService|MSOLAP\$.+|SQLBrowser)$'
+    $svcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $pattern } | Sort-Object Name)
+
+    $svcRows = New-Object System.Collections.ArrayList
+    foreach ($s in $svcs) {
+        [void]$svcRows.Add(@{ name = [string]$s.Name; display_name = [string]$s.DisplayName; state = [string]$s.State; start_mode = [string]$s.StartMode; account = [string]$s.StartName })
+        if ($s.StartMode -eq 'Auto' -and $s.State -ne 'Running') {
+            [void]$issues.Add(@{ severity = 'CRITICAL'; area = 'BI service'; item = [string]$s.Name; detail = "Startup type Automatic but service is $($s.State)" })
+        }
+    }
+    if ($svcRows.Count -gt 0) { $sections['bi_services'] = $svcRows; $columns['bi_services'] = @('name', 'display_name', 'state', 'start_mode', 'account') }
+
+    $srvRows = New-Object System.Collections.ArrayList
+    $dbRows  = New-Object System.Collections.ArrayList
+    foreach ($s in @($svcs | Where-Object { $_.Name -eq 'MSSQLServerOLAPService' -or $_.Name -like 'MSOLAP$*' })) {
+        $inst = if ($s.Name -eq 'MSSQLServerOLAPService') { $env:COMPUTERNAME } else { $env:COMPUTERNAME + '\' + $s.Name.Substring(7) }
+        $row = @{ ssas_instance = $inst; service_state = [string]$s.State; connected = '0'; version = ''; error = '' }
+        if ($s.State -eq 'Running') {
+            $c = $null
+            try {
+                $c = New-Object System.Data.OleDb.OleDbConnection "Provider=MSOLAP;Data Source=$inst;Integrated Security=SSPI;Connect Timeout=15"
+                $c.Open()
+                $row.connected = '1'; $row.version = [string]$c.ServerVersion
+                $cmd = $c.CreateCommand(); $cmd.CommandText = 'SELECT * FROM $SYSTEM.DBSCHEMA_CATALOGS'
+                $r = $cmd.ExecuteReader()
+                while ($r.Read()) {
+                    $vals = @{}
+                    for ($i = 0; $i -lt $r.FieldCount; $i++) { $vals[$r.GetName($i).ToUpperInvariant()] = if ($r.IsDBNull($i)) { '' } else { [string]$r.GetValue($i) } }
+                    [void]$dbRows.Add(@{ ssas_instance = $inst; database = [string]$vals['CATALOG_NAME']; compatibility_level = [string]$vals['COMPATIBILITY_LEVEL']
+                                         type = [string]$vals['TYPE']; date_modified = [string]$vals['DATE_MODIFIED'] })
+                }
+                $r.Close()
+            }
+            catch {
+                $row.error = $_.Exception.Message
+                [void]$issues.Add(@{ severity = 'WARNING'; area = 'SSAS'; item = $inst; detail = 'Could not query SSAS (MSOLAP provider missing or no SSAS admin rights?): ' + $_.Exception.Message })
+            }
+            finally { if ($c) { $c.Dispose() } }
+        }
+        [void]$srvRows.Add($row)
+    }
+    if ($srvRows.Count -gt 0) { $sections['ssas_server'] = $srvRows; $columns['ssas_server'] = @('ssas_instance', 'service_state', 'connected', 'version', 'error') }
+    if ($dbRows.Count -gt 0)  { $sections['ssas_databases'] = $dbRows; $columns['ssas_databases'] = @('ssas_instance', 'database', 'compatibility_level', 'type', 'date_modified') }
+    return @{ sections = $sections; columns = $columns; issues = $issues }
+}
+
+function Get-FullReportHtml($Snap, $Sections = $ReportSections) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($sec in $Sections.Keys) {
+        $rows = @(Get-Rows $Snap $sec)
+        $cols = $null
+        if ($Snap['columns'] -and $Snap['columns'].ContainsKey($sec)) { $cols = @($Snap['columns'][$sec]) }
+        if ($sec -ne 'issues' -and $rows.Count -eq 0) { continue }       # skip empty sections (e.g. no AG)
+        [void]$sb.Append('<h3>' + (Enc $Sections[$sec]) + '</h3>')
+        if (-not $cols) { [void]$sb.Append('<div style="color:#2e7d32">None</div>'); continue }
+        $statusCol = if ($cols -contains 'status') { 'status' } elseif ($cols -contains 'severity') { 'severity' } else { '' }
+        [void]$sb.Append((ConvertTo-HtmlTable $rows $cols '' $statusCol))
+    }
+    return $sb.ToString()
+}
+
 # =============================================================================
 #  MAIN
 # =============================================================================
@@ -704,7 +846,8 @@ $durationUsed  = if ($DurationMin -gt 0) { $DurationMin } else { [int]$Config.Du
 
 try {
     Write-Step "=== $($Config.ReportTitle) - $env:COMPUTERNAME - $Label ===" 'Green'
-    Write-Step "Window     : every $sampleSecUsed s for $durationUsed min$(if ($Unattended) { ' (unattended)' })"
+    Write-Step ("Steps      : {0}{1}{2}" -f $(if (-not $NoHealth) { 'health check' } else { '' }), $(if (-not $NoHealth -and -not $NoPerf) { ' + ' } else { '' }), $(if (-not $NoPerf) { "performance window every $sampleSecUsed s for $durationUsed min" } else { '' }))
+    if ($NoHealth -and $NoPerf) { throw '-NoHealth and -NoPerf together leave nothing to do.' }
     Invoke-Cleanup
 
     # ---- SQL login ----
@@ -724,16 +867,24 @@ try {
     }
 
     $blocks = Get-SqlBlocks ([System.IO.File]::ReadAllText((Get-SqlFilePath)))
-    foreach ($b in 'PERF_START', 'PERF_SAMPLE', 'PERF_END', 'PERF_TEARDOWN') { if (-not $blocks.ContainsKey($b)) { throw "PerfCheck.sql has no --##$b block." } }
+    foreach ($b in 'HEALTH', 'PERF_START', 'PERF_SAMPLE', 'PERF_END', 'PERF_TEARDOWN') { if (-not $blocks.ContainsKey($b)) { throw "PerfCheck.sql has no --##$b block." } }
 
     $targets = Get-TargetInstances
     if (-not $targets) { throw 'No SQL Server instances found on this VM (and no ExtraInstances / -Instances).' }
     Write-Step "Instances  : $(($targets | ForEach-Object { $_.Instance }) -join ', ')"
 
-    # ---- connect to every instance ----
+    # ---- SSIS / SSRS / SSAS services and SSAS databases on THIS VM (once) ----
+    $machineBi = $null
+    if (-not $NoHealth -and @($targets | Where-Object { $_.Status -ne 'Listed' }).Count) {
+        try { Write-Step 'Collecting SSIS / SSRS / SSAS service and SSAS database info for this VM...'; $machineBi = Get-MachineBiSnapshot }
+        catch { Write-Step "SSIS / SSRS / SSAS info not collected: $($_.Exception.Message)" 'Yellow' }
+    }
+
+    # ---- connect to every instance (+ health check) ----
     $items = @(); $mailCandidates = @()
     foreach ($t in $targets) {
-        $row = [pscustomobject][ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; ShortHtml = ''; FullHtml = '' }
+        $row = [pscustomobject][ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; ShortHtml = ''; FullHtml = ''
+                                           HealthCrit = 0; HealthWarn = 0; HealthShort = ''; HealthFull = ''; PerfCrit = 0; PerfWarn = 0; PerfShort = ''; PerfFull = ''; PerfNote = '' }
         if ($t.Status -and $t.Status -notin @('Running', 'Listed', 'Unknown')) {
             $row.State = 'FAILED'; $row.Outcome = "SQL Server service is $($t.Status)"
             $row.ShortHtml = $row.FullHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
@@ -744,7 +895,27 @@ try {
             $row.ConnectedAs = $oc.As
             Write-Step "$($t.Instance): connected as $($oc.As)" 'Green'
             try { $p = Get-MailProfileName $oc.Connection; if ($p) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $p; Local = ($t.Status -ne 'Listed') } } } catch { }
-            $items += [pscustomobject]@{ Instance = $t.Instance; Conn = $oc.Connection; Safe = (Get-SafeFileName $t.Instance); Row = $row }
+            $items += [pscustomobject]@{ Instance = $t.Instance; Conn = $oc.Connection; Safe = (Get-SafeFileName $t.Instance); Row = $row; Local = ($t.Status -ne 'Listed') }
+            if (-not $NoHealth) {
+                Write-Step "$($t.Instance): health check..."
+                try {
+                    $hc = Invoke-SqlSections $oc.Connection $blocks['HEALTH']
+                    $hIssues = @(Get-Rows $hc 'issues')
+                    $row.HealthCrit = @($hIssues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
+                    $row.HealthWarn = @($hIssues | Where-Object { (Get-Val $_ 'severity') -eq 'WARNING' }).Count
+                    $build = Get-Val (@(Get-Rows $hc 'instance') | Where-Object { (Get-Val $_ 'property_code') -eq 'build' } | Select-Object -First 1) 'value'
+                    $hColor = if ($row.HealthCrit) { '#f8d7da' } elseif ($row.HealthWarn) { '#fff3cd' } else { '#d4edda' }
+                    $hHead = "<h2>Health check</h2><div class='banner' style='background:$hColor'>Health: $($row.HealthCrit) critical, $($row.HealthWarn) warning(s)</div><div>Build: $(Enc $build)</div>"
+                    $row.HealthShort = $hHead + "<h3>Needs attention ($($hIssues.Count))</h3>" + [string](ConvertTo-HtmlTable $hIssues @('severity', 'area', 'item', 'detail') '' 'severity')
+                    $row.HealthFull  = $row.HealthShort + ([string](Get-FullReportHtml $hc) -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
+                    Write-Step ("{0}: health - {1} critical, {2} warning(s)" -f $t.Instance, $row.HealthCrit, $row.HealthWarn) $(if ($row.HealthCrit) { 'Red' } elseif ($row.HealthWarn) { 'Yellow' } else { 'Green' })
+                }
+                catch {
+                    $row.HealthCrit = 1
+                    $row.HealthShort = $row.HealthFull = "<h2>Health check</h2><div class='banner' style='background:#f8d7da'>Health check failed: $(Enc $_.Exception.Message)</div>"
+                    Write-Step "$($t.Instance): health check failed - $($_.Exception.Message)" 'Red'
+                }
+            }
         }
         catch {
             $row.State = 'FAILED'; $row.Outcome = 'FAILED: ' + $_.Exception.Message
@@ -755,30 +926,52 @@ try {
     }
 
     # ---- performance window (all instances sampled together) ----
-    if ($items.Count) {
+    $xdlAll = @()
+    if ($items.Count -and -not $NoPerf) {
         try { Invoke-PerfWindow $items $blocks $sampleSecUsed $durationUsed }
         finally {
             foreach ($it in $items) {
                 try {
                     $pr = Get-PerfResult $it $sampleSecUsed
-                    $banner = if ($pr.Crit) { '#f8d7da' } elseif ($pr.Warn) { '#fff3cd' } else { '#d4edda' }
-                    $it.Row.State   = if ($pr.Crit) { 'CRIT' } elseif ($pr.Warn) { 'WARN' } else { 'OK' }
-                    $it.Row.Outcome = "$($pr.Intervals) intervals - $($pr.Crit) critical, $($pr.Warn) warning(s)"
-                    $hdr = "<h1>$(Enc $it.Instance)</h1><div class='banner' style='background:$banner'>$(Enc $it.Row.Outcome)</div><div>Connected as: $(Enc $it.Row.ConnectedAs)</div>"
-                    $it.Row.ShortHtml = $hdr + $pr.Short; $it.Row.FullHtml = $hdr + $pr.Full
-                    Write-Step ("{0}: {1}" -f $it.Instance, $it.Row.Outcome) $(if ($pr.Crit) { 'Red' } elseif ($pr.Warn) { 'Yellow' } else { 'Green' })
+                    $it.Row.PerfCrit = $pr.Crit; $it.Row.PerfWarn = $pr.Warn; $it.Row.PerfShort = $pr.Short; $it.Row.PerfFull = $pr.Full
+                    $it.Row.PerfNote = "$($pr.Intervals) intervals"; $xdlAll += @($pr.Xdl)
+                    Write-Step ("{0}: performance - {1} critical, {2} warning(s)" -f $it.Instance, $pr.Crit, $pr.Warn) $(if ($pr.Crit) { 'Red' } elseif ($pr.Warn) { 'Yellow' } else { 'Green' })
                 }
                 catch {
-                    $it.Row.State = 'FAILED'; $it.Row.Outcome = "Report failed: $($_.Exception.Message)"
-                    $it.Row.ShortHtml = $it.Row.FullHtml = "<h1>$(Enc $it.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $it.Row.Outcome)</div>"
+                    $it.Row.PerfCrit = 1
+                    $it.Row.PerfShort = $it.Row.PerfFull = "<h2>Performance window</h2><div class='banner' style='background:#f8d7da'>Performance report failed: $(Enc $_.Exception.Message)</div>"
                 }
             }
         }
     }
 
+    # ---- per instance: health + performance in one section ----
+    foreach ($it in $items) {
+        $r = $it.Row
+        $c = $r.HealthCrit + $r.PerfCrit; $w = $r.HealthWarn + $r.PerfWarn
+        $r.State = if ($c) { 'CRIT' } elseif ($w) { 'WARN' } else { 'OK' }
+        $parts = @()
+        if (-not $NoHealth) { $parts += "health: $($r.HealthCrit) critical, $($r.HealthWarn) warning(s)" }
+        if (-not $NoPerf)   { $parts += "performance ($($r.PerfNote)): $($r.PerfCrit) critical, $($r.PerfWarn) warning(s)" }
+        $r.Outcome = $parts -join '; '
+        $banner = if ($c) { '#f8d7da' } elseif ($w) { '#fff3cd' } else { '#d4edda' }
+        $hdr = "<h1>$(Enc $it.Instance)</h1><div class='banner' style='background:$banner'>$(Enc $r.Outcome)</div><div>Connected as: $(Enc $r.ConnectedAs)</div>"
+        $r.ShortHtml = $hdr + $r.HealthShort + $r.PerfShort
+        $r.FullHtml  = $hdr + $r.HealthFull + $r.PerfFull
+    }
+
     # ---- one combined report + one email for the VM ----
     $states = @($summary | ForEach-Object { $_.State })
     $nCrit = @($states | Where-Object { $_ -in @('CRIT', 'FAILED') }).Count; $nWarn = @($states | Where-Object { $_ -eq 'WARN' }).Count
+    $biShort = ''; $biFull = ''
+    if ($machineBi) {
+        $biIssues = @($machineBi.issues)
+        $biSnap = @{ sections = $machineBi.sections; columns = $machineBi.columns }
+        $biSnap.sections['issues'] = $biIssues; $biSnap.columns['issues'] = @('severity', 'area', 'item', 'detail')
+        if (@($biIssues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count) { $nCrit++ } elseif ($biIssues.Count) { $nWarn++ }
+        $biShort = "<h3>SSIS / SSRS / SSAS on $(Enc $env:COMPUTERNAME) - needs attention ($($biIssues.Count))</h3>" + [string](ConvertTo-HtmlTable $biIssues @('severity', 'area', 'item', 'detail') '' 'severity')
+        $biFull  = $biShort + ([string](Get-FullReportHtml $biSnap $BiSections) -replace '^<h3>Needs attention[^<]*</h3>.*?(?=<h3>)', '')
+    }
     $tag = if ($nCrit) { 'CRITICAL' } elseif ($nWarn) { 'WARNING' } else { 'OK' }
     $overall = "$tag - $($summary.Count) instance(s): $nCrit critical/failed, $nWarn with warnings"
     $overallColor = switch ($tag) { 'CRITICAL' { '#f8d7da' } 'WARNING' { '#fff3cd' } default { '#d4edda' } }
@@ -792,6 +985,7 @@ try {
         '<h3>Summary</h3>'
         [string](ConvertTo-HtmlTable $summaryRows @('Instance', 'ConnectedAs', 'Outcome') '' 'status')
     ) -join '')
+    $headerShort = $header + $biShort; $header = $header + $biFull
     $combinedHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + '</body></html>'
     $combinedFile = Join-Path $Config.ReportsFolder ("{0}_PERF_{1}_{2}.html" -f (Get-SafeFileName $env:COMPUTERNAME), $Label, (Get-Date -Format 'yyyyMMdd_HHmm'))
     [System.IO.File]::WriteAllText($combinedFile, $combinedHtml, [System.Text.Encoding]::UTF8)
@@ -807,7 +1001,7 @@ try {
         $c = $null
         try {
             $c = (Open-SqlConnection $sender.Instance).Connection
-            $shortHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
+            $shortHtml = [string]$HtmlHead + $headerShort + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
             $sizeBytes = (Get-Item -LiteralPath $combinedFile).Length; $maxBytes = 0
             try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
             $attach = $Config.AttachReport -and ($maxBytes -le 0 -or $sizeBytes -le $maxBytes)
@@ -816,8 +1010,9 @@ try {
             if ($attach) {
                 try {
                     $body = $shortHtml + "<p style='color:#555'>The full report (per-interval tables and query lists) is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
-                    $mailId = Send-DbMail $c $sender.Profile $subject $body $importance $combinedFile
-                    $mailStatus = 'Queued with attachment'
+                    $files = @($combinedFile) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
+                    $mailId = Send-DbMail $c $sender.Profile $subject $body $importance ($files -join ';')
+                    $mailStatus = if ($files.Count -gt 1) { "Queued with attachments (report + $($files.Count - 1) deadlock graph(s))" } else { 'Queued with attachment' }
                 }
                 catch {
                     Write-Step "Attachment not possible ($($_.Exception.Message))." 'Yellow'
