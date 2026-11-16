@@ -15,7 +15,7 @@ automation/pre-post-check/Snapshots/
 automation/pre-post-check/Reports/
 automation/pre-post-check/Logs/
 automation/pre-post-check/servers.txt
-automation/pre-post-check-v2/Snapshots/
-automation/pre-post-check-v2/Reports/
-automation/pre-post-check-v2/Logs/
-automation/pre-post-check-v2/servers.txt
+automation/perf-check/Reports/
+automation/perf-check/Logs/
+automation/perf-check/servers.txt
+automation/perf-check/*.cred
