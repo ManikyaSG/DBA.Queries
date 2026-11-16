@@ -157,6 +157,26 @@ INSERT #issues SELECT status, 'Vitals', metric, value FROM #vitals WHERE status 
 /*=============================================================================
   4. DATABASES + BACKUPS + CHECKDB + LOG USE + AG ROLE
 =============================================================================*/
+-- Last full / diff / log backup per database (msdb read access needed; without it backups are not judged)
+IF OBJECT_ID('tempdb..#bk') IS NOT NULL DROP TABLE #bk;
+CREATE TABLE #bk (database_name sysname, type char(1), backup_finish_date datetime, physical_device_name nvarchar(260));
+DECLARE @bkOk bit = 1;
+BEGIN TRY
+    INSERT #bk (database_name, type, backup_finish_date, physical_device_name)
+    SELECT database_name, type, backup_finish_date, physical_device_name
+    FROM (SELECT b.database_name, b.type, b.backup_finish_date, m.physical_device_name,
+                 ROW_NUMBER() OVER (PARTITION BY b.database_name, b.type ORDER BY b.backup_finish_date DESC) AS rn
+          FROM msdb.dbo.backupset AS b
+          JOIN msdb.dbo.backupmediafamily AS m ON m.media_set_id = b.media_set_id
+          WHERE b.backup_finish_date >= DATEADD(DAY, -60, GETDATE())      -- recent history only (fast on big msdb)
+            AND (b.type IN ('I', 'L') OR (b.type = 'D' AND b.is_copy_only = 0))) AS x
+    WHERE rn = 1;
+END TRY
+BEGIN CATCH
+    SET @bkOk = 0;
+    INSERT #issues SELECT 'WARNING', 'Backup', N'not checked', N'No permission to read backup history in msdb (' + ERROR_MESSAGE() + N') - backups not judged';
+END CATCH;
+
 SELECT d.database_id, d.name, d.state_desc, d.user_access_desc, d.recovery_model_desc, d.compatibility_level,
        SUSER_SNAME(d.owner_sid) AS owner_name, d.is_read_only, d.log_reuse_wait_desc,
        CAST(sz.size_mb AS decimal(18,0)) AS size_mb,
@@ -164,7 +184,7 @@ SELECT d.database_id, d.name, d.state_desc, d.user_access_desc, d.recovery_model
        ag.name AS ag_name,
        CASE WHEN drs.is_primary_replica = 1 THEN N'PRIMARY' WHEN drs.database_id IS NOT NULL THEN N'SECONDARY' ELSE N'' END AS ag_role,
        drs.synchronization_state_desc AS ag_sync_state,
-       CASE WHEN d.replica_id IS NULL THEN 1 ELSE sys.fn_hadr_backup_is_preferred_replica(d.name) END AS backup_preferred_here,
+       CASE WHEN @bkOk = 0 THEN 0 WHEN d.replica_id IS NULL THEN 1 ELSE sys.fn_hadr_backup_is_preferred_replica(d.name) END AS backup_preferred_here,
        bf.backup_finish_date AS last_full, bf.physical_device_name AS last_full_path,
        bd.backup_finish_date AS last_diff,
        bl.backup_finish_date AS last_log,  bl.physical_device_name AS last_log_path,
@@ -177,14 +197,9 @@ OUTER APPLY (SELECT TOP (1) l.active_log_size_mb, l.total_log_size_mb FROM sys.d
 LEFT JOIN sys.availability_databases_cluster AS adc ON adc.database_name = d.name
 LEFT JOIN sys.availability_groups AS ag ON ag.group_id = adc.group_id
 LEFT JOIN sys.dm_hadr_database_replica_states AS drs ON drs.database_id = d.database_id AND drs.is_local = 1
-OUTER APPLY (SELECT TOP (1) b.backup_finish_date, m.physical_device_name FROM msdb.dbo.backupset b
-             JOIN msdb.dbo.backupmediafamily m ON m.media_set_id = b.media_set_id
-             WHERE b.database_name = d.name AND b.type = 'D' AND b.is_copy_only = 0 ORDER BY b.backup_finish_date DESC) AS bf
-OUTER APPLY (SELECT TOP (1) b.backup_finish_date FROM msdb.dbo.backupset b
-             WHERE b.database_name = d.name AND b.type = 'I' ORDER BY b.backup_finish_date DESC) AS bd
-OUTER APPLY (SELECT TOP (1) b.backup_finish_date, m.physical_device_name FROM msdb.dbo.backupset b
-             JOIN msdb.dbo.backupmediafamily m ON m.media_set_id = b.media_set_id
-             WHERE b.database_name = d.name AND b.type = 'L' ORDER BY b.backup_finish_date DESC) AS bl
+LEFT JOIN #bk AS bf ON bf.database_name = d.name AND bf.type = 'D'
+LEFT JOIN #bk AS bd ON bd.database_name = d.name AND bd.type = 'I'
+LEFT JOIN #bk AS bl ON bl.database_name = d.name AND bl.type = 'L'
 WHERE d.source_database_id IS NULL;      -- skip DB snapshots
 
 -- Evaluate each database
@@ -207,7 +222,7 @@ UPDATE #db SET
                     AND ISNULL(last_diff, '19000101') < DATEADD(HOUR, -@DiffBackupMaxHours, @now) THEN N'Full/diff backup too old. ' ELSE N'' END
         + CASE WHEN state_desc = N'ONLINE' AND backup_preferred_here = 1 AND recovery_model_desc <> N'SIMPLE' AND database_id > 4
                     AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now) THEN N'Log backup older than ' + CAST(@LogBackupMaxMin AS nvarchar(10)) + N' min. ' ELSE N'' END
-        + CASE WHEN backup_preferred_here = 0 THEN N'Backups run on another AG replica. ' ELSE N'' END
+        + CASE WHEN backup_preferred_here = 0 AND @bkOk = 1 THEN N'Backups run on another AG replica. ' ELSE N'' END
         + CASE WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN N'CHECKDB older than ' + CAST(@CheckDbMaxDays AS nvarchar(10)) + N' days. ' ELSE N'' END
         + CASE WHEN log_used_pct >= @LogUsedWarnPct THEN N'Log ' + CAST(log_used_pct AS nvarchar(10)) + N'% used (' + log_reuse_wait_desc + N'). ' ELSE N'' END
         + CASE WHEN user_access_desc <> N'MULTI_USER' THEN user_access_desc + N'. ' ELSE N'' END);
@@ -281,13 +296,19 @@ END;
 /*=============================================================================
   8. AGENT JOB FAILURES
 =============================================================================*/
-SELECT j.name AS job_name, msdb.dbo.agent_datetime(h.run_date, h.run_time) AS run_time, h.step_id, h.step_name,
-       LEFT(h.message, 500) AS message
-INTO #jobs
-FROM msdb.dbo.sysjobhistory AS h
-JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
-WHERE h.run_status = 0 AND h.step_id > 0
-  AND msdb.dbo.agent_datetime(h.run_date, h.run_time) >= DATEADD(HOUR, -@JobFailHours, @now);
+CREATE TABLE #jobs (job_name sysname, run_time datetime, step_id int, step_name sysname NULL, message nvarchar(500));
+BEGIN TRY
+    -- run_date / run_time converted inline (msdb.dbo.agent_datetime needs EXECUTE permission)
+    INSERT #jobs (job_name, run_time, step_id, step_name, message)
+    SELECT j.name, DATETIMEFROMPARTS(h.run_date / 10000, h.run_date / 100 % 100, h.run_date % 100, h.run_time / 10000, h.run_time / 100 % 100, h.run_time % 100, 0), h.step_id, h.step_name, LEFT(h.message, 500)
+    FROM msdb.dbo.sysjobhistory AS h
+    JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
+    WHERE h.run_status = 0 AND h.step_id > 0 AND h.run_date > 0
+      AND DATETIMEFROMPARTS(h.run_date / 10000, h.run_date / 100 % 100, h.run_date % 100, h.run_time / 10000, h.run_time / 100 % 100, h.run_time % 100, 0) >= DATEADD(HOUR, -@JobFailHours, @now);
+END TRY
+BEGIN CATCH
+    INSERT #issues SELECT 'WARNING', 'Agent job', N'not read', N'No permission to read job history in msdb (' + ERROR_MESSAGE() + N')';
+END CATCH;
 
 INSERT #issues SELECT 'WARNING', 'Agent job', job_name, CAST(COUNT(*) AS nvarchar(10)) + N' failed step(s), last at ' + CONVERT(nvarchar(20), MAX(run_time), 120)
 FROM #jobs GROUP BY job_name;
