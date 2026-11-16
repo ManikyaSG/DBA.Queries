@@ -1,6 +1,6 @@
 /*******************************************************************************
  File    : PerfCheck.sql   (automation/perf-check)
- Purpose : Performance window for every SQL Server instance on a VM. Run by
+ Purpose : Health check + performance window for every SQL Server instance on a VM. Run by
            Invoke-PerfCheck.ps1 (double-click Run-PerfCheck.bat): each --##PERF_*
            block below is run separately; the script sets the @p_ parameter
            values at the top of each block from $Config.
@@ -9,12 +9,21 @@
            (restores the threshold, drops the XE session). Or select and run the
            blocks one by one in the SAME query window, e.g. START, a few
            SAMPLEs while you generate load, then END and TEARDOWN.
+   HEALTH        : one-time health check (instance, services, vitals, databases,
+                   backups, CHECKDB, Always On, cluster, disks, failed job steps,
+                   error log, config, trace flags, linked servers, endpoints,
+                   certificates, XE sessions, SSIS catalog, SSRS report server
+                   databases) + 'issues'. No data/log file list, Agent job list,
+                   logins or server role members.
    PERF_START    : sets 'blocked process threshold' to @p_BptSec s, starts the XE
                    session DBA_PerfWindow (blocked process reports, deadlocks,
                    queries longer than @p_LongUs microseconds) and takes a plan cache
                    baseline for the window's top queries.
    PERF_SAMPLE   : one sample every N seconds (counters, waits, file I/O,
-                   sessions, blocking, tempdb, Always On, listener connections).
+                   sessions, blocking, tempdb, Always On, listener connections) and
+                   the problem sessions with SPID + statement: blocked / I/O / log /
+                   memory / tempdb waits / long running, head blockers (incl. idle
+                   sessions with an open transaction), memory grants, tempdb users.
    PERF_END      : blocked process reports, deadlocks, long queries (XE) and the
                    top 20 queries of the window (plan cache start vs end).
    PERF_TEARDOWN : drops the XE session and restores the original threshold.
@@ -39,10 +48,534 @@ GRANT ALTER ANY EVENT SESSION TO [dba_perfcheck];   -- temporary XE session DBA_
 USE msdb;
 IF USER_ID(N'dba_perfcheck') IS NULL CREATE USER [dba_perfcheck] FOR LOGIN [dba_perfcheck];
 ALTER ROLE DatabaseMailUserRole ADD MEMBER [dba_perfcheck];   -- send the report by Database Mail
+ALTER ROLE db_datareader ADD MEMBER [dba_perfcheck];          -- health check: backup / job history in msdb
+USE master;
+GRANT VIEW ANY DEFINITION TO [dba_perfcheck];                  -- health check: endpoints, certificates, linked servers
+IF USER_ID(N'dba_perfcheck') IS NULL CREATE USER [dba_perfcheck] FOR LOGIN [dba_perfcheck];
+GRANT EXECUTE ON sys.xp_readerrorlog TO [dba_perfcheck];       -- health check: severe error log entries
+-- Optional, if the instance hosts them:
+-- USE SSISDB;      CREATE USER [dba_perfcheck] FOR LOGIN [dba_perfcheck]; ALTER ROLE ssis_logreader ADD MEMBER [dba_perfcheck];
+-- USE ReportServer; CREATE USER [dba_perfcheck] FOR LOGIN [dba_perfcheck]; ALTER ROLE db_datareader ADD MEMBER [dba_perfcheck];
  ------------------------------------------------------------------------------
- To remove it later: DROP USER [dba_perfcheck] (in msdb), then DROP LOGIN [dba_perfcheck].
+ To remove it later: DROP USER [dba_perfcheck] (in msdb, master and any other database), then DROP LOGIN [dba_perfcheck].
 *******************************************************************************/
 
+--##HEALTH
+SET NOCOUNT ON;
+SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
+SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
+
+/*=============================================================================
+  THRESHOLDS (used for the "issues" section; same meaning as in script 44)
+=============================================================================*/
+DECLARE @LogBackupMaxMin    int = 60,
+        @FullBackupMaxDays  int = 7,
+        @DiffBackupMaxHours int = 26,
+        @CheckDbMaxDays     int = 7,
+        @DiskWarnPct        int = 15,
+        @DiskCritPct        int = 10,
+        @LogUsedWarnPct     int = 80,
+        @FileFreeWarnPct    int = 10,
+        @JobFailHours       int = 24,
+        @ErrorLogHours      int = 24,
+        @CertWarnDays       int = 30,
+        @OpenTranWarnMin    int = 30,
+        @BlockingWarnSec    int = 60;
+
+/*=============================================================================
+  INTERNALS
+=============================================================================*/
+DECLARE @now datetime = GETDATE(),
+        @is_mi bit = CASE WHEN CAST(SERVERPROPERTY('EngineEdition') AS int) = 8 THEN 1 ELSE 0 END,
+        @sql nvarchar(max), @dbn sysname;
+
+IF OBJECT_ID('tempdb..#issues')  IS NOT NULL DROP TABLE #issues;
+IF OBJECT_ID('tempdb..#inst')    IS NOT NULL DROP TABLE #inst;
+IF OBJECT_ID('tempdb..#svc')     IS NOT NULL DROP TABLE #svc;
+IF OBJECT_ID('tempdb..#vitals')  IS NOT NULL DROP TABLE #vitals;
+IF OBJECT_ID('tempdb..#db')      IS NOT NULL DROP TABLE #db;
+IF OBJECT_ID('tempdb..#agr')     IS NOT NULL DROP TABLE #agr;
+IF OBJECT_ID('tempdb..#agdb')    IS NOT NULL DROP TABLE #agdb;
+IF OBJECT_ID('tempdb..#cluster') IS NOT NULL DROP TABLE #cluster;
+IF OBJECT_ID('tempdb..#disk')    IS NOT NULL DROP TABLE #disk;
+IF OBJECT_ID('tempdb..#jobs')    IS NOT NULL DROP TABLE #jobs;
+IF OBJECT_ID('tempdb..#errlog')  IS NOT NULL DROP TABLE #errlog;
+IF OBJECT_ID('tempdb..#el')      IS NOT NULL DROP TABLE #el;
+
+CREATE TABLE #issues (severity varchar(10), area varchar(40), item nvarchar(300), detail nvarchar(2000));
+CREATE TABLE #inst   (seq int IDENTITY, property nvarchar(100), value nvarchar(4000));
+CREATE TABLE #svc    (servicename nvarchar(256), status_desc nvarchar(60), startup_type_desc nvarchar(60),
+                      service_account nvarchar(256), last_startup_time datetimeoffset NULL, ifi nvarchar(1) NULL);
+CREATE TABLE #vitals (seq int IDENTITY, metric nvarchar(100), value nvarchar(400), status varchar(10));
+CREATE TABLE #disk   (volume nvarchar(256), label nvarchar(256), total_gb decimal(18,1), free_gb decimal(18,1), free_pct decimal(5,1), status varchar(10));
+CREATE TABLE #el     (LogDate datetime, ProcessInfo nvarchar(50), [Text] nvarchar(max));
+
+/*=============================================================================
+  2. SERVICES (not available on MI)
+=============================================================================*/
+IF @is_mi = 0
+BEGIN
+    INSERT #svc EXEC (N'SELECT servicename, status_desc, startup_type_desc, service_account, last_startup_time, instant_file_initialization_enabled FROM sys.dm_server_services;');
+    INSERT #issues SELECT 'CRITICAL', 'Service', servicename, 'Status: ' + status_desc
+    FROM #svc WHERE status_desc <> N'Running' AND startup_type_desc = N'Automatic';
+END;
+
+/*=============================================================================
+  3. VITALS (CPU, memory, blocking, transactions, tempdb, errors)
+=============================================================================*/
+DECLARE @ticks bigint = (SELECT ms_ticks FROM sys.dm_os_sys_info),
+        @cpu_avg int, @cpu_max int, @ple bigint, @grants bigint, @blocked int, @blocked_max_s int,
+        @oldest_tran_min int, @tempdb_free_pct decimal(5,1), @users int;
+
+SELECT @cpu_avg = AVG(cpu), @cpu_max = MAX(cpu)
+FROM (SELECT TOP (30) 100 - x.r.value('(Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS cpu
+      FROM sys.dm_os_ring_buffers rb CROSS APPLY (SELECT CAST(rb.record AS xml)) x(r)
+      WHERE rb.ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' AND rb.record LIKE N'%<SystemHealth>%'
+      ORDER BY rb.[timestamp] DESC) AS c;
+SELECT @ple    = MIN(cntr_value) FROM sys.dm_os_performance_counters WHERE counter_name = N'Page life expectancy' AND object_name LIKE N'%Buffer Manager%';
+SELECT @grants = cntr_value      FROM sys.dm_os_performance_counters WHERE counter_name = N'Memory Grants Pending';
+SELECT @blocked = COUNT(*), @blocked_max_s = MAX(wait_time) / 1000 FROM sys.dm_exec_requests WHERE blocking_session_id > 0;
+SELECT @oldest_tran_min = MAX(DATEDIFF(MINUTE, at.transaction_begin_time, @now))
+FROM sys.dm_tran_active_transactions at JOIN sys.dm_tran_session_transactions st ON st.transaction_id = at.transaction_id
+JOIN sys.dm_exec_sessions s ON s.session_id = st.session_id WHERE s.is_user_process = 1;
+SELECT @tempdb_free_pct = CAST(100.0 * SUM(unallocated_extent_page_count) / NULLIF(SUM(total_page_count), 0) AS decimal(5,1)) FROM tempdb.sys.dm_db_file_space_usage;
+SELECT @users = COUNT(*) FROM sys.dm_exec_sessions WHERE is_user_process = 1;
+
+INSERT #vitals (metric, value, status) VALUES
+ (N'CPU last 30 min (avg / max %)', CAST(ISNULL(@cpu_avg, 0) AS nvarchar(10)) + N' / ' + CAST(ISNULL(@cpu_max, 0) AS nvarchar(10)),
+     CASE WHEN @cpu_avg >= 90 THEN 'CRITICAL' WHEN @cpu_avg >= 75 OR @cpu_max >= 95 THEN 'WARNING' ELSE 'OK' END),
+ (N'Page life expectancy (s, lowest NUMA node)', CAST(@ple AS nvarchar(20)), CASE WHEN @ple < 300 THEN 'WARNING' ELSE 'OK' END),
+ (N'Memory grants pending', CAST(@grants AS nvarchar(20)), CASE WHEN @grants > 0 THEN 'WARNING' ELSE 'OK' END),
+ (N'Blocked requests now (longest wait s)', CAST(@blocked AS nvarchar(10)) + N' (' + CAST(ISNULL(@blocked_max_s, 0) AS nvarchar(10)) + N')',
+     CASE WHEN @blocked_max_s >= @BlockingWarnSec * 5 THEN 'CRITICAL' WHEN @blocked_max_s >= @BlockingWarnSec THEN 'WARNING' ELSE 'OK' END),
+ (N'Oldest open user transaction (min)', CAST(ISNULL(@oldest_tran_min, 0) AS nvarchar(10)), CASE WHEN @oldest_tran_min >= @OpenTranWarnMin THEN 'WARNING' ELSE 'OK' END),
+ (N'tempdb free %', CAST(@tempdb_free_pct AS nvarchar(10)), CASE WHEN @tempdb_free_pct < 10 THEN 'CRITICAL' WHEN @tempdb_free_pct < 20 THEN 'WARNING' ELSE 'OK' END),
+ (N'User sessions', CAST(@users AS nvarchar(10)), 'OK');
+
+INSERT #issues SELECT status, 'Vitals', metric, value FROM #vitals WHERE status <> 'OK';
+
+/*=============================================================================
+  4. DATABASES + BACKUPS + CHECKDB + LOG USE + AG ROLE
+=============================================================================*/
+SELECT d.database_id, d.name, d.state_desc, d.user_access_desc, d.recovery_model_desc, d.compatibility_level,
+       SUSER_SNAME(d.owner_sid) AS owner_name, d.is_read_only, d.log_reuse_wait_desc,
+       CAST(sz.size_mb AS decimal(18,0)) AS size_mb,
+       CAST(ls.active_log_size_mb * 100.0 / NULLIF(ls.total_log_size_mb, 0) AS decimal(5,1)) AS log_used_pct,
+       ag.name AS ag_name,
+       CASE WHEN drs.is_primary_replica = 1 THEN N'PRIMARY' WHEN drs.database_id IS NOT NULL THEN N'SECONDARY' ELSE N'' END AS ag_role,
+       drs.synchronization_state_desc AS ag_sync_state,
+       CASE WHEN d.replica_id IS NULL THEN 1 ELSE sys.fn_hadr_backup_is_preferred_replica(d.name) END AS backup_preferred_here,
+       bf.backup_finish_date AS last_full, bf.physical_device_name AS last_full_path,
+       bd.backup_finish_date AS last_diff,
+       bl.backup_finish_date AS last_log,  bl.physical_device_name AS last_log_path,
+       CAST(DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS datetime) AS last_checkdb,
+       CAST('OK' AS varchar(10)) AS status, CAST(N'' AS nvarchar(1000)) AS notes
+INTO #db
+FROM sys.databases AS d
+OUTER APPLY (SELECT SUM(CAST(size AS bigint)) * 8 / 1024.0 AS size_mb FROM sys.master_files mf WHERE mf.database_id = d.database_id) AS sz
+OUTER APPLY (SELECT TOP (1) l.active_log_size_mb, l.total_log_size_mb FROM sys.dm_db_log_stats(d.database_id) l WHERE d.state_desc = N'ONLINE') AS ls
+LEFT JOIN sys.availability_databases_cluster AS adc ON adc.database_name = d.name
+LEFT JOIN sys.availability_groups AS ag ON ag.group_id = adc.group_id
+LEFT JOIN sys.dm_hadr_database_replica_states AS drs ON drs.database_id = d.database_id AND drs.is_local = 1
+OUTER APPLY (SELECT TOP (1) b.backup_finish_date, m.physical_device_name FROM msdb.dbo.backupset b
+             JOIN msdb.dbo.backupmediafamily m ON m.media_set_id = b.media_set_id
+             WHERE b.database_name = d.name AND b.type = 'D' AND b.is_copy_only = 0 ORDER BY b.backup_finish_date DESC) AS bf
+OUTER APPLY (SELECT TOP (1) b.backup_finish_date FROM msdb.dbo.backupset b
+             WHERE b.database_name = d.name AND b.type = 'I' ORDER BY b.backup_finish_date DESC) AS bd
+OUTER APPLY (SELECT TOP (1) b.backup_finish_date, m.physical_device_name FROM msdb.dbo.backupset b
+             JOIN msdb.dbo.backupmediafamily m ON m.media_set_id = b.media_set_id
+             WHERE b.database_name = d.name AND b.type = 'L' ORDER BY b.backup_finish_date DESC) AS bl
+WHERE d.source_database_id IS NULL;      -- skip DB snapshots
+
+-- Evaluate each database
+UPDATE #db SET
+    status = CASE
+        WHEN state_desc NOT IN (N'ONLINE', N'RESTORING') THEN 'CRITICAL'
+        WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND backup_preferred_here = 1 AND (
+                last_full IS NULL
+             OR (last_full < DATEADD(DAY, -@FullBackupMaxDays, @now) AND ISNULL(last_diff, '19000101') < DATEADD(HOUR, -@DiffBackupMaxHours, @now))
+             OR (recovery_model_desc <> N'SIMPLE' AND database_id > 4 AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now)))
+             THEN 'CRITICAL'
+        WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN 'WARNING'
+        WHEN log_used_pct >= @LogUsedWarnPct THEN 'WARNING'
+        WHEN user_access_desc <> N'MULTI_USER' THEN 'WARNING'
+        ELSE 'OK' END,
+    notes = LTRIM(
+          CASE WHEN state_desc NOT IN (N'ONLINE', N'RESTORING') THEN N'State ' + state_desc + N'. ' ELSE N'' END
+        + CASE WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND backup_preferred_here = 1 AND last_full IS NULL THEN N'No full backup. ' ELSE N'' END
+        + CASE WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND backup_preferred_here = 1 AND last_full < DATEADD(DAY, -@FullBackupMaxDays, @now)
+                    AND ISNULL(last_diff, '19000101') < DATEADD(HOUR, -@DiffBackupMaxHours, @now) THEN N'Full/diff backup too old. ' ELSE N'' END
+        + CASE WHEN state_desc = N'ONLINE' AND backup_preferred_here = 1 AND recovery_model_desc <> N'SIMPLE' AND database_id > 4
+                    AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now) THEN N'Log backup older than ' + CAST(@LogBackupMaxMin AS nvarchar(10)) + N' min. ' ELSE N'' END
+        + CASE WHEN backup_preferred_here = 0 THEN N'Backups run on another AG replica. ' ELSE N'' END
+        + CASE WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN N'CHECKDB older than ' + CAST(@CheckDbMaxDays AS nvarchar(10)) + N' days. ' ELSE N'' END
+        + CASE WHEN log_used_pct >= @LogUsedWarnPct THEN N'Log ' + CAST(log_used_pct AS nvarchar(10)) + N'% used (' + log_reuse_wait_desc + N'). ' ELSE N'' END
+        + CASE WHEN user_access_desc <> N'MULTI_USER' THEN user_access_desc + N'. ' ELSE N'' END);
+
+INSERT #issues SELECT status, 'Database', name, notes FROM #db WHERE status <> 'OK';
+
+/*=============================================================================
+  5. ALWAYS ON: AGs, REPLICAS (NODES), ROLES, LISTENERS, DB SYNC
+=============================================================================*/
+SELECT ag.name AS ag_name, ags.primary_replica, ar.replica_server_name AS replica_node,
+       ars.role_desc, ar.availability_mode_desc, ar.failover_mode_desc,
+       ars.connected_state_desc, ars.synchronization_health_desc, ars.operational_state_desc,
+       ar.secondary_role_allow_connections_desc, ar.endpoint_url, ar.backup_priority,
+       STUFF((SELECT N', ' + l.dns_name + N':' + CAST(l.port AS nvarchar(10))
+              FROM sys.availability_group_listeners l WHERE l.group_id = ag.group_id
+              FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'') AS listeners,
+       ars.last_connect_error_description,
+       CAST(CASE WHEN ars.connected_state_desc = 'CONNECTED' AND ars.synchronization_health_desc = 'HEALTHY' THEN 'OK'
+                 WHEN ars.role_desc IS NULL THEN 'WARNING' ELSE 'CRITICAL' END AS varchar(10)) AS status
+INTO #agr
+FROM sys.availability_groups AS ag
+JOIN sys.dm_hadr_availability_group_states AS ags ON ags.group_id = ag.group_id
+JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id
+LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id;
+
+INSERT #issues SELECT status, 'AlwaysOn replica', ag_name + N' / ' + replica_node,
+       ISNULL(role_desc, N'state not visible from this replica') + N', ' + ISNULL(connected_state_desc, N'?') + N', ' + ISNULL(synchronization_health_desc, N'?')
+       + ISNULL(N', ' + last_connect_error_description, N'')
+FROM #agr WHERE status <> 'OK';
+
+SELECT ag.name AS ag_name, DB_NAME(drs.database_id) AS database_name, ar.replica_server_name AS replica_node,
+       CASE WHEN drs.is_primary_replica = 1 THEN N'PRIMARY' ELSE N'SECONDARY' END AS role,
+       drs.synchronization_state_desc, drs.synchronization_health_desc, drs.is_suspended, drs.suspend_reason_desc,
+       drs.log_send_queue_size AS send_queue_kb, drs.redo_queue_size AS redo_queue_kb,
+       drs.secondary_lag_seconds, drs.last_commit_time,
+       CAST(CASE WHEN drs.synchronization_health_desc = 'HEALTHY' AND drs.is_suspended = 0 THEN 'OK' ELSE 'CRITICAL' END AS varchar(10)) AS status
+INTO #agdb
+FROM sys.dm_hadr_database_replica_states AS drs
+JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id
+JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id;
+
+INSERT #issues SELECT status, 'AlwaysOn database', ag_name + N' / ' + database_name + N' @ ' + replica_node,
+       synchronization_state_desc + CASE WHEN is_suspended = 1 THEN N' SUSPENDED (' + ISNULL(suspend_reason_desc, N'') + N')' ELSE N'' END
+       + N', send queue ' + CAST(ISNULL(send_queue_kb, 0) AS nvarchar(20)) + N' KB, redo queue ' + CAST(ISNULL(redo_queue_kb, 0) AS nvarchar(20)) + N' KB'
+FROM #agdb WHERE status <> 'OK';
+
+-- Cluster (AG on WSFC / FCI)
+SELECT c.cluster_name, c.quorum_type_desc, c.quorum_state_desc, m.member_name, m.member_type_desc, m.member_state_desc, m.number_of_quorum_votes,
+       CAST(CASE WHEN m.member_state_desc = 'UP' AND c.quorum_state_desc = 'NORMAL_QUORUM' THEN 'OK' ELSE 'CRITICAL' END AS varchar(10)) AS status
+INTO #cluster
+FROM sys.dm_hadr_cluster AS c CROSS JOIN sys.dm_hadr_cluster_members AS m;
+
+INSERT #issues SELECT status, 'Cluster', member_name, member_type_desc + N' ' + member_state_desc + N', quorum ' + quorum_state_desc
+FROM #cluster WHERE status <> 'OK';
+
+/*=============================================================================
+  6. DISK SPACE (not available on MI)
+=============================================================================*/
+IF @is_mi = 0
+BEGIN
+    INSERT #disk (volume, label, total_gb, free_gb, free_pct)
+    EXEC (N'SELECT DISTINCT vs.volume_mount_point, vs.logical_volume_name,
+                   CAST(vs.total_bytes / 1073741824.0 AS decimal(18,1)), CAST(vs.available_bytes / 1073741824.0 AS decimal(18,1)),
+                   CAST(100.0 * vs.available_bytes / vs.total_bytes AS decimal(5,1))
+            FROM sys.master_files mf CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs;');
+    UPDATE #disk SET status = CASE WHEN free_pct < @DiskCritPct THEN 'CRITICAL' WHEN free_pct < @DiskWarnPct THEN 'WARNING' ELSE 'OK' END;
+    INSERT #issues SELECT status, 'Disk', volume, CAST(free_gb AS nvarchar(20)) + N' GB free of ' + CAST(total_gb AS nvarchar(20)) + N' GB (' + CAST(free_pct AS nvarchar(10)) + N'%)'
+    FROM #disk WHERE status <> 'OK';
+END;
+
+/*=============================================================================
+  8. AGENT JOB FAILURES
+=============================================================================*/
+SELECT j.name AS job_name, msdb.dbo.agent_datetime(h.run_date, h.run_time) AS run_time, h.step_id, h.step_name,
+       LEFT(h.message, 500) AS message
+INTO #jobs
+FROM msdb.dbo.sysjobhistory AS h
+JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
+WHERE h.run_status = 0 AND h.step_id > 0
+  AND msdb.dbo.agent_datetime(h.run_date, h.run_time) >= DATEADD(HOUR, -@JobFailHours, @now);
+
+INSERT #issues SELECT 'WARNING', 'Agent job', job_name, CAST(COUNT(*) AS nvarchar(10)) + N' failed step(s), last at ' + CONVERT(nvarchar(20), MAX(run_time), 120)
+FROM #jobs GROUP BY job_name;
+
+/*=============================================================================
+  9. ERROR LOG: SEVERITY >= 17, CORRUPTION, I/O STALLS (current log)
+=============================================================================*/
+BEGIN TRY
+    INSERT #el EXEC sys.xp_readerrorlog 0, 1, N'Severity:';
+    INSERT #el EXEC sys.xp_readerrorlog 0, 1, N'I/O requests taking longer than';
+    INSERT #el EXEC sys.xp_readerrorlog 0, 1, N'stack dump';
+END TRY
+BEGIN CATCH
+    INSERT #issues SELECT 'WARNING', 'Error log', N'not read', N'No permission to read the error log (' + ERROR_MESSAGE() + N') - see SETUP in PerfCheck.sql';
+END CATCH;
+
+SELECT DISTINCT e.LogDate, e.ProcessInfo, LEFT(e.[Text], 1000) AS message
+INTO #errlog
+FROM #el AS e
+WHERE e.LogDate >= DATEADD(HOUR, -@ErrorLogHours, @now)
+  AND (   e.[Text] LIKE N'I/O requests taking longer than%' OR e.[Text] LIKE N'%stack dump%'
+       OR TRY_CAST(SUBSTRING(e.[Text], CHARINDEX('Severity:', e.[Text]) + 10, 2) AS int) >= 17);
+
+INSERT #issues SELECT 'CRITICAL', 'Error log', N'Severe errors (' + CAST(@ErrorLogHours AS nvarchar(5)) + N'h)',
+       CAST(COUNT(*) AS nvarchar(10)) + N' entries, latest: ' + MAX(CONVERT(nvarchar(20), LogDate, 120))
+FROM #errlog HAVING COUNT(*) > 0;
+
+/*=============================================================================
+  10. CERTIFICATES (TDE / backup encryption / endpoints)
+=============================================================================*/
+INSERT #issues
+SELECT 'WARNING', 'Certificate', c.name,
+       N'Expires ' + CONVERT(nvarchar(10), c.expiry_date, 120)
+     + CASE WHEN c.pvt_key_last_backup_date IS NULL AND EXISTS (SELECT 1 FROM sys.dm_database_encryption_keys k WHERE k.encryptor_thumbprint = c.thumbprint)
+            THEN N' - TDE certificate private key NEVER backed up' ELSE N'' END
+FROM master.sys.certificates AS c
+WHERE c.name NOT LIKE N'##%'
+  AND (c.expiry_date < DATEADD(DAY, @CertWarnDays, @now)
+       OR (c.pvt_key_last_backup_date IS NULL AND EXISTS (SELECT 1 FROM sys.dm_database_encryption_keys k WHERE k.encryptor_thumbprint = c.thumbprint)));
+
+/*=============================================================================
+  11. EXTRA DATA FOR PRE / POST COMPARISON
+=============================================================================*/
+IF OBJECT_ID('tempdb..#tf') IS NOT NULL DROP TABLE #tf;
+CREATE TABLE #tf (TraceFlag int, Status int, Global int, Session int);
+INSERT #tf EXEC (N'DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');
+
+/*=============================================================================
+  12. SSIS CATALOG (SSISDB) - catalog settings, projects, environments, failures
+=============================================================================*/
+IF OBJECT_ID('tempdb..#ssis_cat')  IS NOT NULL DROP TABLE #ssis_cat;
+IF OBJECT_ID('tempdb..#ssis_proj') IS NOT NULL DROP TABLE #ssis_proj;
+IF OBJECT_ID('tempdb..#ssis_env')  IS NOT NULL DROP TABLE #ssis_env;
+IF OBJECT_ID('tempdb..#ssis_fail') IS NOT NULL DROP TABLE #ssis_fail;
+CREATE TABLE #ssis_cat  (property_name nvarchar(256), property_value nvarchar(4000));
+CREATE TABLE #ssis_proj (folder nvarchar(128), project nvarchar(128), packages int, object_version_lsn bigint, last_deployed nvarchar(19), deployed_by nvarchar(256));
+CREATE TABLE #ssis_env  (folder nvarchar(128), environment nvarchar(128), variables int);
+CREATE TABLE #ssis_fail (execution_id bigint, folder nvarchar(128) NULL, project nvarchar(128) NULL, package nvarchar(260) NULL, start_time nvarchar(19) NULL, status nvarchar(30) NULL);
+
+IF DB_ID(N'SSISDB') IS NOT NULL AND HAS_DBACCESS(N'SSISDB') = 1
+BEGIN
+    BEGIN TRY
+        EXEC (N'INSERT #ssis_cat SELECT property_name, CAST(property_value AS nvarchar(4000)) FROM SSISDB.catalog.catalog_properties;');
+        EXEC (N'INSERT #ssis_proj SELECT f.name, p.name, (SELECT COUNT(*) FROM SSISDB.catalog.packages AS k WHERE k.project_id = p.project_id),
+                       p.object_version_lsn, CONVERT(nvarchar(19), p.last_deployed_time, 120), p.deployed_by_name
+                FROM SSISDB.catalog.projects AS p JOIN SSISDB.catalog.folders AS f ON f.folder_id = p.folder_id;');
+        EXEC (N'INSERT #ssis_env SELECT f.name, e.name, (SELECT COUNT(*) FROM SSISDB.catalog.environment_variables AS v WHERE v.environment_id = e.environment_id)
+                FROM SSISDB.catalog.environments AS e JOIN SSISDB.catalog.folders AS f ON f.folder_id = e.folder_id;');
+        SET @sql = N'INSERT #ssis_fail SELECT TOP (200) execution_id, folder_name, project_name, package_name, CONVERT(nvarchar(19), start_time, 120),
+                       CASE status WHEN 4 THEN N''Failed'' WHEN 6 THEN N''Ended unexpectedly'' END
+                FROM SSISDB.catalog.executions
+                WHERE status IN (4, 6) AND start_time >= DATEADD(HOUR, -@h, SYSDATETIMEOFFSET())
+                ORDER BY execution_id DESC;';
+        EXEC sys.sp_executesql @sql, N'@h int', @h = @JobFailHours;
+    END TRY
+    BEGIN CATCH
+        INSERT #issues (severity, area, item, detail) VALUES ('WARNING', 'SSIS', N'SSISDB', LEFT(N'Could not read the SSIS catalog: ' + ERROR_MESSAGE(), 1900));
+    END CATCH;
+
+    INSERT #issues (severity, area, item, detail)
+    SELECT 'WARNING', 'SSIS', N'Failed package executions',
+           CAST(COUNT(*) AS nvarchar(10)) + N' in the last ' + CAST(@JobFailHours AS nvarchar(5)) + N' h, latest: ' + ISNULL(MAX(package), N'')
+    FROM #ssis_fail HAVING COUNT(*) > 0;
+END;
+
+/*=============================================================================
+  13. SSRS REPORT SERVER DATABASES ON THIS INSTANCE - content & subscriptions
+  Any database with dbo.Catalog + dbo.Subscriptions + dbo.ExecutionLogStorage.
+=============================================================================*/
+IF OBJECT_ID('tempdb..#ssrs_sum') IS NOT NULL DROP TABLE #ssrs_sum;
+IF OBJECT_ID('tempdb..#ssrs_sub') IS NOT NULL DROP TABLE #ssrs_sub;
+CREATE TABLE #ssrs_sum (rs_database sysname, folders int, reports int, datasources int, datasets int, other_items int,
+                        subscriptions int, failing_subscriptions int, schedules int, failed_executions int);
+CREATE TABLE #ssrs_sub (rs_database sysname, subscription_id nvarchar(40), report_path nvarchar(425) NULL, owner nvarchar(260) NULL,
+                        description nvarchar(512) NULL, inactive_flags int NULL, last_status nvarchar(260) NULL, last_run nvarchar(19) NULL, is_failing int);
+
+DECLARE rsc CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.databases
+    WHERE state_desc = N'ONLINE' AND HAS_DBACCESS(name) = 1 AND source_database_id IS NULL
+      AND OBJECT_ID(QUOTENAME(name) + N'.dbo.Catalog') IS NOT NULL
+      AND OBJECT_ID(QUOTENAME(name) + N'.dbo.Subscriptions') IS NOT NULL
+      AND OBJECT_ID(QUOTENAME(name) + N'.dbo.ExecutionLogStorage') IS NOT NULL;
+OPEN rsc; FETCH NEXT FROM rsc INTO @dbn;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+        SET @sql = N'USE ' + QUOTENAME(@dbn) + N';
+INSERT #ssrs_sub (rs_database, subscription_id, report_path, owner, description, inactive_flags, last_status, last_run, is_failing)
+SELECT DB_NAME(), CAST(s.SubscriptionID AS nvarchar(40)), c.Path, u.UserName, LEFT(s.Description, 512), s.InactiveFlags,
+       LEFT(s.LastStatus, 260), CONVERT(nvarchar(19), s.LastRunTime, 120),
+       CASE WHEN s.LastStatus LIKE N''%fail%'' OR s.LastStatus LIKE N''%error%'' THEN 1 ELSE 0 END
+FROM dbo.Subscriptions AS s
+LEFT JOIN dbo.Catalog AS c ON c.ItemID = s.Report_OID
+LEFT JOIN dbo.Users AS u ON u.UserID = s.OwnerID;
+INSERT #ssrs_sum
+SELECT DB_NAME(),
+       SUM(CASE WHEN c.Type = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN c.Type = 2 THEN 1 ELSE 0 END),
+       SUM(CASE WHEN c.Type = 5 THEN 1 ELSE 0 END), SUM(CASE WHEN c.Type = 8 THEN 1 ELSE 0 END),
+       SUM(CASE WHEN c.Type NOT IN (1, 2, 5, 8) THEN 1 ELSE 0 END),
+       (SELECT COUNT(*) FROM dbo.Subscriptions),
+       (SELECT COUNT(*) FROM #ssrs_sub AS x WHERE x.rs_database = DB_NAME() AND x.is_failing = 1),
+       (SELECT COUNT(*) FROM dbo.Schedule),
+       (SELECT COUNT(*) FROM dbo.ExecutionLogStorage AS e WHERE e.TimeStart >= DATEADD(HOUR, -@h, GETDATE()) AND e.Status <> N''rsSuccess'')
+FROM dbo.Catalog AS c;';
+        EXEC sys.sp_executesql @sql, N'@h int', @h = @JobFailHours;
+    END TRY
+    BEGIN CATCH
+        INSERT #issues (severity, area, item, detail) VALUES ('WARNING', 'SSRS', @dbn, LEFT(N'Could not read the report server database: ' + ERROR_MESSAGE(), 1900));
+    END CATCH;
+    FETCH NEXT FROM rsc INTO @dbn;
+END
+CLOSE rsc; DEALLOCATE rsc;
+
+INSERT #issues (severity, area, item, detail)
+SELECT 'WARNING', 'SSRS', LEFT(rs_database + N' / ' + ISNULL(report_path, subscription_id), 300), N'Subscription failing: ' + ISNULL(last_status, N'')
+FROM #ssrs_sub WHERE is_failing = 1;
+INSERT #issues (severity, area, item, detail)
+SELECT 'WARNING', 'SSRS', rs_database, CAST(failed_executions AS nvarchar(10)) + N' failed report executions in the last ' + CAST(@JobFailHours AS nvarchar(5)) + N' h'
+FROM #ssrs_sum WHERE failed_executions > 0;
+
+/*=============================================================================
+  OUTPUT - one result set per section. First column _section = section name.
+  Every value is returned as text so PRE / POST compare exactly.
+=============================================================================*/
+-- instance (property_code is the comparison key)
+SELECT N'instance' AS _section, v.property_code, v.property, v.value
+FROM sys.dm_os_sys_info AS i
+CROSS APPLY (VALUES
+    (N'server_name', N'Server name',            CAST(@@SERVERNAME AS nvarchar(4000))),
+    (N'node',        N'Machine / active node',  CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS nvarchar(4000))),
+    (N'edition',     N'Edition',                CAST(SERVERPROPERTY('Edition') AS nvarchar(4000))),
+    (N'build',       N'Build',                  CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(4000))),
+    (N'sp_level',    N'Product level',          CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(4000))),
+    (N'cu',          N'Cumulative update',      CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(4000))),
+    (N'kb',          N'KB',                     CAST(SERVERPROPERTY('ProductUpdateReference') AS nvarchar(4000))),
+    (N'collation',   N'Collation',              CAST(SERVERPROPERTY('Collation') AS nvarchar(4000))),
+    (N'is_fci',      N'Failover cluster (FCI)', CAST(SERVERPROPERTY('IsClustered') AS nvarchar(4000))),
+    (N'is_hadr',     N'Always On enabled',      CAST(SERVERPROPERTY('IsHadrEnabled') AS nvarchar(4000))),
+    (N'start_time',  N'SQL started',            CONVERT(nvarchar(19), i.sqlserver_start_time, 120)),
+    (N'sql_uptime',  N'SQL Server uptime',      CAST(DATEDIFF(SECOND, i.sqlserver_start_time, GETDATE()) / 86400 AS nvarchar(10)) + N'd '
+                                                + RIGHT(N'0' + CAST(DATEDIFF(SECOND, i.sqlserver_start_time, GETDATE()) % 86400 / 3600 AS nvarchar(2)), 2) + N'h '
+                                                + RIGHT(N'0' + CAST(DATEDIFF(SECOND, i.sqlserver_start_time, GETDATE()) % 3600 / 60 AS nvarchar(2)), 2) + N'm'),
+    (N'os_boot_time',N'Windows started',        CONVERT(nvarchar(16), DATEADD(SECOND, -CAST(i.ms_ticks / 1000 AS int), GETDATE()), 120)),
+    (N'os_uptime',   N'Windows uptime',         CAST(i.ms_ticks / 1000 / 86400 AS nvarchar(10)) + N'd '
+                                                + RIGHT(N'0' + CAST(i.ms_ticks / 1000 % 86400 / 3600 AS nvarchar(2)), 2) + N'h '
+                                                + RIGHT(N'0' + CAST(i.ms_ticks / 1000 % 3600 / 60 AS nvarchar(2)), 2) + N'm'),
+    (N'cpu_count',   N'Logical CPUs',           CAST(i.cpu_count AS nvarchar(20))),
+    (N'schedulers',  N'Schedulers',             CAST(i.scheduler_count AS nvarchar(20))),
+    (N'memory_mb',   N'Physical memory (MB)',   CAST(i.physical_memory_kb / 1024 AS nvarchar(20))),
+    (N'memory_model',N'Memory model',           CAST(i.sql_memory_model_desc AS nvarchar(4000)))
+) AS v(property_code, property, value);
+
+SELECT N'services' AS _section, servicename, status_desc AS status, startup_type_desc AS startup_type,
+       service_account, ifi, CONVERT(nvarchar(19), last_startup_time, 120) AS last_startup
+FROM #svc ORDER BY servicename;
+
+SELECT N'vitals' AS _section, metric, value, status FROM #vitals ORDER BY seq;
+
+SELECT N'config' AS _section, name, CAST(value_in_use AS nvarchar(100)) AS value_in_use
+FROM sys.configurations ORDER BY name;
+
+SELECT N'traceflags' AS _section, CAST(TraceFlag AS nvarchar(10)) AS trace_flag, CAST(Global AS nvarchar(5)) AS global
+FROM #tf WHERE Global = 1 ORDER BY TraceFlag;
+
+SELECT N'databases' AS _section, d.name, d.state_desc AS state, d.user_access_desc AS user_access,
+       d.recovery_model_desc AS recovery_model, CAST(d.compatibility_level AS nvarchar(5)) AS compat_level,
+       d.owner_name, CAST(sd.is_read_only AS nvarchar(5)) AS is_read_only, sd.page_verify_option_desc AS page_verify,
+       CAST(sd.is_read_committed_snapshot_on AS nvarchar(5)) AS rcsi, sd.snapshot_isolation_state_desc AS snapshot_isolation,
+       CAST(sd.is_encrypted AS nvarchar(5)) AS is_encrypted, CAST(sd.is_broker_enabled AS nvarchar(5)) AS broker,
+       CAST(sd.is_trustworthy_on AS nvarchar(5)) AS trustworthy, CAST(sd.is_query_store_on AS nvarchar(5)) AS query_store,
+       ISNULL(d.ag_name, N'') AS ag_name, d.ag_role, ISNULL(d.ag_sync_state, N'') AS ag_sync_state,
+       CAST(d.size_mb AS nvarchar(30)) AS size_mb, CAST(d.log_used_pct AS nvarchar(10)) AS log_used_pct, d.log_reuse_wait_desc AS log_reuse_wait,
+       CONVERT(nvarchar(16), d.last_full, 120) AS last_full,
+       CASE WHEN CHARINDEX(N'\', REPLACE(d.last_full_path, N'/', N'\')) > 0
+            THEN LEFT(REPLACE(d.last_full_path, N'/', N'\'), LEN(REPLACE(d.last_full_path, N'/', N'\')) - CHARINDEX(N'\', REVERSE(REPLACE(d.last_full_path, N'/', N'\'))))
+            ELSE d.last_full_path END AS last_full_folder,
+       CONVERT(nvarchar(16), d.last_diff, 120) AS last_diff,
+       CONVERT(nvarchar(16), d.last_log, 120) AS last_log,
+       CASE WHEN CHARINDEX(N'\', REPLACE(d.last_log_path, N'/', N'\')) > 0
+            THEN LEFT(REPLACE(d.last_log_path, N'/', N'\'), LEN(REPLACE(d.last_log_path, N'/', N'\')) - CHARINDEX(N'\', REVERSE(REPLACE(d.last_log_path, N'/', N'\'))))
+            ELSE d.last_log_path END AS last_log_folder,
+       CONVERT(nvarchar(16), NULLIF(d.last_checkdb, '19000101'), 120) AS last_checkdb,
+       d.status, d.notes
+FROM #db AS d
+JOIN sys.databases AS sd ON sd.database_id = d.database_id
+ORDER BY d.database_id;
+
+SELECT N'ag_replicas' AS _section, ag_name, replica_node, ISNULL(primary_replica, N'') AS primary_replica, ISNULL(role_desc, N'') AS role,
+       availability_mode_desc AS availability_mode, failover_mode_desc AS failover_mode,
+       ISNULL(connected_state_desc, N'') AS connected_state, ISNULL(synchronization_health_desc, N'') AS sync_health,
+       secondary_role_allow_connections_desc AS readable, ISNULL(endpoint_url, N'') AS endpoint_url,
+       CAST(backup_priority AS nvarchar(5)) AS backup_priority, ISNULL(listeners, N'') AS listeners, status
+FROM #agr ORDER BY ag_name, replica_node;
+
+-- Listener IPs: static or DHCP, subnet, IP resource state (DNN listeners are not listed here)
+SELECT N'ag_listeners' AS _section, ag.name AS ag_name, l.dns_name AS listener, CAST(l.port AS nvarchar(10)) AS port,
+       ISNULL(ip.ip_address, N'') AS ip_address, ISNULL(ip.ip_subnet_mask, N'') AS subnet_mask,
+       CASE ip.is_dhcp WHEN 1 THEN N'DHCP' WHEN 0 THEN N'Static' ELSE N'' END AS ip_type,
+       ISNULL(ip.network_subnet_ip + N'/' + CAST(ip.network_subnet_prefix_length AS nvarchar(5)), N'') AS network_subnet,
+       ISNULL(ip.state_desc, N'') AS ip_state, CAST(l.is_conformant AS nvarchar(5)) AS is_conformant
+FROM sys.availability_group_listeners AS l
+JOIN sys.availability_groups AS ag ON ag.group_id = l.group_id
+LEFT JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id = l.listener_id
+ORDER BY ag.name, l.dns_name, ip.ip_address;
+
+SELECT N'ag_databases' AS _section, ag_name, database_name, replica_node, role,
+       synchronization_state_desc AS sync_state, synchronization_health_desc AS sync_health,
+       CAST(is_suspended AS nvarchar(5)) AS is_suspended,
+       CAST(send_queue_kb AS nvarchar(30)) AS send_queue_kb, CAST(redo_queue_kb AS nvarchar(30)) AS redo_queue_kb, status
+FROM #agdb ORDER BY ag_name, database_name, replica_node;
+
+SELECT N'cluster' AS _section, member_name, cluster_name, quorum_type_desc AS quorum_type, quorum_state_desc AS quorum_state,
+       member_type_desc AS member_type, member_state_desc AS member_state, CAST(number_of_quorum_votes AS nvarchar(5)) AS votes, status
+FROM #cluster ORDER BY member_name;
+
+SELECT N'disks' AS _section, volume, ISNULL(label, N'') AS label, CAST(total_gb AS nvarchar(30)) AS total_gb,
+       CAST(free_gb AS nvarchar(30)) AS free_gb, CAST(free_pct AS nvarchar(10)) AS free_pct, status
+FROM #disk ORDER BY volume;
+
+SELECT N'linked_servers' AS _section, name, ISNULL(product, N'') AS product, ISNULL(provider, N'') AS provider, ISNULL(data_source, N'') AS data_source
+FROM sys.servers WHERE is_linked = 1 ORDER BY name;
+
+SELECT N'endpoints' AS _section, e.name, e.type_desc AS type, e.state_desc AS state, ISNULL(CAST(t.port AS nvarchar(10)), N'') AS port
+FROM sys.endpoints AS e LEFT JOIN sys.tcp_endpoints AS t ON t.endpoint_id = e.endpoint_id
+WHERE e.endpoint_id > 5
+ORDER BY e.name;
+
+SELECT N'certificates' AS _section, name, CONVERT(nvarchar(100), thumbprint, 1) AS thumbprint, CONVERT(nvarchar(10), expiry_date, 120) AS expiry
+FROM master.sys.certificates WHERE name NOT LIKE N'##%' ORDER BY name;
+
+SELECT N'xe_sessions' AS _section, s.name, CASE WHEN r.name IS NULL THEN N'0' ELSE N'1' END AS running
+FROM sys.server_event_sessions AS s LEFT JOIN sys.dm_xe_sessions AS r ON r.name = s.name
+ORDER BY s.name;
+
+SELECT N'job_failures' AS _section, job_name, CONVERT(nvarchar(16), run_time, 120) AS run_time,
+       CAST(step_id AS nvarchar(5)) + N' ' + step_name AS step, message
+FROM #jobs ORDER BY run_time DESC;
+
+SELECT TOP (50) N'errorlog' AS _section, CONVERT(nvarchar(19), LogDate, 120) AS log_time, ProcessInfo AS source, message
+FROM #errlog ORDER BY LogDate DESC;
+
+SELECT N'ssis_catalog' AS _section, property_name, ISNULL(property_value, N'') AS property_value FROM #ssis_cat ORDER BY property_name;
+
+SELECT N'ssis_projects' AS _section, folder, project, CAST(packages AS nvarchar(10)) AS packages,
+       CAST(object_version_lsn AS nvarchar(30)) AS object_version_lsn, ISNULL(last_deployed, N'') AS last_deployed, ISNULL(deployed_by, N'') AS deployed_by
+FROM #ssis_proj ORDER BY folder, project;
+
+SELECT N'ssis_environments' AS _section, folder, environment, CAST(variables AS nvarchar(10)) AS variables
+FROM #ssis_env ORDER BY folder, environment;
+
+SELECT N'ssis_failures' AS _section, CAST(execution_id AS nvarchar(30)) AS execution_id, ISNULL(folder, N'') AS folder, ISNULL(project, N'') AS project,
+       ISNULL(package, N'') AS package, ISNULL(start_time, N'') AS start_time, ISNULL(status, N'') AS status
+FROM #ssis_fail ORDER BY execution_id DESC;
+
+SELECT N'ssrs_summary' AS _section, rs_database, CAST(folders AS nvarchar(10)) AS folders, CAST(reports AS nvarchar(10)) AS reports,
+       CAST(datasources AS nvarchar(10)) AS datasources, CAST(datasets AS nvarchar(10)) AS datasets, CAST(other_items AS nvarchar(10)) AS other_items,
+       CAST(subscriptions AS nvarchar(10)) AS subscriptions, CAST(failing_subscriptions AS nvarchar(10)) AS failing_subscriptions,
+       CAST(schedules AS nvarchar(10)) AS schedules, CAST(failed_executions AS nvarchar(10)) AS failed_executions
+FROM #ssrs_sum ORDER BY rs_database;
+
+SELECT N'ssrs_subscriptions' AS _section, rs_database, subscription_id, ISNULL(report_path, N'') AS report_path, ISNULL(owner, N'') AS owner,
+       ISNULL(description, N'') AS description, CAST(ISNULL(inactive_flags, 0) AS nvarchar(10)) AS inactive_flags,
+       ISNULL(last_status, N'') AS last_status, ISNULL(last_run, N'') AS last_run, CAST(is_failing AS nvarchar(5)) AS is_failing
+FROM #ssrs_sub ORDER BY rs_database, report_path;
+
+SELECT N'issues' AS _section, severity, area, item, ISNULL(detail, N'') AS detail
+FROM #issues ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, area, item;
+GO
 --##PERF_START
 SET NOCOUNT ON;
 DECLARE @p_BptSec int = 5;               -- blocked process threshold (s) during the window
@@ -75,10 +608,10 @@ BEGIN
 ADD EVENT sqlserver.blocked_process_report,
 ADD EVENT sqlserver.xml_deadlock_report,
 ADD EVENT sqlserver.rpc_completed (
-    ACTION (sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
     WHERE duration > #LONG#),
 ADD EVENT sqlserver.sql_batch_completed (
-    ACTION (sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
     WHERE duration > #LONG#)
 ADD TARGET package0.ring_buffer (SET max_memory = 8192, max_events_limit = 2000)
 WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, STARTUP_STATE = OFF);', N'#LONG#', CAST(@p_LongUs AS nvarchar(20)));
@@ -109,6 +642,9 @@ GO
 --##PERF_SAMPLE
 SET NOCOUNT ON;
 DECLARE @p_BptSec int = 5;               -- report sessions blocked at least this long (s)
+DECLARE @p_LongSec int = 5;              -- report requests running longer than this (s)
+DECLARE @p_BigGrantMB int = 1024;        -- report memory grants of at least this size (MB), plus every grant still waiting
+DECLARE @p_TempdbMB int = 500;           -- report sessions using at least this much tempdb (MB)
 SELECT N'sample' AS _section, CONVERT(nvarchar(23), SYSDATETIME(), 121) AS sample_time;
 
 SELECT N'pc' AS _section,
@@ -152,13 +688,97 @@ GROUP BY s.program_name, s.host_name, s.login_name;
 SELECT N'blocking' AS _section, CAST(COUNT(*) AS nvarchar(10)) AS blocked, CAST(ISNULL(MAX(wait_time), 0) AS nvarchar(20)) AS max_wait_ms
 FROM sys.dm_exec_requests WHERE blocking_session_id > 0 AND wait_time >= @p_BptSec * 1000;
 
-SELECT TOP (5) N'blocked_now' AS _section, CONVERT(nvarchar(19), GETDATE(), 120) AS seen_at, CAST(r.session_id AS nvarchar(10)) AS session_id,
-       CAST(r.blocking_session_id AS nvarchar(10)) AS blocked_by, r.wait_type, CAST(r.wait_time / 1000 AS nvarchar(20)) AS wait_s,
-       ISNULL(DB_NAME(r.database_id), N'') AS db, ISNULL(LEFT(t.text, 200), N'') AS sql_text
+-- Problem sessions right now: blocked, waiting on I/O / log / memory / tempdb pages, or long running
+SELECT TOP (25) N'problem_sessions' AS _section, CONVERT(nvarchar(19), GETDATE(), 120) AS seen_at,
+       CASE WHEN r.blocking_session_id > 0 AND r.wait_time >= @p_BptSec * 1000 THEN N'Blocked'
+            WHEN r.wait_type LIKE N'PAGEIOLATCH[_]%' OR r.wait_type IN (N'IO_COMPLETION', N'ASYNC_IO_COMPLETION') THEN N'I/O wait'
+            WHEN r.wait_type = N'WRITELOG' THEN N'Log write wait'
+            WHEN r.wait_type = N'RESOURCE_SEMAPHORE' THEN N'Memory grant wait'
+            WHEN r.wait_type LIKE N'PAGELATCH[_]%' AND r.wait_resource LIKE N'2:%' THEN N'TempDB contention'
+            ELSE N'Long running' END AS reason,
+       CAST(r.session_id AS nvarchar(10)) AS session_id, s.login_name AS login, ISNULL(s.host_name, N'') AS host,
+       ISNULL(s.program_name, N'') AS program, ISNULL(DB_NAME(r.database_id), N'') AS db, r.status, r.command,
+       ISNULL(r.wait_type, N'') AS wait_type, CAST(r.wait_time AS nvarchar(20)) AS wait_ms, ISNULL(r.wait_resource, N'') AS wait_resource,
+       CAST(r.blocking_session_id AS nvarchar(10)) AS blocked_by, CAST(r.total_elapsed_time / 1000 AS nvarchar(20)) AS elapsed_s,
+       CAST(r.cpu_time AS nvarchar(20)) AS cpu_ms, CAST(r.logical_reads AS nvarchar(20)) AS logical_reads, CAST(r.writes AS nvarchar(20)) AS writes,
+       CAST(r.granted_query_memory * 8 / 1024 AS nvarchar(20)) AS granted_mb, CAST(CAST(ISNULL(tu.tempdb_mb, 0) AS decimal(18, 1)) AS nvarchar(20)) AS tempdb_mb,
+       CAST(r.open_transaction_count AS nvarchar(10)) AS open_tran,
+       ISNULL(LEFT(LTRIM(SUBSTRING(t.text, r.statement_start_offset / 2 + 1,
+              (CASE WHEN r.statement_end_offset = -1 THEN DATALENGTH(t.text) ELSE r.statement_end_offset END - r.statement_start_offset) / 2 + 1)), 400), N'') AS statement,
+       ISNULL(OBJECT_NAME(t.objectid, t.dbid), N'') AS object_name
 FROM sys.dm_exec_requests AS r
+JOIN sys.dm_exec_sessions AS s ON s.session_id = r.session_id
 OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
-WHERE r.blocking_session_id > 0 AND r.wait_time >= @p_BptSec * 1000
-ORDER BY r.wait_time DESC;
+OUTER APPLY (SELECT SUM(tsu.user_objects_alloc_page_count - tsu.user_objects_dealloc_page_count
+                        + tsu.internal_objects_alloc_page_count - tsu.internal_objects_dealloc_page_count) * 8 / 1024.0 AS tempdb_mb
+             FROM sys.dm_db_task_space_usage AS tsu WHERE tsu.session_id = r.session_id AND tsu.request_id = r.request_id) AS tu
+WHERE s.is_user_process = 1 AND r.session_id <> @@SPID
+  AND (   (r.blocking_session_id > 0 AND r.wait_time >= @p_BptSec * 1000)
+       OR r.wait_type LIKE N'PAGEIOLATCH[_]%' OR r.wait_type IN (N'IO_COMPLETION', N'ASYNC_IO_COMPLETION', N'WRITELOG', N'RESOURCE_SEMAPHORE')
+       OR (r.wait_type LIKE N'PAGELATCH[_]%' AND r.wait_resource LIKE N'2:%')
+       OR r.total_elapsed_time >= @p_LongSec * 1000)
+ORDER BY CASE WHEN r.blocking_session_id > 0 THEN 0 ELSE 1 END, r.total_elapsed_time DESC;
+
+-- Head blockers: sessions at the top of a blocking chain (not blocked themselves), including SLEEPING
+-- sessions holding an open transaction - then the statement is the last one that session ran
+;WITH b AS (
+    SELECT blocking_session_id AS sid, COUNT(*) AS blocked_sessions, MAX(wait_time) AS max_wait_ms
+    FROM sys.dm_exec_requests WHERE blocking_session_id > 0 AND blocking_session_id <> session_id
+    GROUP BY blocking_session_id HAVING MAX(wait_time) >= @p_BptSec * 1000)
+SELECT TOP (10) N'head_blockers' AS _section, CONVERT(nvarchar(19), GETDATE(), 120) AS seen_at, CAST(b.sid AS nvarchar(10)) AS session_id,
+       s.login_name AS login, ISNULL(s.host_name, N'') AS host, ISNULL(s.program_name, N'') AS program,
+       ISNULL(DB_NAME(COALESCE(r.database_id, s.database_id)), N'') AS db, s.status, CAST(s.open_transaction_count AS nvarchar(10)) AS open_tran,
+       CAST(b.blocked_sessions AS nvarchar(10)) AS blocked_sessions, CAST(b.max_wait_ms / 1000 AS nvarchar(20)) AS max_blocked_s,
+       ISNULL(r.wait_type, N'') AS own_wait, CONVERT(nvarchar(19), s.last_request_end_time, 120) AS last_request_end,
+       CASE WHEN r.session_id IS NULL THEN N'last statement (session idle)' ELSE N'running now' END AS statement_source,
+       ISNULL(LEFT(LTRIM(CASE WHEN r.session_id IS NOT NULL
+                   THEN SUBSTRING(t.text, r.statement_start_offset / 2 + 1,
+                        (CASE WHEN r.statement_end_offset = -1 THEN DATALENGTH(t.text) ELSE r.statement_end_offset END - r.statement_start_offset) / 2 + 1)
+                   ELSE t.text END), 400), N'') AS statement
+FROM b
+JOIN sys.dm_exec_sessions AS s ON s.session_id = b.sid
+LEFT JOIN sys.dm_exec_requests AS r ON r.session_id = b.sid
+OUTER APPLY (SELECT TOP (1) c.most_recent_sql_handle FROM sys.dm_exec_connections AS c WHERE c.session_id = b.sid) AS c
+OUTER APPLY sys.dm_exec_sql_text(COALESCE(r.sql_handle, c.most_recent_sql_handle)) AS t
+WHERE NOT EXISTS (SELECT 1 FROM sys.dm_exec_requests AS r2 WHERE r2.session_id = b.sid AND r2.blocking_session_id > 0 AND r2.blocking_session_id <> r2.session_id)
+ORDER BY b.blocked_sessions DESC;
+
+-- Memory grants: queries waiting for memory, and big grants
+SELECT TOP (10) N'memory_grants' AS _section, CONVERT(nvarchar(19), GETDATE(), 120) AS seen_at, CAST(mg.session_id AS nvarchar(10)) AS session_id,
+       s.login_name AS login, ISNULL(s.program_name, N'') AS program, ISNULL(DB_NAME(r.database_id), N'') AS db,
+       CASE WHEN mg.grant_time IS NULL THEN N'WAITING' ELSE N'granted' END AS grant_state,
+       CAST(mg.requested_memory_kb / 1024 AS nvarchar(20)) AS requested_mb, CAST(ISNULL(mg.granted_memory_kb, 0) / 1024 AS nvarchar(20)) AS granted_mb,
+       CAST(ISNULL(mg.used_memory_kb, 0) / 1024 AS nvarchar(20)) AS used_mb, CAST(ISNULL(mg.wait_time_ms, 0) AS nvarchar(20)) AS wait_ms,
+       CAST(mg.dop AS nvarchar(5)) AS dop,
+       ISNULL(LEFT(LTRIM(SUBSTRING(t.text, ISNULL(r.statement_start_offset, 0) / 2 + 1,
+              (CASE WHEN ISNULL(r.statement_end_offset, -1) = -1 THEN DATALENGTH(t.text) ELSE r.statement_end_offset END - ISNULL(r.statement_start_offset, 0)) / 2 + 1)), 400), N'') AS statement
+FROM sys.dm_exec_query_memory_grants AS mg
+JOIN sys.dm_exec_sessions AS s ON s.session_id = mg.session_id
+LEFT JOIN sys.dm_exec_requests AS r ON r.session_id = mg.session_id AND r.request_id = mg.request_id
+OUTER APPLY sys.dm_exec_sql_text(mg.sql_handle) AS t
+WHERE mg.session_id <> @@SPID AND (mg.grant_time IS NULL OR mg.granted_memory_kb >= @p_BigGrantMB * 1024)
+ORDER BY CASE WHEN mg.grant_time IS NULL THEN 0 ELSE 1 END, mg.requested_memory_kb DESC;
+
+-- TempDB consumers: allocated by finished tasks (session) + running tasks
+SELECT TOP (10) N'tempdb_sessions' AS _section, CONVERT(nvarchar(19), GETDATE(), 120) AS seen_at, CAST(u.session_id AS nvarchar(10)) AS session_id,
+       s.login_name AS login, ISNULL(s.host_name, N'') AS host, ISNULL(s.program_name, N'') AS program,
+       CAST(CAST(u.user_mb AS decimal(18, 1)) AS nvarchar(20)) AS user_objects_mb, CAST(CAST(u.internal_mb AS decimal(18, 1)) AS nvarchar(20)) AS internal_objects_mb,
+       s.status, ISNULL(LEFT(LTRIM(t.text), 400), N'') AS statement
+FROM (SELECT session_id, SUM(user_pages) * 8 / 1024.0 AS user_mb, SUM(internal_pages) * 8 / 1024.0 AS internal_mb
+      FROM (SELECT session_id, user_objects_alloc_page_count - user_objects_dealloc_page_count AS user_pages,
+                   internal_objects_alloc_page_count - internal_objects_dealloc_page_count AS internal_pages
+            FROM sys.dm_db_session_space_usage
+            UNION ALL
+            SELECT session_id, user_objects_alloc_page_count - user_objects_dealloc_page_count,
+                   internal_objects_alloc_page_count - internal_objects_dealloc_page_count
+            FROM sys.dm_db_task_space_usage) AS x
+      GROUP BY session_id) AS u
+JOIN sys.dm_exec_sessions AS s ON s.session_id = u.session_id AND s.is_user_process = 1
+LEFT JOIN sys.dm_exec_requests AS r ON r.session_id = u.session_id
+OUTER APPLY (SELECT TOP (1) c.most_recent_sql_handle FROM sys.dm_exec_connections AS c WHERE c.session_id = u.session_id) AS c
+OUTER APPLY sys.dm_exec_sql_text(COALESCE(r.sql_handle, c.most_recent_sql_handle)) AS t
+WHERE u.user_mb + u.internal_mb >= @p_TempdbMB
+ORDER BY u.user_mb + u.internal_mb DESC;
 
 SELECT N'tempdb' AS _section,
        CAST(CAST(SUM(user_object_reserved_page_count)     * 8 / 1024.0 AS decimal(18, 1)) AS nvarchar(30)) AS user_mb,
@@ -228,11 +848,34 @@ SELECT N'xe_deadlocks' AS _section,
 FROM #xe WHERE ev.value('(event/@name)[1]', 'nvarchar(60)') = N'xml_deadlock_report'
 ORDER BY event_time;
 
+-- Every process in every deadlock (SPID, login, host, app, isolation, lock wait, statement)
+SELECT N'xe_deadlock_procs' AS _section,
+       CONVERT(nvarchar(19), DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), x.ev.value('(event/@timestamp)[1]', 'datetime2')), 120) AS event_time,
+       CASE WHEN p.n.value('@id', 'nvarchar(50)') = x.ev.value('(event/data[@name="xml_report"]/value/deadlock/victim-list/victimProcess/@id)[1]', 'nvarchar(50)')
+            THEN N'VICTIM' ELSE N'' END AS victim,
+       ISNULL(p.n.value('@spid', 'nvarchar(10)'), N'') AS session_id, ISNULL(p.n.value('@loginname', 'nvarchar(128)'), N'') AS login,
+       ISNULL(p.n.value('@hostname', 'nvarchar(128)'), N'') AS host, ISNULL(p.n.value('@clientapp', 'nvarchar(128)'), N'') AS app,
+       ISNULL(DB_NAME(p.n.value('@currentdb', 'int')), N'') AS db, ISNULL(p.n.value('@isolationlevel', 'nvarchar(60)'), N'') AS isolation,
+       ISNULL(p.n.value('@lockMode', 'nvarchar(20)'), N'') AS lock_mode, ISNULL(p.n.value('@waitresource', 'nvarchar(200)'), N'') AS wait_resource,
+       ISNULL(LEFT(LTRIM(p.n.value('(inputbuf)[1]', 'nvarchar(max)')), 400), N'') AS statement
+FROM #xe AS x
+CROSS APPLY x.ev.nodes('event/data[@name="xml_report"]/value/deadlock/process-list/process') AS p(n)
+WHERE x.ev.value('(event/@name)[1]', 'nvarchar(60)') = N'xml_deadlock_report'
+ORDER BY event_time;
+
+-- Full deadlock graphs: the script saves each one as a .xdl file (opens as a diagram in SSMS)
+SELECT TOP (20) N'xe_deadlock_xml' AS _section,
+       CONVERT(nvarchar(19), DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), ev.value('(event/@timestamp)[1]', 'datetime2')), 120) AS event_time,
+       CAST(ev.query('event/data[@name="xml_report"]/value/deadlock') AS nvarchar(max)) AS deadlock_xml
+FROM #xe WHERE ev.value('(event/@name)[1]', 'nvarchar(60)') = N'xml_deadlock_report'
+ORDER BY event_time;
+
 SELECT TOP (200) N'xe_long' AS _section,
        CONVERT(nvarchar(19), DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), ev.value('(event/@timestamp)[1]', 'datetime2')), 120) AS end_time,
        CAST(CAST(ev.value('(event/data[@name="duration"]/value)[1]', 'bigint') / 1000000.0 AS decimal(18, 1)) AS nvarchar(30)) AS duration_s,
        CAST(ev.value('(event/data[@name="cpu_time"]/value)[1]', 'bigint') / 1000 AS nvarchar(30)) AS cpu_ms,
        CAST(ev.value('(event/data[@name="logical_reads"]/value)[1]', 'bigint') AS nvarchar(30)) AS logical_reads,
+       ISNULL(ev.value('(event/action[@name="session_id"]/value)[1]', 'nvarchar(10)'), N'') AS session_id,
        ISNULL(ev.value('(event/action[@name="database_name"]/value)[1]', 'nvarchar(128)'), N'') AS db,
        ISNULL(ev.value('(event/action[@name="client_app_name"]/value)[1]', 'nvarchar(128)'), N'') AS app,
        ISNULL(ev.value('(event/action[@name="client_hostname"]/value)[1]', 'nvarchar(128)'), N'') AS host,
