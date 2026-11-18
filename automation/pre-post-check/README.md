@@ -22,6 +22,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
 **One report and one email per VM.** All instances on the VM go into a single HTML file, `Reports\<VM>_<PRE|POST>_<ticket>_<time>.html`. It opens with a summary table (one row per instance), followed by each instance's section. A single email is sent through the first instance that has working Database Mail, local instances first:
 - The **email body** has the summary plus each instance's differences / new problems.
 - The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the report goes in the email body instead, **without the data / log file list**, which stays in the report file on the VM (its path is given in the email).
+- If Database Mail is disabled or has no profile on an instance, the script runs **`db_mail_setup.sql`** (your setup script, kept next to the `.ps1`) on that instance and checks again. Its batches are split on `GO` and its `PRINT` messages go to the console and log. It needs sysadmin, and SQLCMD-mode lines (`:setvar`, `:r`, `:connect`) aren't supported. If the file is missing or the script fails, the run carries on. Turn this off with `AutoSetupDbMail = $false` in `$Config`.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
 Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
@@ -33,6 +34,7 @@ Snapshots (JSON) and reports stay on the VM as evidence. The report and email do
 | `Run-PrePostCheck.bat` | Double-click this. Starts the Secondary Logon service if needed, then runs the PowerShell script. |
 | `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. All settings are in `$Config` at the top. |
 | `HC_Snapshot.sql` | All the checks, run on every instance. |
+| `db_mail_setup.sql` | *Optional, your own file.* Run automatically on an instance where Database Mail is disabled or not configured. |
 
 Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\` (HTML) and `Logs\`.
 
