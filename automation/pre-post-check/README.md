@@ -21,7 +21,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
 
 **One report and one email per VM.** All instances on the VM go into a single HTML file, `Reports\<VM>_<PRE|POST>_<ticket>_<time>.html`. It opens with a summary table (one row per instance), followed by each instance's section. A single email is sent through the first instance that has working Database Mail, local instances first:
 - The **email body** has the summary plus each instance's differences / new problems.
-- The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the whole report goes in the email body instead.
+- The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the report goes in the email body instead, **without the data / log file list**, which stays in the report file on the VM (its path is given in the email).
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
 Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
@@ -64,7 +64,7 @@ If POST finds no PRE for that ticket, it offers the **latest PRE for that instan
 | Instance | edition, collation, FCI/HADR, active node, CPUs, memory, memory model. **SQL Server uptime and Windows uptime** are shown side by side (not compared) | build, CU, KB, product level, SQL start time, Windows boot time |
 | Services | status, startup type, service account, IFI | last start time |
 | sp_configure / trace flags | every value, global flags added or removed | |
-| Databases | state, user access, recovery model, compat level, owner, read-only, page verify, RCSI, snapshot isolation, TDE, broker, trustworthy, Query Store, AG name/role/sync state, full and log backup **folders** | size changes within tolerance |
+| Databases | state, user access, recovery model, compat level, owner, read-only, page verify, RCSI, snapshot isolation, TDE, broker, trustworthy, Query Store, AG name/role/sync state | size changes within tolerance |
 | Always On | each replica's role, **primary replica**, commit/failover mode, connected, health, readable, endpoint, backup priority, listeners; **listener IPs**: static or **DHCP**, subnet mask, network subnet, IP state, port (DNN listeners don't appear here); each DB's role, sync state, health and suspended flag on every replica | |
 | Cluster | quorum type/state, member type/state, votes | |
 | Disks / files | disk size, file paths, type, state, growth, max size | free space and size changes within tolerance |
