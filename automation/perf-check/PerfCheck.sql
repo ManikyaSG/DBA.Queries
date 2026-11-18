@@ -300,6 +300,7 @@ BEGIN TRY
     FROM msdb.dbo.sysjobhistory AS h
     JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
     WHERE h.run_status = 0 AND h.step_id > 0 AND h.run_date > 0
+      AND h.step_name <> N'AG role check - continue only on the primary'   -- skips on secondaries on purpose
       AND DATETIMEFROMPARTS(h.run_date / 10000, h.run_date / 100 % 100, h.run_date % 100, h.run_time / 10000, h.run_time / 100 % 100, h.run_time % 100, 0) >= DATEADD(HOUR, -@JobFailHours, @now);
 END TRY
 BEGIN CATCH

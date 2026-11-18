@@ -79,11 +79,11 @@ RETURNS nvarchar(max)
 AS
 BEGIN
     IF @v IS NULL RETURN N'';
-    DECLARE @i int = 1;
-    WHILE @i < 32
+    DECLARE @i int = 0;
+    WHILE @i < 32          -- control characters 0-31 (except tab, LF, CR) are not allowed in XML
     BEGIN
-        IF @i NOT IN (9, 10, 13) AND CHARINDEX(NCHAR(@i), @v COLLATE Latin1_General_BIN) > 0
-            SET @v = REPLACE(@v COLLATE Latin1_General_BIN, NCHAR(@i), N' ');
+        IF @i NOT IN (9, 10, 13) AND CHARINDEX(NCHAR(@i) COLLATE Latin1_General_BIN, @v COLLATE Latin1_General_BIN) > 0
+            SET @v = REPLACE(@v COLLATE Latin1_General_BIN, NCHAR(@i) COLLATE Latin1_General_BIN, N' ');
         SET @i += 1;
     END;
     RETURN REPLACE(REPLACE(REPLACE(@v, N'&', N'&amp;'), N'<', N'&lt;'), N'>', N'&gt;');
@@ -106,7 +106,7 @@ ALTER PROCEDURE dbo.usp_DBA_HtmlTable
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @sql nvarchar(max) = REPLACE(REPLACE(N'SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_WARNINGS ON; SET ARITHABORT ON;
+    DECLARE @sql nvarchar(max) = CAST(N'SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_WARNINGS ON; SET ARITHABORT ON;
 SELECT ROW_NUMBER() OVER (ORDER BY {ORDER}) AS _rn, q.* INTO #r FROM ({QUERY}) AS q;
 DECLARE @n int = @@ROWCOUNT;
 IF @n = 0
@@ -138,7 +138,8 @@ FROM #r WHERE @max = 0 OR _rn <= @max ORDER BY _rn FOR XML PATH(''''''''), TYPE)
 EXEC sys.sp_executesql @sql2, N''@rows nvarchar(max) OUTPUT, @max int'', @rows OUTPUT, @max;
 SET @html = N''<h3>'' + dbo.fn_DBA_Html(@title) + N'' ('' + CAST(@n AS nvarchar(10)) + N'')</h3><table><tr>'' + @hdr + N''</tr>'' + ISNULL(@rows, N'''') + N''</table>''
           + CASE WHEN @max > 0 AND @n > @max THEN N''<div style="color:#555">First '' + CAST(@max AS nvarchar(10)) + N'' of '' + CAST(@n AS nvarchar(10)) + N'' rows - run the procedure with @SendEmail = 0 for all.</div>'' ELSE N'''' END;
-', N'{ORDER}', @OrderBy), N'{QUERY}', @Query);
+' AS nvarchar(max));   -- (max) first: REPLACE on a shorter type cuts the result at 4000 characters
+    SET @sql = REPLACE(REPLACE(@sql, N'{ORDER}', @OrderBy), N'{QUERY}', @Query);
     SET @Html = N'';
     BEGIN TRY
         EXEC sys.sp_executesql @sql, N'@title nvarchar(400), @status sysname, @max int, @skip bit, @html nvarchar(max) OUTPUT',
@@ -438,6 +439,7 @@ BEGIN
         FROM msdb.dbo.sysjobhistory AS h
         JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
         WHERE h.run_status = 0 AND h.step_id > 0 AND h.run_date > 0
+          AND h.step_name <> N'AG role check - continue only on the primary'   -- skips on secondaries on purpose
           AND DATETIMEFROMPARTS(h.run_date / 10000, h.run_date / 100 % 100, h.run_date % 100, h.run_time / 10000, h.run_time / 100 % 100, h.run_time % 100, 0) >= DATEADD(HOUR, -@JobFailHours, @now);
     END TRY
     BEGIN CATCH
