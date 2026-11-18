@@ -12,7 +12,7 @@ For **every SQL Server instance on the VM**: a **health check** (including SSIS 
 
 ## Health check (once, at the start)
 
-Instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery model, compat, owner, size, log use, last full / diff / log backup, last CHECKDB, AG role), Always On replicas, listeners (IP, static / DHCP) and databases per replica, cluster and quorum, disk space, failed job steps (24 h), severe error log entries (24 h), sp_configure, trace flags, linked servers, endpoints, certificates, XE sessions, **SSIS** (catalog settings, projects, environments, failed executions 24 h), **SSRS** (content and subscriptions of the report server databases on the instance), and once for the VM the **SSIS / SSRS / SSAS services** and **SSAS databases**. Problems go into a *Needs attention* table per instance.
+Instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery model, compat, owner, size, log use, last full / diff / log backup, AG role), Always On replicas, listeners (IP, static / DHCP) and databases per replica, cluster and quorum, disk space, failed job steps (24 h), severe error log entries (24 h), sp_configure, trace flags, linked servers, endpoints, certificates, XE sessions, **SSIS** (catalog settings, projects, environments, failed executions 24 h), **SSRS** (content and subscriptions of the report server databases on the instance), and once for the VM the **SSIS / SSRS / SSAS services** and **SSAS databases**. Problems go into a *Needs attention* table per instance.
 
 **Not included:** the data / log file list, the Agent job list, logins and server role members.
 
