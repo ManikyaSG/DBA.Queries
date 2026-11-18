@@ -32,6 +32,7 @@ The same check as [`automation/perf-check`](../perf-check/README.md), written en
 | `@SampleSec`, `@DurationMin` | performance window; the job runs about `@DurationMin` + 1 minutes |
 | `@PerfDatabases` | e.g. `N'MARS,CLR'` for Transactions/sec; NULL = all databases |
 | `@NoPerf` | 1 = health check only |
+| `@PrimaryOnly` | 1 = add step 1, the AG role check (run only on the primary); 0 = every replica runs the check |
 | `@Schedule` | `DAILY`, `WEEKLY` (with `@WeekDays = 'Mon,Wed,Fri'`), `ONCE` (with `@OnceDate`) or `NONE` (run on demand) |
 | `@StartTime` | `HH:mm`, server time |
 | `@JobOwner` | NULL = `sa` (found by SID, works when `sa` is renamed or disabled) |
@@ -39,7 +40,12 @@ The same check as [`automation/perf-check`](../perf-check/README.md), written en
 
 Run the job now: `EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check';`
 
-On an **Always On** VM, install and create the job on **every replica**. The job only reports the instance it runs on, so there's one email per instance (the PowerShell version combines all instances on a VM into one email). Send/redo queues of every replica are only visible on the primary.
+**Always On:** install PART 1 and create the job on **every replica**. With `@PrimaryOnly = 1` (default) the job has two steps:
+
+1. **AG role check:** carries on if the instance has no availability group, is **primary** for at least one, or an AG is **resolving** (no primary, so an outage is never silent). If it is **secondary for every AG**, the step stops the job on purpose: the job ends as **succeeded**, no email, and the step history says *Skipped: … is a SECONDARY replica …*.
+2. **The check** (`dbo.usp_DBA_HealthPerfCheck`).
+
+After a failover the new primary starts reporting on its own; nothing to change. The primary's report shows every replica's sync state, send and redo queues. Instance-level health of the secondaries (their disks, services, error log, blocking) is **not** checked in this mode; set `@PrimaryOnly = 0` to create the job without step 1, and every replica then reports itself. The job reports only the instance it runs on (the PowerShell version combines all instances on a VM into one email).
 
 ## What it changes on the server - and puts back
 

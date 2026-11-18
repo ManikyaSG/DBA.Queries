@@ -1607,8 +1607,13 @@ GO
 
 /*=============================================================================
   PART 2 - CREATE THE SQL AGENT JOB  (set the parameters, then run this part)
-  Creates or replaces the job with one T-SQL step that runs the procedure and a
-  schedule. The job runs as its owner (sa by default), so it has all permissions.
+  Creates or replaces the job and a schedule. Steps:
+    1. AG role check (when @PrimaryOnly = 1): continues if this instance has no
+       availability group, is PRIMARY for at least one, or an AG is RESOLVING (no
+       primary); if it is SECONDARY for every AG it stops - the job ends as
+       succeeded, no email. After a failover the new primary takes over by itself.
+    2. The health & performance check (dbo.usp_DBA_HealthPerfCheck).
+  The job runs as its owner (sa by default), so it has all permissions.
   Run it now:  EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check';
 =============================================================================*/
 USE [msdb];
@@ -1625,6 +1630,9 @@ DECLARE
     @DurationMin     int           = 30,                           -- performance window: minutes (job runs about this long)
     @PerfDatabases   nvarchar(max) = NULL,                         -- e.g. N'MARS,CLR' for Trans/s; NULL = all
     @NoPerf          bit           = 0,                            -- 1 = health check only (job takes ~1 min)
+    @PrimaryOnly     bit           = 1,                            -- 1 = step 1 checks the AG role: run only where this instance is primary
+                                                                   --     for at least one AG (or has no AG); on a secondary-only instance
+                                                                   --     the job ends as succeeded without running. Install on every replica.
     @Schedule        varchar(10)   = 'DAILY',                      -- DAILY | WEEKLY | ONCE | NONE (no schedule, run on demand)
     @StartTime       char(5)       = '06:00',                      -- HH:mm, server local time
     @WeekDays        varchar(60)   = 'Mon,Wed,Fri',                -- WEEKLY only
@@ -1682,6 +1690,30 @@ END;
 IF @NotifyOperator IS NOT NULL
     EXEC dbo.sp_update_job @job_id = @jobId, @notify_level_email = 2, @notify_email_operator_name = @NotifyOperator;
 
+IF @PrimaryOnly = 1
+BEGIN
+    DECLARE @agCmd nvarchar(max) = N'SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+-- Step 1: run the check only on the primary replica (or when there is no AG / no primary)
+IF CAST(SERVERPROPERTY(''IsHadrEnabled'') AS int) = 1
+   AND EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1)
+   AND NOT EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1 AND role_desc <> N''SECONDARY'')
+BEGIN
+    DECLARE @m nvarchar(2000) = N''Skipped: '' + @@SERVERNAME + N'' is a SECONDARY replica for every availability group (''
+        + STUFF((SELECT N'', '' + ag.name FROM sys.availability_groups AS ag ORDER BY ag.name FOR XML PATH('''')), 1, 2, N'''')
+        + N''). The primary replica runs the check. The job ends as succeeded.'';
+    RAISERROR(N''%s'', 16, 1, @m);   -- step 1 "fails" on purpose -> the job quits reporting success
+END
+ELSE
+    PRINT N''Proceeding: '' + @@SERVERNAME + CASE WHEN EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1)
+                                             THEN N'' is PRIMARY (or RESOLVING) for at least one availability group.'' ELSE N'' has no availability group.'' END;';
+    EXEC dbo.sp_add_jobstep
+         @job_id = @jobId, @step_id = 1, @step_name = N'AG role check - continue only on the primary', @subsystem = N'TSQL',
+         @database_name = N'master', @command = @agCmd,
+         @on_success_action = 3,   -- go to the next step
+         @on_fail_action = 1,      -- secondary: quit the job reporting success
+         @retry_attempts = 0;
+END;
+
 EXEC dbo.sp_add_jobstep
      @job_id = @jobId, @step_name = N'Health & performance check', @subsystem = N'TSQL',
      @database_name = @ProcDatabase, @command = @cmd, @on_success_action = 1, @on_fail_action = 2, @retry_attempts = 0;
@@ -1710,6 +1742,6 @@ EXEC dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)';
 
 PRINT N'Job created: ' + @JobName + N' (' + CASE WHEN @Schedule = 'NONE' THEN N'no schedule' ELSE @Schedule + N' at ' + @StartTime
       + CASE WHEN @Schedule = 'WEEKLY' THEN N' on ' + @WeekDays WHEN @Schedule = 'ONCE' THEN N' on ' + CONVERT(nvarchar(10), @OnceDate, 120) ELSE N'' END END + N').';
-PRINT N'Step command:' + NCHAR(13) + NCHAR(10) + @cmd;
+PRINT CASE WHEN @PrimaryOnly = 1 THEN N'Step 1: AG role check (runs step 2 only on the primary). ' ELSE N'' END + N'Check step command:' + NCHAR(13) + NCHAR(10) + @cmd;
 PRINT N'Run it now: EXEC msdb.dbo.sp_start_job @job_name = N''' + @JobName + N''';';
 GO
