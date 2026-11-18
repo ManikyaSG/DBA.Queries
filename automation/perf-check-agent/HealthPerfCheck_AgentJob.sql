@@ -183,7 +183,7 @@ SET XACT_ABORT OFF;
 SET ANSI_WARNINGS ON; SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET ANSI_PADDING ON; SET NUMERIC_ROUNDABORT OFF;
 
 DECLARE @p_runStart datetime = GETDATE(), @p_err nvarchar(4000) = NULL, @p_notes nvarchar(max) = N'',
-        @p_hFull nvarchar(max) = N'', @p_hShort nvarchar(max) = N'', @p_pFull nvarchar(max) = N'', @p_pShort nvarchar(max) = N'',
+        @p_hFull nvarchar(max) = N'', @p_hShort nvarchar(max) = N'', @p_pFull nvarchar(max) = N'', @p_pShort nvarchar(max) = N'', @p_pMid nvarchar(max) = N'',
         @p_part nvarchar(max), @p_hCrit int = 0, @p_hWarn int = 0, @p_pCrit int = 0, @p_pWarn int = 0, @p_intervals int = 0;
 
 IF @SendEmail = 1 AND NULLIF(LTRIM(@Recipients), N'') IS NULL
@@ -1340,14 +1340,16 @@ BEGIN
     SET @p_pFull = N'<h2>Performance window: ' + CONVERT(nvarchar(16), (SELECT MIN(t) FROM #s_time), 120) + N' - '
                  + CONVERT(nvarchar(5), (SELECT MAX(t) FROM #s_time), 108) + N' (' + CAST(@p_intervals AS nvarchar(10)) + N' intervals of '
                  + CAST(@SampleSec AS nvarchar(10)) + N' s)</h2>';
-    SET @p_pShort = @p_pFull;
+    SET @p_pShort = @p_pFull; SET @p_pMid = @p_pFull;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT severity, area, item, detail, CASE severity WHEN ''CRITICAL'' THEN 0 ELSE 1 END AS _o FROM #pissues',
          @Title = N'Performance - needs attention', @OrderBy = N'_o, area, item', @StatusColumn = N'severity', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     SET @p_pShort += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT _seq, area, metric, [avg], [min], [max] FROM #psum',
          @Title = N'Performance summary for the window', @OrderBy = N'_seq', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     SET @p_pShort += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen, COUNT(*) AS samples, session_id, MAX(login) AS login, MAX(host) AS host,
        MAX(program) AS program, MAX(db) AS db, MAX(status) AS status, MAX(open_tran) AS open_tran, MAX(blocked_sessions) AS blocked_sessions,
@@ -1355,6 +1357,7 @@ BEGIN
 FROM #s_head GROUP BY session_id, statement',
          @Title = N'Head blockers (top of each blocking chain)', @OrderBy = N'max_blocked_s DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen, COUNT(*) AS samples, session_id, MAX(login) AS login, MAX(host) AS host,
        MAX(program) AS program, MAX(db) AS db, MAX(status) AS status, MAX(open_tran) AS open_tran, MAX(blocked_sessions) AS blocked_sessions,
        MAX(max_blocked_s) AS max_blocked_s, MAX(statement_source) AS statement_source, statement
@@ -1369,6 +1372,7 @@ FROM #s_head GROUP BY session_id, statement',
 FROM #s_prob GROUP BY session_id, reason, statement',
          @Title = N'Problem sessions (blocked, I/O / log / memory / tempdb waits, long running)', @OrderBy = N'max_elapsed_s DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen, COUNT(*) AS samples, reason, session_id, MAX(login) AS login,
        MAX(host) AS host, MAX(program) AS program, MAX(db) AS db, MAX(command) AS command, MAX(wait_type) AS wait_type, MAX(wait_ms) AS max_wait_ms,
        MAX(wait_resource) AS wait_resource, MAX(blocked_by) AS blocked_by, MAX(elapsed_s) AS max_elapsed_s, MAX(cpu_ms) AS max_cpu_ms,
@@ -1383,11 +1387,13 @@ FROM #s_prob GROUP BY session_id, reason, statement',
 FROM #s_grant GROUP BY session_id, statement',
          @Title = N'Memory grants (waiting, or big)', @OrderBy = N'requested_mb DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen, COUNT(*) AS samples, session_id, MAX(login) AS login, MAX(host) AS host,
        MAX(program) AS program, MAX(user_objects_mb) AS user_objects_mb, MAX(internal_objects_mb) AS internal_objects_mb, statement
 FROM #s_tdbs GROUP BY session_id, statement',
          @Title = N'TempDB users', @OrderBy = N'user_objects_mb DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT n AS _n, CONVERT(char(8), t, 108) AS [time], batch_s AS [batch req/s], tx_s AS [trans/s], comp_s AS [compiles/s], recomp_s AS [recompiles/s],
        user_conn AS [user conns], lock_waits_s AS [lock waits/s], lock_wait_ms_s AS [lock wait ms/s], lock_timeouts_s AS [lock timeouts/s],
        deadlocks_s AS [deadlocks/s], blocked AS [blocked], max_block_s AS [max block s], ple AS [PLE s], buffer_hit_pct AS [buffer hit %],
@@ -1408,6 +1414,7 @@ WHERE p.obj = N''Databases'' AND p.ctr = N''Transactions/sec'' AND p.inst NOT IN
 GROUP BY p.inst ORDER BY AVG(p.d / i.dt) DESC',
          @Title = N'Transactions/sec per database', @OrderBy = N'[avg trans/s] DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT b.db AS [database], b.ftype AS file_type, b.reads - a.reads AS reads,
        CAST((b.rstall - a.rstall) * 1.0 / NULLIF(b.reads - a.reads, 0) AS decimal(18, 1)) AS [avg read ms],
        b.writes - a.writes AS writes, CAST((b.wstall - a.wstall) * 1.0 / NULLIF(b.writes - a.writes, 0) AS decimal(18, 1)) AS [avg write ms]
@@ -1415,11 +1422,13 @@ FROM #s_io AS b JOIN #s_io AS a ON a.db = b.db AND a.ftype = b.ftype AND a.n = 0
 WHERE b.n = (SELECT MAX(n) FROM #s_time) AND b.reads >= a.reads AND b.writes >= a.writes AND (b.reads - a.reads) + (b.writes - a.writes) > 0',
          @Title = N'Data / log file latency in the window', @OrderBy = N'CASE WHEN ISNULL([avg read ms], 0) > ISNULL([avg write ms], 0) THEN [avg read ms] ELSE [avg write ms] END DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (15) program, host, login, MAX(sessions) AS [peak sessions],
        CAST(SUM(sessions) * 1.0 / (SELECT COUNT(*) FROM #s_time) AS decimal(18, 1)) AS [avg sessions], MAX(active) AS [peak active]
 FROM #s_sess GROUP BY program, host, login ORDER BY MAX(sessions) DESC',
          @Title = N'Connection pool usage (sessions per application / host / login)', @OrderBy = N'[peak sessions] DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT CASE WHEN EXISTS (SELECT 1 FROM #s_ag AS x WHERE x.ag_name = g.ag_name AND x.db = g.db AND x.replica = g.replica
                                        AND x.sync_state NOT IN (N''SYNCHRONIZED'', N''SYNCHRONIZING'', N'''')) THEN ''CRITICAL'' ELSE '''' END AS status,
        g.ag_name, g.db AS [database], g.replica,
@@ -1432,25 +1441,31 @@ FROM #s_sess GROUP BY program, host, login ORDER BY MAX(sessions) DESC',
 FROM #s_ag AS g GROUP BY g.ag_name, g.db, g.replica',
          @Title = N'Always On during the window', @OrderBy = N'ag_name, [database], replica', @StatusColumn = N'status', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT listener, ip, MIN(connections) AS [min conns], CAST(AVG(connections * 1.0) AS decimal(18, 1)) AS [avg conns], MAX(connections) AS [max conns]
 FROM #s_lsn GROUP BY listener, ip',
          @Title = N'Listener connections', @OrderBy = N'listener, ip', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (50) * FROM #x_blocked ORDER BY blocked_s DESC',
          @Title = N'Blocked process reports (XE)', @OrderBy = N'blocked_s DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT deadlock_no, event_time, processes FROM #x_dl',
          @Title = N'Deadlocks', @OrderBy = N'deadlock_no', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT * FROM #x_dlproc',
          @Title = N'Deadlock processes', @OrderBy = N'deadlock_no, victim DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (10) deadlock_no, CONVERT(nvarchar(max), deadlock_graph) AS deadlock_xml FROM #x_dl ORDER BY deadlock_no',
          @Title = N'Deadlock graphs - copy a graph into a .xdl file to see the diagram in SSMS', @OrderBy = N'deadlock_no', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (200) * FROM #x_long ORDER BY duration_s DESC',
          @Title = N'Queries over the long-query limit (XE)', @OrderBy = N'duration_s DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     SET @p_pFull += N'<div style="color:#555;margin-top:12px">Top queries = plan cache (sys.dm_exec_query_stats) at the end of the window minus the start, grouped by query_hash ('
                   + CAST(@pf_cached AS nvarchar(20)) + N' cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted; those over '
                   + CAST(@LongQuerySec AS nvarchar(10)) + N' s are in the list above.</div>';
@@ -1458,14 +1473,17 @@ FROM #s_lsn GROUP BY listener, ip',
 FROM #qtx WHERE rn_d <= 20',
          @Title = N'Top 20 queries in the window by duration', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, executions, total_cpu_ms, total_duration_ms, total_logical_reads, query_text, rn_c AS _r
 FROM #qtx WHERE rn_c <= 20',
          @Title = N'Top 20 queries in the window by CPU', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, executions, total_logical_reads, total_duration_ms, total_cpu_ms, query_text, rn_r AS _r
 FROM #qtx WHERE rn_r <= 20',
          @Title = N'Top 20 queries in the window by logical reads', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
+    SET @p_pMid += @p_part;
 END;
 
 /*#############################################################################
@@ -1473,7 +1491,8 @@ END;
 #############################################################################*/
 DECLARE @r_tag varchar(10), @r_head nvarchar(max), @r_full nvarchar(max), @r_short nvarchar(max), @r_subject nvarchar(255),
         @r_file nvarchar(260), @r_query nvarchar(max), @r_max bigint = 0, @r_mailId int, @r_how nvarchar(200), @r_crit int, @r_warn int,
-        @r_imp varchar(6), @r_body nvarchar(max);
+        @r_imp varchar(6), @r_body nvarchar(max), @r_compact nvarchar(max), @r_try int = 1, @r_rc int, @r_att nvarchar(max), @r_kind nvarchar(100),
+        @r_note nvarchar(max);
 SET @r_crit = @p_hCrit + @p_pCrit; SET @r_warn = @p_hWarn + @p_pWarn;
 SET @r_tag = CASE WHEN @r_crit > 0 THEN 'CRITICAL' WHEN @r_warn > 0 THEN 'WARNING' ELSE 'OK' END;
 SET @r_imp = CASE WHEN @r_tag = 'CRITICAL' THEN 'High' ELSE 'Normal' END;   -- EXEC parameters can't be expressions
@@ -1499,6 +1518,14 @@ table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#f
 td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
 </style></head><body>' + @r_head + @p_hShort + @p_pShort;
+SET @r_compact = N'<html><head><style>
+body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
+h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
+table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
+td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
+.banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
+</style></head><body>' + @r_head + @p_hFull + @p_pMid
+               + N'<p style="color:#555">Compact report: the per-interval tables and the deadlock graph XML were left out to fit Database Mail''s attachment limit.</p></body></html>';
 SET @r_subject = N'[' + @r_tag + N'] SQL Server Health & Performance Check [' + @Label + N'] - ' + @@SERVERNAME;
 SET @r_file = REPLACE(REPLACE(@@SERVERNAME, N'\', N'_'), N',', N'_') + N'_HEALTHPERF_' + @Label + N'_' + FORMAT(@p_runStart, 'yyyyMMdd_HHmm') + N'.html';
 
@@ -1522,34 +1549,50 @@ IF @MailProfile IS NULL
 SELECT @r_max = CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';
 
 SET @r_mailId = NULL;
-IF @AttachReport = 1 AND (@r_max <= 0 OR LEN(@r_full) <= @r_max)
+-- Attach the full report; if Database Mail rejects it, try the compact report; else send the summary only.
+-- sp_send_dbmail can reject a query attachment WITHOUT raising a catchable error, so the return code is checked too.
+WHILE @AttachReport = 1 AND @r_mailId IS NULL AND @r_try <= 2
 BEGIN
-    BEGIN TRY
-        -- the report is attached as a query result (works for every login; no file on disk needed)
-        -- varchar result = plain (ANSI) text file, which every browser opens correctly
-        SET @r_query = N'SET NOCOUNT ON; SELECT CAST(N''' + REPLACE(@r_full, N'''', N'''''') + N''' AS varchar(max));';
-        SET @r_body = @r_short + N'<p style="color:#555">The full report (all sections, per-interval tables and query lists) is attached: ' + @r_file + N'</p></body></html>';
-        EXEC msdb.dbo.sp_send_dbmail
-             @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
-             @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body,
-             @query = @r_query, @execute_query_database = N'master', @attach_query_result_as_file = 1, @query_attachment_filename = @r_file,
-             @query_result_header = 0, @query_no_truncate = 1, @query_result_no_padding = 1, @exclude_query_output = 1,
-             @mailitem_id = @r_mailId OUTPUT;
-        SET @r_how = N'with the report attached';
-    END TRY
-    BEGIN CATCH
-        SET @r_how = N'attachment failed (' + ERROR_MESSAGE() + N')';
-        SET @r_mailId = NULL;
-    END CATCH;
-END
-ELSE IF @AttachReport = 1
-    SET @r_how = N'report is ' + CAST(LEN(@r_full) / 1024 AS nvarchar(20)) + N' KB, above Database Mail MaxFileSize (' + CAST(@r_max / 1024 AS nvarchar(20))
-               + N' KB) - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB)';
+    SET @r_att  = CASE WHEN @r_try = 1 THEN @r_full ELSE @r_compact END;
+    SET @r_kind = CASE WHEN @r_try = 1 THEN N'full report' ELSE N'compact report' END;
+    IF @r_max > 0 AND LEN(@r_att) > @r_max
+        SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' is ' + CAST(LEN(@r_att) / 1024 AS nvarchar(20)) + N' KB, above Database Mail MaxFileSize ('
+                   + CAST(@r_max / 1024 AS nvarchar(20)) + N' KB)';
+    ELSE
+    BEGIN
+        BEGIN TRY
+            -- the report is attached as a query result (works for every login; no file on disk needed);
+            -- varchar result = plain (ANSI) text file, which every browser opens correctly
+            SET @r_query = N'SET NOCOUNT ON; SELECT CAST(N''' + REPLACE(@r_att, N'''', N'''''') + N''' AS varchar(max));';
+            SET @r_body = @r_short + N'<p style="color:#555">The ' + @r_kind + N' (all sections' + CASE WHEN @r_try = 1 THEN N', per-interval tables and query lists' ELSE N' except the per-interval tables' END
+                        + N') is attached: ' + @r_file + N'</p></body></html>';
+            SET @r_rc = NULL;
+            EXEC @r_rc = msdb.dbo.sp_send_dbmail
+                 @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
+                 @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body,
+                 @query = @r_query, @execute_query_database = N'master', @attach_query_result_as_file = 1, @query_attachment_filename = @r_file,
+                 @query_result_header = 0, @query_no_truncate = 1, @query_result_no_padding = 1, @exclude_query_output = 1,
+                 @mailitem_id = @r_mailId OUTPUT;
+            IF ISNULL(@r_rc, 1) <> 0 OR @r_mailId IS NULL
+            BEGIN
+                SET @r_mailId = NULL;
+                SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' (' + CAST(LEN(@r_att) / 1024 AS nvarchar(20)) + N' KB) rejected by Database Mail (return code '
+                           + ISNULL(CAST(@r_rc AS nvarchar(10)), N'none') + N', MaxFileSize ' + CAST(@r_max / 1024 AS nvarchar(20)) + N' KB - the reason is in the job step messages)';
+            END
+            ELSE SET @r_how = N'with the ' + @r_kind + N' attached (' + CAST(LEN(@r_att) / 1024 AS nvarchar(20)) + N' KB)';
+        END TRY
+        BEGIN CATCH
+            SET @r_mailId = NULL;
+            SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' failed: ' + ERROR_MESSAGE();
+        END CATCH;
+    END;
+    SET @r_try += 1;
+END;
 
 IF @r_mailId IS NULL
 BEGIN
     -- summary only (the per-section tables of the email body are still included)
-    DECLARE @r_note nvarchar(max) = N'<p style="color:#a94442">Full report not attached: ' + dbo.fn_DBA_Html(ISNULL(@r_how, N'@AttachReport = 0')) + N'. '
+    SET @r_note = N'<p style="color:#a94442">Report not attached: ' + dbo.fn_DBA_Html(ISNULL(@r_how, N'@AttachReport = 0')) + N'. '
         + N'Run EXEC ' + DB_NAME() + N'.dbo.usp_DBA_HealthPerfCheck @SendEmail = 0 in SSMS to see it.</p></body></html>';
     SET @r_body = @r_short + @r_note;
     EXEC msdb.dbo.sp_send_dbmail
