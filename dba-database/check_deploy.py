@@ -59,7 +59,7 @@ def main(path):
         if fb:
             defs.append(lex(b[fb.start() + len('@fallback_definition = '):])[1][0])
         for k, d in enumerate(defs):
-            if not re.match(r'CREATE OR ALTER (VIEW|FUNCTION|PROCEDURE) dbo\.' + name + r'\b', d):
+            if not re.match(r'ALTER (VIEW|FUNCTION|PROCEDURE) dbo\.' + name + r'\b', d):
                 errors.append(f'{name}: definition {k} does not create dbo.{name}')
             ok, inner, depth, why = lex(d)
             if not ok or depth:
@@ -71,6 +71,8 @@ def main(path):
                 ok, _, depth, why = lex(body)
                 if not ok or depth:
                     errors.append(f'{name} dynamic body: {why or "paren balance %d" % depth}')
+    if re.search(r'\bCREATE OR ALTER\b', re.sub(r"N?'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/", '', txt, flags=re.S)):
+        errors.append('CREATE OR ALTER used outside object definitions (not available before 2016 SP1)')
     print(f'{count} objects checked, {len(errors)} problems')
     for e in errors: print('  ' + e)
     return 1 if errors else 0

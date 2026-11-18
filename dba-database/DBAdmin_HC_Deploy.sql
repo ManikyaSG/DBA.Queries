@@ -15,7 +15,8 @@
              Install on EVERY AG replica (DBAdmin is a local database - keep it out of AGs).
            * Azure SQL Database  : connect to the user database you want it in and run
                                    the script there (the USE below errors harmlessly).
- Safe to  : re-run any time. Every object is CREATE OR ALTER inside TRY/CATCH, so one
+ Safe to  : re-run any number of times. Every object is IF NOT EXISTS -> create placeholder,
+            then ALTER, inside TRY/CATCH (works on every 2016 build), so one
             failure never stops the rest. Objects that need a newer version or another
             platform are skipped and listed in dbo.HC_catalog with the reason.
  Security : objects run with the CALLER's permissions. Users still need
@@ -50,22 +51,35 @@ GO
   Registry + deploy helper
 ----------------------------------------------------------------------------*/
 IF OBJECT_ID(N'dbo.HC_objects', N'U') IS NULL
-CREATE TABLE dbo.HC_objects
-(
-    name          sysname        NOT NULL CONSTRAINT PK_HC_objects PRIMARY KEY,
-    section       varchar(10)    NOT NULL,
-    source_file   nvarchar(128)  NOT NULL,
-    title         nvarchar(400)  NOT NULL,
-    tags          varchar(30)    NOT NULL,
-    usage         nvarchar(1000) NOT NULL,
-    sort_hint     nvarchar(1000) NULL,
-    status        varchar(30)    NOT NULL,
-    message       nvarchar(4000) NULL,
-    deployed_at   datetime2(0)   NOT NULL CONSTRAINT DF_HC_objects_deployed DEFAULT SYSDATETIME()
-);
+BEGIN
+    CREATE TABLE dbo.HC_objects
+    (
+        name          sysname        NOT NULL CONSTRAINT PK_HC_objects PRIMARY KEY,
+        section       varchar(10)    NOT NULL,
+        source_file   nvarchar(128)  NOT NULL,
+        title         nvarchar(400)  NOT NULL,
+        tags          varchar(30)    NOT NULL,
+        usage         nvarchar(1000) NOT NULL,
+        sort_hint     nvarchar(1000) NULL,
+        status        varchar(30)    NOT NULL,
+        message       nvarchar(4000) NULL,
+        deployed_at   datetime2(0)   NOT NULL CONSTRAINT DF_HC_objects_deployed DEFAULT SYSDATETIME()
+    );
+    PRINT 'Created table dbo.HC_objects.';
+END;
 GO
 
-CREATE OR ALTER PROCEDURE dbo.HC_usp_deploy
+-- Remember when this run started; the end of the script drops objects that an earlier
+-- run installed but this version of the toolkit no longer contains.
+DECLARE @hc_run_start datetime2(0) = SYSDATETIME();
+EXEC sys.sp_set_session_context @key = N'hc_run_start', @value = @hc_run_start;
+GO
+
+IF OBJECT_ID(N'dbo.HC_usp_deploy', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_usp_deploy AS RETURN;');
+GO
+
+ALTER PROCEDURE dbo.HC_usp_deploy
     @name                sysname,
     @section             varchar(10),
     @source_file         nvarchar(128),
@@ -74,7 +88,7 @@ CREATE OR ALTER PROCEDURE dbo.HC_usp_deploy
     @usage               nvarchar(1000),
     @sort_hint           nvarchar(1000) = NULL,
     @min_version         int            = NULL,   -- SQL Server major version: 13=2016 14=2017 15=2019 16=2022 17=2025
-    @definition          nvarchar(max),
+    @definition          nvarchar(max),            -- 'ALTER VIEW|FUNCTION|PROCEDURE dbo.HC_x ...'
     @fallback_definition nvarchar(max)  = NULL
 AS
 SET NOCOUNT ON;
@@ -82,6 +96,7 @@ DECLARE @platform varchar(5) =
         CASE CAST(SERVERPROPERTY('EngineEdition') AS int) WHEN 5 THEN 'SQLDB' WHEN 8 THEN 'MI' ELSE 'BOX' END;
 DECLARE @status varchar(30), @msg nvarchar(4000), @fq nvarchar(300) = N'dbo.' + QUOTENAME(@name),
         @want char(2), @have char(2), @try nvarchar(max), @attempt int = 1, @errno int,
+        @stub nvarchar(400), @created bit,
         @major int = CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int);
 
 IF (@tags <> '' AND CHARINDEX(@platform, @tags) = 0)
@@ -92,7 +107,7 @@ BEGIN
     ELSE
         SELECT @status = 'NOT ON THIS VERSION',
                @msg = N'Needs major version ' + CAST(@min_version AS nvarchar(5)) + N'+; this is ' + CAST(@major AS nvarchar(5)) + N'.';
-    IF OBJECT_ID(@fq) IS NOT NULL
+    IF OBJECT_ID(@fq) IS NOT NULL      -- installed by an earlier run on a different platform/version
     BEGIN
         SET @try = N'DROP ' + CASE (SELECT type FROM sys.objects WHERE object_id = OBJECT_ID(@fq))
                                 WHEN 'V' THEN N'VIEW' WHEN 'P' THEN N'PROCEDURE' ELSE N'FUNCTION' END + N' ' + @fq;
@@ -104,16 +119,28 @@ BEGIN
     SET @try = @definition;
     WHILE @try IS NOT NULL
     BEGIN
-        SET @want = CASE WHEN @try LIKE N'CREATE OR ALTER VIEW%'     THEN 'V'
-                         WHEN @try LIKE N'CREATE OR ALTER FUNCTION%' THEN 'IF'
-                         ELSE 'P' END;
+        SELECT @want = CASE WHEN @try LIKE N'ALTER VIEW%'     THEN 'V'
+                            WHEN @try LIKE N'ALTER FUNCTION%' THEN 'IF'
+                            ELSE 'P' END,
+               @created = 0;
         BEGIN TRY
+            -- IF EXISTS with a different type (e.g. was a view, now a procedure): drop it first
             SELECT @have = type FROM sys.objects WHERE object_id = OBJECT_ID(@fq);
             IF @have IS NOT NULL AND RTRIM(@have) <> RTRIM(@want)
             BEGIN
                 DECLARE @drop nvarchar(400) = N'DROP ' + CASE RTRIM(@have) WHEN 'V' THEN N'VIEW' WHEN 'P' THEN N'PROCEDURE'
                                                           ELSE N'FUNCTION' END + N' ' + @fq;
                 EXEC sys.sp_executesql @drop;
+            END;
+            -- IF NOT EXISTS: create an empty placeholder, then ALTER it into the real object
+            IF OBJECT_ID(@fq) IS NULL
+            BEGIN
+                SET @stub = CASE @want
+                    WHEN 'V'  THEN N'CREATE VIEW ' + @fq + N' AS SELECT 1 AS placeholder;'
+                    WHEN 'IF' THEN N'CREATE FUNCTION ' + @fq + N'() RETURNS TABLE AS RETURN (SELECT 1 AS placeholder);'
+                    ELSE           N'CREATE PROCEDURE ' + @fq + N' AS RETURN;' END;
+                EXEC sys.sp_executesql @stub;
+                SET @created = 1;
             END;
             EXEC sys.sp_executesql @try;
             SELECT @status = CASE WHEN @attempt = 1 THEN 'OK' ELSE 'OK (as procedure)' END,
@@ -123,6 +150,11 @@ BEGIN
         BEGIN CATCH
             SELECT @msg = CASE WHEN @msg IS NULL THEN N'' ELSE @msg + N' | ' END + ERROR_MESSAGE(),
                    @errno = ERROR_NUMBER();
+            IF @created = 1 AND OBJECT_ID(@fq) IS NOT NULL      -- don't leave an empty placeholder behind
+            BEGIN
+                SET @stub = N'DROP ' + CASE @want WHEN 'V' THEN N'VIEW' WHEN 'IF' THEN N'FUNCTION' ELSE N'PROCEDURE' END + N' ' + @fq;
+                EXEC sys.sp_executesql @stub;
+            END;
             IF @attempt = 1 AND @fallback_definition IS NOT NULL
                 SELECT @try = @fallback_definition, @attempt = 2;
             ELSE      -- 207/208/195/4121 on older builds = column/function/syntax the version lacks
@@ -152,7 +184,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_version;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_version
+    @definition = N'ALTER VIEW dbo.HC_version
 AS
 -- Toolkit 00_instance_overview.sql section 0.1: VERSION, EDITION, PATCH LEVEL
 SELECT
@@ -170,7 +202,7 @@ SELECT
     SERVERPROPERTY(''Collation'')              AS server_collation,
     @@VERSION                                AS full_version;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_version
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_version
 AS
 -- Toolkit 00_instance_overview.sql section 0.1: VERSION, EDITION, PATCH LEVEL
 SET NOCOUNT ON;
@@ -198,7 +230,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_uptime_hardware;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_uptime_hardware
+    @definition = N'ALTER VIEW dbo.HC_uptime_hardware
 AS
 -- Toolkit 00_instance_overview.sql section 0.2: UPTIME + HARDWARE (CPU / MEMORY / NUMA)
 SELECT
@@ -219,7 +251,7 @@ SELECT
     affinity_type_desc
 FROM sys.dm_os_sys_info;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_uptime_hardware
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_uptime_hardware
 AS
 -- Toolkit 00_instance_overview.sql section 0.2: UPTIME + HARDWARE (CPU / MEMORY / NUMA)
 SET NOCOUNT ON;
@@ -250,13 +282,13 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_host_os;',
     @min_version = 14,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_host_os
+    @definition = N'ALTER VIEW dbo.HC_host_os
 AS
 -- Toolkit 00_instance_overview.sql section 0.3: HOST OS INFO (2017+)
 SELECT host_platform, host_distribution, host_release, host_service_pack_level, host_sku
 FROM sys.dm_os_host_info;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_host_os
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_host_os
 AS
 -- Toolkit 00_instance_overview.sql section 0.3: HOST OS INFO (2017+)
 SET NOCOUNT ON;
@@ -272,7 +304,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_instance_settings;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_instance_settings
+    @definition = N'ALTER PROCEDURE dbo.HC_instance_settings
 AS
 -- Toolkit 00_instance_overview.sql section 0.4: KEY INSTANCE SETTINGS (sp_configure)
 SET NOCOUNT ON;
@@ -303,7 +335,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_db_scoped_config @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_db_scoped_config
+    @definition = N'ALTER PROCEDURE dbo.HC_db_scoped_config
     @database_name sysname = NULL
 AS
 -- Toolkit 00_instance_overview.sql section 0.5: DATABASE-SCOPED CONFIGURATION (current DB)
@@ -327,7 +359,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_trace_flags;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_trace_flags
+    @definition = N'ALTER PROCEDURE dbo.HC_trace_flags
 AS
 -- Toolkit 00_instance_overview.sql section 0.6: GLOBAL TRACE FLAGS
 SET NOCOUNT ON;
@@ -343,7 +375,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_services;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_services
+    @definition = N'ALTER PROCEDURE dbo.HC_services
 AS
 -- Toolkit 00_instance_overview.sql section 0.7: SQL SERVICES, ACCOUNTS, IFI
 SET NOCOUNT ON;
@@ -366,7 +398,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_database_properties ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY d.name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_database_properties
+    @definition = N'ALTER VIEW dbo.HC_database_properties
 AS
 -- Toolkit 00_instance_overview.sql section 0.8: ALL DATABASES - PROPERTIES AT A GLANCE
 SELECT
@@ -383,7 +415,7 @@ SELECT
     d.create_date
 FROM sys.databases AS d;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_database_properties
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_database_properties
 AS
 -- Toolkit 00_instance_overview.sql section 0.8: ALL DATABASES - PROPERTIES AT A GLANCE
 SET NOCOUNT ON;
@@ -411,7 +443,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_database_sizes ORDER BY total_gb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY total_gb DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_database_sizes
+    @definition = N'ALTER VIEW dbo.HC_database_sizes
 AS
 -- Toolkit 00_instance_overview.sql section 0.9: DATABASE SIZES (data / log)
 SELECT
@@ -422,7 +454,7 @@ SELECT
 FROM sys.master_files AS mf
 GROUP BY mf.database_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_database_sizes
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_database_sizes
 AS
 -- Toolkit 00_instance_overview.sql section 0.9: DATABASE SIZES (data / log)
 SET NOCOUNT ON;
@@ -444,7 +476,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_connection_counts ORDER BY sessions DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sessions DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_connection_counts
+    @definition = N'ALTER VIEW dbo.HC_connection_counts
 AS
 -- Toolkit 00_instance_overview.sql section 0.10: CONNECTION COUNTS BY DB / LOGIN / HOST / APP
 SELECT DB_NAME(s.database_id) AS database_name, s.login_name, s.host_name, s.program_name,
@@ -454,7 +486,7 @@ FROM sys.dm_exec_sessions AS s
 WHERE s.is_user_process = 1
 GROUP BY DB_NAME(s.database_id), s.login_name, s.host_name, s.program_name;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_connection_counts
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_connection_counts
 AS
 -- Toolkit 00_instance_overview.sql section 0.10: CONNECTION COUNTS BY DB / LOGIN / HOST / APP
 SET NOCOUNT ON;
@@ -475,7 +507,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_waits;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY w.rn',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_top_waits
+    @definition = N'ALTER VIEW dbo.HC_top_waits
 AS
 -- Toolkit 01_wait_stats.sql section 1.1: TOP WAITS SINCE RESTART (benign waits filtered)
 WITH waits AS (
@@ -532,7 +564,7 @@ SELECT
 FROM waits AS w
 WHERE w.rn <= 25;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_top_waits
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_top_waits
 AS
 -- Toolkit 01_wait_stats.sql section 1.1: TOP WAITS SINCE RESTART (benign waits filtered)
 SET NOCOUNT ON;
@@ -600,7 +632,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_waits_delta @delay = ''00:01:00'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_waits_delta
+    @definition = N'ALTER PROCEDURE dbo.HC_waits_delta
     @delay char(8) = ''00:01:00''
 AS
 -- Toolkit 01_wait_stats.sql section 1.2: WAITS RIGHT NOW - DELTA OVER N SECONDS
@@ -640,7 +672,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_waiting_tasks ORDER BY wait_duration_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wt.wait_duration_ms DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_waiting_tasks
+    @definition = N'ALTER VIEW dbo.HC_waiting_tasks
 AS
 -- Toolkit 01_wait_stats.sql section 1.3: WHO IS WAITING ON WHAT - LIVE
 SELECT
@@ -655,7 +687,7 @@ LEFT JOIN sys.dm_exec_requests AS r ON r.session_id = wt.session_id
 OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
 WHERE s.is_user_process = 1;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_waiting_tasks
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_waiting_tasks
 AS
 -- Toolkit 01_wait_stats.sql section 1.3: WHO IS WAITING ON WHAT - LIVE
 SET NOCOUNT ON;
@@ -681,7 +713,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_session_waits(DEFAULT) ORDER BY wait_time_ms DESC;  -- @spid = 55',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wait_time_ms DESC',
-    @definition = N'CREATE OR ALTER FUNCTION dbo.HC_session_waits
+    @definition = N'ALTER FUNCTION dbo.HC_session_waits
 (
     @spid int = 55
 )
@@ -695,7 +727,7 @@ FROM sys.dm_exec_session_wait_stats
 WHERE session_id = @spid
 );
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_session_waits
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_session_waits
     @spid int = 55
 AS
 -- Toolkit 01_wait_stats.sql section 1.4: WAIT STATS FOR ONE SESSION (2016+)
@@ -714,7 +746,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_signal_waits;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_signal_waits
+    @definition = N'ALTER VIEW dbo.HC_signal_waits
 AS
 -- Toolkit 01_wait_stats.sql section 1.5: SIGNAL WAIT % (CPU PRESSURE INDICATOR)
 SELECT
@@ -723,7 +755,7 @@ SELECT
 FROM sys.dm_os_wait_stats
 WHERE wait_time_ms > 0;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_signal_waits
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_signal_waits
 AS
 -- Toolkit 01_wait_stats.sql section 1.5: SIGNAL WAIT % (CPU PRESSURE INDICATOR)
 SET NOCOUNT ON;
@@ -742,7 +774,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_latch_stats ORDER BY wait_time_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_latch_stats
+    @definition = N'ALTER VIEW dbo.HC_latch_stats
 AS
 -- Toolkit 01_wait_stats.sql section 1.6: LATCH STATS (non-buffer latches)
 SELECT TOP (15) latch_class, waiting_requests_count, wait_time_ms, max_wait_time_ms,
@@ -751,7 +783,7 @@ FROM sys.dm_os_latch_stats
 WHERE latch_class NOT IN (N''BUFFER'')
 ORDER BY wait_time_ms DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_latch_stats
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_latch_stats
 AS
 -- Toolkit 01_wait_stats.sql section 1.6: LATCH STATS (non-buffer latches)
 SET NOCOUNT ON;
@@ -770,7 +802,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_active_sessions ORDER BY elapsed_s DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY r.total_elapsed_time DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_active_sessions
+    @definition = N'ALTER VIEW dbo.HC_active_sessions
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.1: ACTIVE REQUESTS ("sp_who2 on steroids")
 SELECT
@@ -800,7 +832,7 @@ OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) AS qp
 WHERE s.is_user_process = 1
   AND r.session_id <> @@SPID;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_active_sessions
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_active_sessions
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.1: ACTIVE REQUESTS ("sp_who2 on steroids")
 SET NOCOUNT ON;
@@ -841,7 +873,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_live_plan @spid = 55;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_live_plan
+    @definition = N'ALTER PROCEDURE dbo.HC_live_plan
     @spid int = 55
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.2: LIVE (IN-FLIGHT) ACTUAL PLAN FOR A SESSION 2016 SP1+
@@ -865,7 +897,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_blocking_tree;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_blocking_tree
+    @definition = N'ALTER PROCEDURE dbo.HC_blocking_tree
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.3: BLOCKING TREE (head blocker at top, victims indented)
 SET NOCOUNT ON;
@@ -923,7 +955,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_blocking_summary ORDER BY sessions_blocked DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sessions_blocked DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_blocking_summary
+    @definition = N'ALTER VIEW dbo.HC_blocking_summary
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.4: QUICK BLOCKING SUMMARY (how many victims per blocker)
 SELECT r.blocking_session_id      AS blocker,
@@ -934,7 +966,7 @@ FROM sys.dm_exec_requests AS r
 WHERE r.blocking_session_id > 0
 GROUP BY r.blocking_session_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_blocking_summary
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_blocking_summary
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.4: QUICK BLOCKING SUMMARY (how many victims per blocker)
 SET NOCOUNT ON;
@@ -956,7 +988,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_open_transactions;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_open_transactions
+    @definition = N'ALTER PROCEDURE dbo.HC_open_transactions
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.5: OPEN TRANSACTIONS (oldest first) - log growth / blocking culprits
 SET NOCOUNT ON;
@@ -993,7 +1025,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_sleeping_open_trans ORDER BY last_request_end_time;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY s.last_request_end_time',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_sleeping_open_trans
+    @definition = N'ALTER VIEW dbo.HC_sleeping_open_trans
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.6: SLEEPING SESSIONS HOLDING OPEN TRANSACTIONS (forgotten COMMITs)
 SELECT s.session_id, s.login_name, s.host_name, s.program_name,
@@ -1005,7 +1037,7 @@ OUTER APPLY sys.dm_exec_input_buffer(s.session_id, NULL) AS ib
 WHERE s.status = ''sleeping''
   AND s.open_transaction_count > 0;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sleeping_open_trans
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_sleeping_open_trans
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.6: SLEEPING SESSIONS HOLDING OPEN TRANSACTIONS (forgotten COMMITs)
 SET NOCOUNT ON;
@@ -1028,7 +1060,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_connection_details ORDER BY connect_time;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY c.connect_time',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_connection_details
+    @definition = N'ALTER VIEW dbo.HC_connection_details
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.7: CONNECTION DETAILS (IP, protocol, encryption, auth)
 SELECT c.session_id, s.login_name, s.host_name, s.program_name,
@@ -1038,7 +1070,7 @@ SELECT c.session_id, s.login_name, s.host_name, s.program_name,
 FROM sys.dm_exec_connections AS c
 JOIN sys.dm_exec_sessions    AS s ON s.session_id = c.session_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_connection_details
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_connection_details
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.7: CONNECTION DETAILS (IP, protocol, encryption, auth)
 SET NOCOUNT ON;
@@ -1059,7 +1091,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_last_sql_by_session(DEFAULT);  -- @spid = 55',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER FUNCTION dbo.HC_last_sql_by_session
+    @definition = N'ALTER FUNCTION dbo.HC_last_sql_by_session
 (
     @spid int = 55
 )
@@ -1071,7 +1103,7 @@ RETURN
 SELECT event_type, parameters, event_info FROM sys.dm_exec_input_buffer(@spid, NULL)
 );
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_last_sql_by_session
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_last_sql_by_session
     @spid int = 55
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.8: LAST SQL SENT BY A SESSION
@@ -1087,7 +1119,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_rollback_progress;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_rollback_progress
+    @definition = N'ALTER VIEW dbo.HC_rollback_progress
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.9: ROLLBACK / KILL PROGRESS
 SELECT session_id, command, status, percent_complete,
@@ -1097,7 +1129,7 @@ FROM sys.dm_exec_requests
 WHERE command IN (''KILLED/ROLLBACK'', ''ROLLBACK TRANSACTION'')
    OR status = ''rollback'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_rollback_progress
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_rollback_progress
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.9: ROLLBACK / KILL PROGRESS
 SET NOCOUNT ON;
@@ -1117,7 +1149,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_generate_kill_head_blockers;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_generate_kill_head_blockers
+    @definition = N'ALTER VIEW dbo.HC_generate_kill_head_blockers
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.10: GENERATE KILL FOR HEAD BLOCKERS (review before running!)
 SELECT DISTINCT ''KILL '' + CAST(r.blocking_session_id AS varchar(10)) + '';'' AS kill_cmd
@@ -1126,7 +1158,7 @@ WHERE r.blocking_session_id > 0
   AND r.blocking_session_id NOT IN (SELECT session_id FROM sys.dm_exec_requests
                                     WHERE blocking_session_id > 0);
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_generate_kill_head_blockers
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_generate_kill_head_blockers
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.10: GENERATE KILL FOR HEAD BLOCKERS (review before running!)
 SET NOCOUNT ON;
@@ -1145,7 +1177,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_top_queries @sort_by = ''CPU'', @top = 25;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_top_queries
+    @definition = N'ALTER PROCEDURE dbo.HC_top_queries
     @sort_by varchar(10) = ''CPU'',
     @top int = 25
 AS
@@ -1195,7 +1227,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_procedures ORDER BY total_cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_top_procedures
+    @definition = N'ALTER VIEW dbo.HC_top_procedures
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.2: TOP STORED PROCEDURES
 SELECT TOP (25)
@@ -1210,7 +1242,7 @@ SELECT TOP (25)
 FROM sys.dm_exec_procedure_stats AS ps
 ORDER BY ps.total_worker_time DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_top_procedures
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_top_procedures
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.2: TOP STORED PROCEDURES
 SET NOCOUNT ON;
@@ -1235,7 +1267,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_query_hash ORDER BY total_cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_top_query_hash
+    @definition = N'ALTER VIEW dbo.HC_top_query_hash
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.3: TOP QUERIES AGGREGATED BY query_hash
 SELECT TOP (25)
@@ -1250,7 +1282,7 @@ CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS t
 GROUP BY qs.query_hash
 ORDER BY total_cpu_ms DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_top_query_hash
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_top_query_hash
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.3: TOP QUERIES AGGREGATED BY query_hash
 SET NOCOUNT ON;
@@ -1275,7 +1307,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_param_sniffing_suspects;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_param_sniffing_suspects
+    @definition = N'ALTER VIEW dbo.HC_param_sniffing_suspects
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.4: PARAMETER SNIFFING SUSPECTS (large min/max variance)
 SELECT TOP (25)
@@ -1296,7 +1328,7 @@ WHERE qs.execution_count > 10
   AND qs.max_logical_reads > 10 * (qs.min_logical_reads + 1)
 ORDER BY qs.max_logical_reads - qs.min_logical_reads DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_param_sniffing_suspects
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_param_sniffing_suspects
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.4: PARAMETER SNIFFING SUSPECTS (large min/max variance)
 SET NOCOUNT ON;
@@ -1327,7 +1359,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_find_query_in_cache(DEFAULT) ORDER BY last_execution_time DESC;  -- @search_text = N''%YourTableOrProcName%''',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER FUNCTION dbo.HC_find_query_in_cache
+    @definition = N'ALTER FUNCTION dbo.HC_find_query_in_cache
 (
     @search_text nvarchar(200) = N''%YourTableOrProcName%''
 )
@@ -1348,7 +1380,7 @@ WHERE t.text LIKE @search_text
 ORDER BY qs.last_execution_time DESC
 );
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_find_query_in_cache
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_find_query_in_cache
     @search_text nvarchar(200) = N''%YourTableOrProcName%''
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.5: FIND A QUERY IN CACHE BY TEXT
@@ -1373,7 +1405,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_plan_cache_bloat ORDER BY total_mb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY total_mb DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_plan_cache_bloat
+    @definition = N'ALTER VIEW dbo.HC_plan_cache_bloat
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.6: PLAN CACHE COMPOSITION & SINGLE-USE PLAN BLOAT
 SELECT cp.objtype, cp.cacheobjtype,
@@ -1384,7 +1416,7 @@ SELECT cp.objtype, cp.cacheobjtype,
 FROM sys.dm_exec_cached_plans AS cp
 GROUP BY cp.objtype, cp.cacheobjtype;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_plan_cache_bloat
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_plan_cache_bloat
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.6: PLAN CACHE COMPOSITION & SINGLE-USE PLAN BLOAT
 SET NOCOUNT ON;
@@ -1406,7 +1438,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_plan_warnings ORDER BY total_cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_plan_warnings
+    @definition = N'ALTER VIEW dbo.HC_plan_warnings
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.7: PLANS WITH IMPLICIT CONVERSIONS / MISSING INDEX / WARNINGS
 WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
@@ -1426,7 +1458,7 @@ WHERE qp.query_plan.exist(''//PlanAffectingConvert'') = 1
    OR qp.query_plan.exist(''//Warnings'') = 1
 ORDER BY qs.total_worker_time DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_plan_warnings
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_plan_warnings
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.7: PLANS WITH IMPLICIT CONVERSIONS / MISSING INDEX / WARNINGS
 SET NOCOUNT ON;
@@ -1456,7 +1488,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_compilations;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_compilations
+    @definition = N'ALTER VIEW dbo.HC_compilations
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.8: RECOMPILES / COMPILATIONS RATE
 SELECT counter_name, cntr_value
@@ -1464,7 +1496,7 @@ FROM sys.dm_os_performance_counters
 WHERE object_name LIKE N''%SQL Statistics%''
   AND counter_name IN (N''Batch Requests/sec'', N''SQL Compilations/sec'', N''SQL Re-Compilations/sec'');
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_compilations
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_compilations
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.8: RECOMPILES / COMPILATIONS RATE
 SET NOCOUNT ON;
@@ -1482,7 +1514,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_status @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_status
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_status
     @database_name sysname = NULL
 AS
 -- Toolkit 04_query_store.sql section 4.1: QUERY STORE STATUS - CURRENT DB
@@ -1510,12 +1542,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_qs_status_all_dbs ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_qs_status_all_dbs
+    @definition = N'ALTER VIEW dbo.HC_qs_status_all_dbs
 AS
 -- Toolkit 04_query_store.sql section 4.2: QUERY STORE STATUS - ALL DATABASES
 SELECT name, is_query_store_on FROM sys.databases WHERE database_id > 4;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_status_all_dbs
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_qs_status_all_dbs
 AS
 -- Toolkit 04_query_store.sql section 4.2: QUERY STORE STATUS - ALL DATABASES
 SET NOCOUNT ON;
@@ -1530,7 +1562,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_top_queries @database_name = N''YourDB'', @hours = 24, @metric = ''CPU'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_top_queries
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_top_queries
     @database_name sysname = NULL,
     @hours int = 24,
     @metric varchar(10) = ''CPU''
@@ -1587,7 +1619,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_regressed @database_name = N''YourDB'', @recent_hours = 4, @history_days = 7;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_regressed
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_regressed
     @database_name sysname = NULL,
     @recent_hours int = 4,
     @history_days int = 7
@@ -1640,7 +1672,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_multi_plan @database_name = N''YourDB'', @query_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_multi_plan
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_multi_plan
     @database_name sysname = NULL,
     @query_id bigint = 1
 AS
@@ -1696,7 +1728,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_forced_plans @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_forced_plans
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_forced_plans
     @database_name sysname = NULL
 AS
 -- Toolkit 04_query_store.sql section 4.6: FORCED PLANS & FORCING FAILURES
@@ -1724,7 +1756,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_wait_categories @database_name = N''YourDB'', @hours = 24;',
     @min_version = 14,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_wait_categories
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_wait_categories
     @database_name sysname = NULL,
     @hours int = 24
 AS
@@ -1754,7 +1786,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_hints @database_name = N''YourDB'';',
     @min_version = 16,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_hints
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_hints
     @database_name sysname = NULL
 AS
 -- Toolkit 04_query_store.sql section 4.8: QUERY STORE HINTS (2022+, Azure SQL DB, MI)
@@ -1778,7 +1810,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_find_query @database_name = N''YourDB'', @search_text = N''%YourText%'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_qs_find_query
+    @definition = N'ALTER PROCEDURE dbo.HC_qs_find_query
     @database_name sysname = NULL,
     @search_text nvarchar(400) = N''%YourText%''
 AS
@@ -1805,7 +1837,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_missing_indexes;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_missing_indexes
+    @definition = N'ALTER PROCEDURE dbo.HC_missing_indexes
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.1: MISSING INDEXES - ALL DATABASES, WITH CREATE STATEMENT
 SET NOCOUNT ON;
@@ -1838,7 +1870,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_usage @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_index_usage
+    @definition = N'ALTER PROCEDURE dbo.HC_index_usage
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.2: INDEX USAGE - CURRENT DB (reads vs writes, size)
@@ -1877,7 +1909,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_unused_indexes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_unused_indexes
+    @definition = N'ALTER PROCEDURE dbo.HC_unused_indexes
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.3: UNUSED / WRITE-ONLY NONCLUSTERED INDEXES - CURRENT DB
@@ -1916,7 +1948,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_duplicate_indexes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_duplicate_indexes
+    @definition = N'ALTER PROCEDURE dbo.HC_duplicate_indexes
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.4: DUPLICATE & OVERLAPPING INDEXES - CURRENT DB
@@ -1971,7 +2003,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_fragmentation @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_index_fragmentation
+    @definition = N'ALTER PROCEDURE dbo.HC_index_fragmentation
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.5: FRAGMENTATION - CURRENT DB (LIMITED mode, >1000 pages)
@@ -2003,7 +2035,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_heaps_forwarded @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_heaps_forwarded
+    @definition = N'ALTER PROCEDURE dbo.HC_heaps_forwarded
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.6: HEAPS WITH FORWARDED RECORDS - CURRENT DB
@@ -2031,7 +2063,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_table_indexes @database_name = N''YourDB'', @table = N''dbo.YourTable'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_table_indexes
+    @definition = N'ALTER PROCEDURE dbo.HC_table_indexes
     @database_name sysname = NULL,
     @table sysname = N''dbo.YourTable''
 AS
@@ -2071,7 +2103,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stats_health @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_stats_health
+    @definition = N'ALTER PROCEDURE dbo.HC_stats_health
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.8: STATISTICS HEALTH - CURRENT DB (stale / low sample)
@@ -2105,7 +2137,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_operational_stats @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_index_operational_stats
+    @definition = N'ALTER PROCEDURE dbo.HC_index_operational_stats
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.9: INDEX OPERATIONAL STATS (lock/latch waits, splits proxy)
@@ -2140,7 +2172,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_columnstore_health @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_columnstore_health
+    @definition = N'ALTER PROCEDURE dbo.HC_columnstore_health
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.10: COLUMNSTORE ROWGROUP HEALTH - CURRENT DB
@@ -2170,7 +2202,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tables_without_ci_pk @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tables_without_ci_pk
+    @definition = N'ALTER PROCEDURE dbo.HC_tables_without_ci_pk
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.11: TABLES WITHOUT A CLUSTERED INDEX / PRIMARY KEY
@@ -2199,7 +2231,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_resumable_index_ops @database_name = N''YourDB'';',
     @min_version = 14,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_resumable_index_ops
+    @definition = N'ALTER PROCEDURE dbo.HC_resumable_index_ops
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.12: RESUMABLE INDEX OPERATIONS IN PROGRESS (2017+)
@@ -2223,7 +2255,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_memory_overview;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_memory_overview
+    @definition = N'ALTER PROCEDURE dbo.HC_memory_overview
 AS
 -- Toolkit 06_memory.sql section 6.1: OS + SQL PROCESS MEMORY OVERVIEW
 SET NOCOUNT ON;
@@ -2252,7 +2284,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_memory_counters ORDER BY object_name, counter_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY object_name, counter_name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_memory_counters
+    @definition = N'ALTER VIEW dbo.HC_memory_counters
 AS
 -- Toolkit 06_memory.sql section 6.2: KEY MEMORY COUNTERS
 SELECT RTRIM(object_name) AS object_name, RTRIM(counter_name) AS counter_name,
@@ -2265,7 +2297,7 @@ WHERE (object_name LIKE N''%Memory Manager%'' AND counter_name IN (
    OR (object_name LIKE N''%Buffer Manager%'' AND counter_name IN (
           N''Page life expectancy'', N''Lazy writes/sec'', N''Page reads/sec'', N''Checkpoint pages/sec''));
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_memory_counters
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_memory_counters
 AS
 -- Toolkit 06_memory.sql section 6.2: KEY MEMORY COUNTERS
 SET NOCOUNT ON;
@@ -2289,14 +2321,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ple_per_numa;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ple_per_numa
+    @definition = N'ALTER VIEW dbo.HC_ple_per_numa
 AS
 -- Toolkit 06_memory.sql section 6.3: PAGE LIFE EXPECTANCY PER NUMA NODE
 SELECT RTRIM(object_name) AS object_name, RTRIM(instance_name) AS numa_node, cntr_value AS ple_seconds
 FROM sys.dm_os_performance_counters
 WHERE counter_name = N''Page life expectancy'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ple_per_numa
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ple_per_numa
 AS
 -- Toolkit 06_memory.sql section 6.3: PAGE LIFE EXPECTANCY PER NUMA NODE
 SET NOCOUNT ON;
@@ -2313,7 +2345,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_buffer_pool_by_db;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_buffer_pool_by_db
+    @definition = N'ALTER PROCEDURE dbo.HC_buffer_pool_by_db
 AS
 -- Toolkit 06_memory.sql section 6.4: BUFFER POOL USAGE BY DATABASE
 SET NOCOUNT ON;
@@ -2336,7 +2368,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_buffer_pool_by_object @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_buffer_pool_by_object
+    @definition = N'ALTER PROCEDURE dbo.HC_buffer_pool_by_object
     @database_name sysname = NULL
 AS
 -- Toolkit 06_memory.sql section 6.5: BUFFER POOL USAGE BY OBJECT - CURRENT DB
@@ -2371,7 +2403,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_memory_clerks ORDER BY memory_mb DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_memory_clerks
+    @definition = N'ALTER VIEW dbo.HC_memory_clerks
 AS
 -- Toolkit 06_memory.sql section 6.6: TOP MEMORY CLERKS (who is using non-buffer memory)
 SELECT TOP (20) [type] AS clerk_type, name,
@@ -2380,7 +2412,7 @@ FROM sys.dm_os_memory_clerks
 GROUP BY [type], name
 ORDER BY memory_mb DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_memory_clerks
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_memory_clerks
 AS
 -- Toolkit 06_memory.sql section 6.6: TOP MEMORY CLERKS (who is using non-buffer memory)
 SET NOCOUNT ON;
@@ -2399,7 +2431,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_memory_grants;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_memory_grants
+    @definition = N'ALTER PROCEDURE dbo.HC_memory_grants
 AS
 -- Toolkit 06_memory.sql section 6.7: MEMORY GRANTS - WAITING AND RUNNING
 SET NOCOUNT ON;
@@ -2430,7 +2462,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_low_memory_events;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_low_memory_events
+    @definition = N'ALTER PROCEDURE dbo.HC_low_memory_events
 AS
 -- Toolkit 06_memory.sql section 6.8: LOW MEMORY NOTIFICATIONS FROM RING BUFFER
 SET NOCOUNT ON;
@@ -2456,13 +2488,13 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_oom_events;',
     @min_version = 16,
     @sort_hint = N'ORDER BY event_time DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_oom_events
+    @definition = N'ALTER VIEW dbo.HC_oom_events
 AS
 -- Toolkit 06_memory.sql section 6.9: OUT-OF-MEMORY EVENTS (2022+, Azure SQL DB, MI)
 SELECT *
 FROM sys.dm_os_out_of_memory_events;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_oom_events
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_oom_events
 AS
 -- Toolkit 06_memory.sql section 6.9: OUT-OF-MEMORY EVENTS (2022+, Azure SQL DB, MI)
 SET NOCOUNT ON;
@@ -2479,7 +2511,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_memory_settings;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_memory_settings
+    @definition = N'ALTER VIEW dbo.HC_memory_settings
 AS
 -- Toolkit 06_memory.sql section 6.10: MEMORY SETTINGS CHECK
 SELECT
@@ -2488,7 +2520,7 @@ SELECT
     (SELECT physical_memory_kb / 1024 FROM sys.dm_os_sys_info)                                      AS physical_memory_mb,
     (SELECT sql_memory_model_desc FROM sys.dm_os_sys_info)                                          AS memory_model;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_memory_settings
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_memory_settings
 AS
 -- Toolkit 06_memory.sql section 6.10: MEMORY SETTINGS CHECK
 SET NOCOUNT ON;
@@ -2507,7 +2539,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cpu_history;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cpu_history
+    @definition = N'ALTER PROCEDURE dbo.HC_cpu_history
 AS
 -- Toolkit 07_cpu.sql section 7.1: CPU % - LAST ~256 MINUTES (1-minute samples)
 SET NOCOUNT ON;
@@ -2540,7 +2572,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_scheduler_pressure;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_scheduler_pressure
+    @definition = N'ALTER PROCEDURE dbo.HC_scheduler_pressure
 AS
 -- Toolkit 07_cpu.sql section 7.2: SCHEDULER PRESSURE (runnable queue)
 SET NOCOUNT ON;
@@ -2567,7 +2599,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_worker_threads;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_worker_threads
+    @definition = N'ALTER VIEW dbo.HC_worker_threads
 AS
 -- Toolkit 07_cpu.sql section 7.3: WORKER THREAD USAGE (THREADPOOL risk)
 SELECT
@@ -2576,7 +2608,7 @@ SELECT
     (SELECT SUM(active_workers_count)  FROM sys.dm_os_schedulers WHERE status = N''VISIBLE ONLINE'') AS active_workers,
     (SELECT COUNT(*) FROM sys.dm_os_waiting_tasks WHERE wait_type = N''THREADPOOL'')    AS tasks_waiting_threadpool;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_worker_threads
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_worker_threads
 AS
 -- Toolkit 07_cpu.sql section 7.3: WORKER THREAD USAGE (THREADPOOL risk)
 SET NOCOUNT ON;
@@ -2595,7 +2627,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_cpu_now ORDER BY cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_top_cpu_now
+    @definition = N'ALTER VIEW dbo.HC_top_cpu_now
 AS
 -- Toolkit 07_cpu.sql section 7.4: TOP CPU CONSUMERS RIGHT NOW
 SELECT TOP (20)
@@ -2611,7 +2643,7 @@ OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
 WHERE s.is_user_process = 1 AND r.session_id <> @@SPID
 ORDER BY r.cpu_time DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_top_cpu_now
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_top_cpu_now
 AS
 -- Toolkit 07_cpu.sql section 7.4: TOP CPU CONSUMERS RIGHT NOW
 SET NOCOUNT ON;
@@ -2637,7 +2669,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cpu_by_database;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cpu_by_database
+    @definition = N'ALTER PROCEDURE dbo.HC_cpu_by_database
 AS
 -- Toolkit 07_cpu.sql section 7.5: CPU USAGE BY DATABASE (from plan cache - approximate)
 SET NOCOUNT ON;
@@ -2664,7 +2696,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_numa_maxdop @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_numa_maxdop
+    @definition = N'ALTER PROCEDURE dbo.HC_numa_maxdop
     @database_name sysname = NULL
 AS
 -- Toolkit 07_cpu.sql section 7.6: NUMA NODES & PARALLELISM SETTINGS
@@ -2694,7 +2726,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_file_latency ORDER BY avg_io_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY avg_io_ms DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_file_latency
+    @definition = N'ALTER VIEW dbo.HC_file_latency
 AS
 -- Toolkit 08_storage_io_files.sql section 8.1: FILE I/O LATENCY - ALL DATABASES (since restart)
 SELECT
@@ -2710,7 +2742,7 @@ SELECT
 FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
 JOIN sys.master_files AS mf ON mf.database_id = vfs.database_id AND mf.file_id = vfs.file_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_file_latency
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_file_latency
 AS
 -- Toolkit 08_storage_io_files.sql section 8.1: FILE I/O LATENCY - ALL DATABASES (since restart)
 SET NOCOUNT ON;
@@ -2737,7 +2769,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_file_latency_delta @delay = ''00:00:30'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_file_latency_delta
+    @definition = N'ALTER PROCEDURE dbo.HC_file_latency_delta
     @delay char(8) = ''00:00:30''
 AS
 -- Toolkit 08_storage_io_files.sql section 8.2: FILE I/O LATENCY - DELTA OVER N SECONDS (live)
@@ -2767,7 +2799,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_pending_io ORDER BY io_pending_ms_ticks DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY pio.io_pending_ms_ticks DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_pending_io
+    @definition = N'ALTER VIEW dbo.HC_pending_io
 AS
 -- Toolkit 08_storage_io_files.sql section 8.3: PENDING I/O REQUESTS RIGHT NOW
 SELECT DB_NAME(vfs.database_id) AS database_name, mf.physical_name,
@@ -2776,7 +2808,7 @@ FROM sys.dm_io_pending_io_requests AS pio
 JOIN sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs ON vfs.file_handle = pio.io_handle
 JOIN sys.master_files AS mf ON mf.database_id = vfs.database_id AND mf.file_id = vfs.file_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_pending_io
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_pending_io
 AS
 -- Toolkit 08_storage_io_files.sql section 8.3: PENDING I/O REQUESTS RIGHT NOW
 SET NOCOUNT ON;
@@ -2796,7 +2828,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_volume_space ORDER BY free_pct;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY free_pct',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_volume_space
+    @definition = N'ALTER VIEW dbo.HC_volume_space
 AS
 -- Toolkit 08_storage_io_files.sql section 8.4: DRIVE / VOLUME FREE SPACE
 SELECT DISTINCT
@@ -2807,7 +2839,7 @@ SELECT DISTINCT
 FROM sys.master_files AS mf
 CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_volume_space
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_volume_space
 AS
 -- Toolkit 08_storage_io_files.sql section 8.4: DRIVE / VOLUME FREE SPACE
 SET NOCOUNT ON;
@@ -2829,7 +2861,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_file_space @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_file_space
+    @definition = N'ALTER PROCEDURE dbo.HC_file_space
     @database_name sysname = NULL
 AS
 -- Toolkit 08_storage_io_files.sql section 8.5: FILE SIZE & FREE SPACE - CURRENT DB
@@ -2860,7 +2892,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_file_space_all_dbs;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_file_space_all_dbs
+    @definition = N'ALTER PROCEDURE dbo.HC_file_space_all_dbs
 AS
 -- Toolkit 08_storage_io_files.sql section 8.6: FILE SIZE & FREE SPACE - ALL ONLINE DATABASES
 SET NOCOUNT ON;
@@ -2889,7 +2921,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_log_space;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_log_space
+    @definition = N'ALTER PROCEDURE dbo.HC_log_space
 AS
 -- Toolkit 08_storage_io_files.sql section 8.7: LOG SPACE - ALL DATABASES + WHY LOG CAN''T TRUNCATE
 SET NOCOUNT ON;
@@ -2910,7 +2942,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_log_stats ORDER BY total_log_size_mb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ls.total_log_size_mb DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_log_stats
+    @definition = N'ALTER VIEW dbo.HC_log_stats
 AS
 -- Toolkit 08_storage_io_files.sql section 8.8: LOG STATS PER DATABASE (2016 SP2+)
 SELECT d.name, d.recovery_model_desc,
@@ -2922,7 +2954,7 @@ FROM sys.databases AS d
 CROSS APPLY sys.dm_db_log_stats(d.database_id) AS ls
 WHERE d.state_desc = N''ONLINE'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_log_stats
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_log_stats
 AS
 -- Toolkit 08_storage_io_files.sql section 8.8: LOG STATS PER DATABASE (2016 SP2+)
 SET NOCOUNT ON;
@@ -2945,7 +2977,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_vlf_counts ORDER BY vlf_count DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY vlf_count DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_vlf_counts
+    @definition = N'ALTER VIEW dbo.HC_vlf_counts
 AS
 -- Toolkit 08_storage_io_files.sql section 8.9: VLF COUNT PER DATABASE (2016 SP2+)
 SELECT d.name AS database_name, COUNT(li.database_id) AS vlf_count,
@@ -2956,7 +2988,7 @@ CROSS APPLY sys.dm_db_log_info(d.database_id) AS li
 WHERE d.state_desc = N''ONLINE''
 GROUP BY d.name;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_vlf_counts
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_vlf_counts
 AS
 -- Toolkit 08_storage_io_files.sql section 8.9: VLF COUNT PER DATABASE (2016 SP2+)
 SET NOCOUNT ON;
@@ -2978,7 +3010,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_autogrowth_settings;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_autogrowth_settings
+    @definition = N'ALTER PROCEDURE dbo.HC_autogrowth_settings
 AS
 -- Toolkit 08_storage_io_files.sql section 8.10: AUTOGROWTH SETTINGS - FLAG % GROWTH & TINY INCREMENTS
 SET NOCOUNT ON;
@@ -3003,7 +3035,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_autogrowth_events;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_autogrowth_events
+    @definition = N'ALTER PROCEDURE dbo.HC_autogrowth_events
 AS
 -- Toolkit 08_storage_io_files.sql section 8.11: RECENT AUTOGROWTH / SHRINK EVENTS (default trace)
 SET NOCOUNT ON;
@@ -3030,7 +3062,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_largest_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_largest_tables
+    @definition = N'ALTER PROCEDURE dbo.HC_largest_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 08_storage_io_files.sql section 8.12: LARGEST TABLES - CURRENT DB
@@ -3061,7 +3093,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tempdb_files;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tempdb_files
+    @definition = N'ALTER PROCEDURE dbo.HC_tempdb_files
 AS
 -- Toolkit 09_tempdb.sql section 9.1: TEMPDB FILE LAYOUT (equal sizes? equal growth? # files vs cores)
 SET NOCOUNT ON;
@@ -3087,7 +3119,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_space;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_tempdb_space
+    @definition = N'ALTER VIEW dbo.HC_tempdb_space
 AS
 -- Toolkit 09_tempdb.sql section 9.2: TEMPDB SPACE BY CATEGORY
 SELECT
@@ -3099,7 +3131,7 @@ SELECT
     SUM(mixed_extent_page_count)          * 8 / 1024 AS mixed_extents_mb
 FROM tempdb.sys.dm_db_file_space_usage;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tempdb_space
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tempdb_space
 AS
 -- Toolkit 09_tempdb.sql section 9.2: TEMPDB SPACE BY CATEGORY
 SET NOCOUNT ON;
@@ -3121,7 +3153,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_by_session;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_tempdb_by_session
+    @definition = N'ALTER VIEW dbo.HC_tempdb_by_session
 AS
 -- Toolkit 09_tempdb.sql section 9.3: TEMPDB USAGE BY SESSION (allocated incl. running tasks)
 WITH task AS (
@@ -3143,7 +3175,7 @@ OUTER APPLY sys.dm_exec_input_buffer(ss.session_id, NULL) AS ib
 WHERE s.is_user_process = 1
 ORDER BY user_obj_mb + internal_obj_mb DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tempdb_by_session
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tempdb_by_session
 AS
 -- Toolkit 09_tempdb.sql section 9.3: TEMPDB USAGE BY SESSION (allocated incl. running tasks)
 SET NOCOUNT ON;
@@ -3175,7 +3207,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_version_store ORDER BY version_store_mb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY reserved_page_count DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_version_store
+    @definition = N'ALTER VIEW dbo.HC_version_store
 AS
 -- Toolkit 09_tempdb.sql section 9.4: VERSION STORE BY DATABASE (2016 SP2+ / 2017+)
 SELECT DB_NAME(database_id) AS database_name,
@@ -3183,7 +3215,7 @@ SELECT DB_NAME(database_id) AS database_name,
        reserved_space_kb / 1024       AS reserved_mb
 FROM sys.dm_tran_version_store_space_usage;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_version_store
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_version_store
 AS
 -- Toolkit 09_tempdb.sql section 9.4: VERSION STORE BY DATABASE (2016 SP2+ / 2017+)
 SET NOCOUNT ON;
@@ -3202,7 +3234,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_snapshot_transactions ORDER BY elapsed_time_seconds DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_snapshot_transactions
+    @definition = N'ALTER VIEW dbo.HC_snapshot_transactions
 AS
 -- Toolkit 09_tempdb.sql section 9.5: LONG-RUNNING SNAPSHOT TRANSACTIONS (hold version store)
 SELECT TOP (20) ast.session_id, ast.transaction_id, ast.elapsed_time_seconds,
@@ -3212,7 +3244,7 @@ JOIN sys.dm_exec_sessions AS s ON s.session_id = ast.session_id
 OUTER APPLY sys.dm_exec_input_buffer(ast.session_id, NULL) AS ib
 ORDER BY ast.elapsed_time_seconds DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_snapshot_transactions
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_snapshot_transactions
 AS
 -- Toolkit 09_tempdb.sql section 9.5: LONG-RUNNING SNAPSHOT TRANSACTIONS (hold version store)
 SET NOCOUNT ON;
@@ -3232,7 +3264,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_contention;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_tempdb_contention
+    @definition = N'ALTER VIEW dbo.HC_tempdb_contention
 AS
 -- Toolkit 09_tempdb.sql section 9.6: TEMPDB ALLOCATION CONTENTION (PAGELATCH on db 2)
 SELECT session_id, wait_type, wait_duration_ms, resource_description
@@ -3240,7 +3272,7 @@ FROM sys.dm_os_waiting_tasks
 WHERE wait_type LIKE N''PAGELATCH%''
   AND resource_description LIKE N''2:%'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tempdb_contention
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tempdb_contention
 AS
 -- Toolkit 09_tempdb.sql section 9.6: TEMPDB ALLOCATION CONTENTION (PAGELATCH on db 2)
 SET NOCOUNT ON;
@@ -3258,12 +3290,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_metadata;',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_tempdb_metadata
+    @definition = N'ALTER VIEW dbo.HC_tempdb_metadata
 AS
 -- Toolkit 09_tempdb.sql section 9.7: MEMORY-OPTIMIZED TEMPDB METADATA (2019+)
 SELECT SERVERPROPERTY(''IsTempdbMetadataMemoryOptimized'') AS is_tempdb_metadata_memory_optimized;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tempdb_metadata
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tempdb_metadata
 AS
 -- Toolkit 09_tempdb.sql section 9.7: MEMORY-OPTIMIZED TEMPDB METADATA (2019+)
 SET NOCOUNT ON;
@@ -3278,7 +3310,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_last_backup;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_last_backup
+    @definition = N'ALTER PROCEDURE dbo.HC_last_backup
 AS
 -- Toolkit 10_backup_restore.sql section 10.1: LAST BACKUP PER DATABASE + RPO FLAGS
 SET NOCOUNT ON;
@@ -3318,7 +3350,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_backup_history @days = 7;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_backup_history
+    @definition = N'ALTER PROCEDURE dbo.HC_backup_history
     @days int = 7
 AS
 -- Toolkit 10_backup_restore.sql section 10.2: BACKUP HISTORY - LAST N DAYS (size, speed, location)
@@ -3351,7 +3383,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_backup_restore_progress;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_backup_restore_progress
+    @definition = N'ALTER VIEW dbo.HC_backup_restore_progress
 AS
 -- Toolkit 10_backup_restore.sql section 10.3: BACKUP / RESTORE / DBCC PROGRESS (live)
 SELECT r.session_id, r.command, DB_NAME(r.database_id) AS database_name,
@@ -3365,7 +3397,7 @@ OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
 WHERE r.command LIKE N''BACKUP%'' OR r.command LIKE N''RESTORE%'' OR r.command LIKE N''DBCC%''
    OR r.command IN (N''DbccFilesCompact'', N''DbccSpaceReclaim'', N''ALTER INDEX'');
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_backup_restore_progress
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_backup_restore_progress
 AS
 -- Toolkit 10_backup_restore.sql section 10.3: BACKUP / RESTORE / DBCC PROGRESS (live)
 SET NOCOUNT ON;
@@ -3389,7 +3421,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_restore_history;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_restore_history
+    @definition = N'ALTER PROCEDURE dbo.HC_restore_history
 AS
 -- Toolkit 10_backup_restore.sql section 10.4: RESTORE HISTORY
 SET NOCOUNT ON;
@@ -3414,7 +3446,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_generate_restore_script @database = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_generate_restore_script
+    @definition = N'ALTER PROCEDURE dbo.HC_generate_restore_script
     @database sysname = N''YourDB''
 AS
 -- Toolkit 10_backup_restore.sql section 10.5: GENERATE RESTORE SCRIPT (latest FULL + DIFF + LOG chain)
@@ -3463,7 +3495,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_backup_size_trend ORDER BY database_name, month_start;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY database_name, month_start',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_backup_size_trend
+    @definition = N'ALTER VIEW dbo.HC_backup_size_trend
 AS
 -- Toolkit 10_backup_restore.sql section 10.6: BACKUP SIZE TREND (monthly FULL size per DB)
 SELECT database_name,
@@ -3474,7 +3506,7 @@ FROM msdb.dbo.backupset
 WHERE type = ''D'' AND backup_start_date >= DATEADD(MONTH, -12, GETDATE())
 GROUP BY database_name, DATEFROMPARTS(YEAR(backup_start_date), MONTH(backup_start_date), 1);
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_backup_size_trend
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_backup_size_trend
 AS
 -- Toolkit 10_backup_restore.sql section 10.6: BACKUP SIZE TREND (monthly FULL size per DB)
 SET NOCOUNT ON;
@@ -3496,12 +3528,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_backup_url_credentials;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_backup_url_credentials
+    @definition = N'ALTER VIEW dbo.HC_backup_url_credentials
 AS
 -- Toolkit 10_backup_restore.sql section 10.7: BACKUP TO URL CREDENTIALS (Azure blob)
 SELECT name, credential_identity, create_date, modify_date FROM sys.credentials;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_backup_url_credentials
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_backup_url_credentials
 AS
 -- Toolkit 10_backup_restore.sql section 10.7: BACKUP TO URL CREDENTIALS (Azure blob)
 SET NOCOUNT ON;
@@ -3516,7 +3548,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_dashboard;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_dashboard
+    @definition = N'ALTER VIEW dbo.HC_ag_dashboard
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.1: AG DASHBOARD - ONE ROW PER AG
 SELECT ag.name AS ag_name, ags.primary_replica, ags.primary_recovery_health_desc,
@@ -3528,7 +3560,7 @@ SELECT ag.name AS ag_name, ags.primary_replica, ags.primary_recovery_health_desc
 FROM sys.availability_groups AS ag
 JOIN sys.dm_hadr_availability_group_states AS ags ON ags.group_id = ag.group_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_dashboard
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_dashboard
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.1: AG DASHBOARD - ONE ROW PER AG
 SET NOCOUNT ON;
@@ -3550,7 +3582,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_replicas ORDER BY ag_name, role_desc, replica_server_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, ars.role_desc, ar.replica_server_name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_replicas
+    @definition = N'ALTER VIEW dbo.HC_ag_replicas
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.2: REPLICA STATE & CONFIGURATION
 SELECT ag.name AS ag_name, ar.replica_server_name,
@@ -3565,7 +3597,7 @@ FROM sys.availability_groups AS ag
 JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id
 LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_replicas
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_replicas
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.2: REPLICA STATE & CONFIGURATION
 SET NOCOUNT ON;
@@ -3591,7 +3623,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_db_sync ORDER BY ag_name, database_name, is_primary_replica DESC, replica_server_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, database_name, drs.is_primary_replica DESC, ar.replica_server_name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_db_sync
+    @definition = N'ALTER VIEW dbo.HC_ag_db_sync
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.3: DATABASE SYNC STATE, LAG, RPO / RTO ESTIMATES
 SELECT
@@ -3614,7 +3646,7 @@ FROM sys.dm_hadr_database_replica_states AS drs
 JOIN sys.availability_replicas  AS ar ON ar.replica_id = drs.replica_id
 JOIN sys.availability_groups    AS ag ON ag.group_id = drs.group_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_db_sync
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_db_sync
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.3: DATABASE SYNC STATE, LAG, RPO / RTO ESTIMATES
 SET NOCOUNT ON;
@@ -3648,7 +3680,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_data_loss_window ORDER BY potential_data_loss_s DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY potential_data_loss_s DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_data_loss_window
+    @definition = N'ALTER VIEW dbo.HC_ag_data_loss_window
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.4: DATA LOSS WINDOW: primary vs secondary last_commit_time
 SELECT ag.name AS ag_name, DB_NAME(s.database_id) AS database_name,
@@ -3663,7 +3695,7 @@ JOIN sys.availability_replicas AS ar ON ar.replica_id = s.replica_id
 JOIN sys.availability_groups   AS ag ON ag.group_id = s.group_id
 WHERE p.is_primary_replica = 1;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_data_loss_window
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_data_loss_window
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.4: DATA LOSS WINDOW: primary vs secondary last_commit_time
 SET NOCOUNT ON;
@@ -3689,7 +3721,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_failover_readiness ORDER BY ag_name, database_name, replica_server_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, dcs.database_name, ar.replica_server_name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_failover_readiness
+    @definition = N'ALTER VIEW dbo.HC_ag_failover_readiness
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.5: FAILOVER READINESS (is_failover_ready must be 1 on sync targets)
 SELECT ag.name AS ag_name, ar.replica_server_name, dcs.database_name,
@@ -3699,7 +3731,7 @@ FROM sys.dm_hadr_database_replica_cluster_states AS dcs
 JOIN sys.availability_replicas AS ar ON ar.replica_id = dcs.replica_id
 JOIN sys.availability_groups   AS ag ON ag.group_id = ar.group_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_failover_readiness
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_failover_readiness
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.5: FAILOVER READINESS (is_failover_ready must be 1 on sync targets)
 SET NOCOUNT ON;
@@ -3720,7 +3752,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_helper_functions;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_helper_functions
+    @definition = N'ALTER VIEW dbo.HC_ag_helper_functions
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.6: HELPER FUNCTIONS (per database)
 SELECT d.name,
@@ -3730,7 +3762,7 @@ SELECT d.name,
 FROM sys.databases AS d
 WHERE d.replica_id IS NOT NULL;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_helper_functions
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_helper_functions
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.6: HELPER FUNCTIONS (per database)
 SET NOCOUNT ON;
@@ -3750,14 +3782,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_dbs_not_in_ag ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_dbs_not_in_ag
+    @definition = N'ALTER VIEW dbo.HC_dbs_not_in_ag
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.7: DATABASES NOT IN ANY AG (on an AG-enabled server)
 SELECT name, recovery_model_desc, state_desc
 FROM sys.databases
 WHERE database_id > 4 AND replica_id IS NULL;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_dbs_not_in_ag
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_dbs_not_in_ag
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.7: DATABASES NOT IN ANY AG (on an AG-enabled server)
 SET NOCOUNT ON;
@@ -3775,7 +3807,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_listeners;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_listeners
+    @definition = N'ALTER VIEW dbo.HC_ag_listeners
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.8: LISTENERS (Azure VM: check ILB probe port / DNN)
 SELECT ag.name AS ag_name, agl.dns_name, agl.port, agl.is_conformant,
@@ -3785,7 +3817,7 @@ FROM sys.availability_group_listeners AS agl
 JOIN sys.availability_groups AS ag ON ag.group_id = agl.group_id
 LEFT JOIN sys.availability_group_listener_ip_addresses AS lip ON lip.listener_id = agl.listener_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_listeners
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_listeners
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.8: LISTENERS (Azure VM: check ILB probe port / DNN)
 SET NOCOUNT ON;
@@ -3805,7 +3837,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_readonly_routing ORDER BY ag_name, when_primary_is, routing_priority;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, src.replica_server_name, rl.routing_priority',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_readonly_routing
+    @definition = N'ALTER VIEW dbo.HC_ag_readonly_routing
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.9: READ-ONLY ROUTING
 SELECT ag.name AS ag_name, src.replica_server_name AS when_primary_is,
@@ -3815,7 +3847,7 @@ JOIN sys.availability_replicas AS src ON src.replica_id = rl.replica_id
 JOIN sys.availability_replicas AS dst ON dst.replica_id = rl.read_only_replica_id
 JOIN sys.availability_groups   AS ag  ON ag.group_id = src.group_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_readonly_routing
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_readonly_routing
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.9: READ-ONLY ROUTING
 SET NOCOUNT ON;
@@ -3836,7 +3868,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_hadr_endpoint;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_hadr_endpoint
+    @definition = N'ALTER PROCEDURE dbo.HC_hadr_endpoint
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.10: HADR ENDPOINT (state, port, encryption, connect permission)
 SET NOCOUNT ON;
@@ -3861,7 +3893,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_seeding;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_seeding
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_seeding
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.11: AUTOMATIC SEEDING PROGRESS
 SET NOCOUNT ON;
@@ -3891,7 +3923,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_wsfc;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_wsfc
+    @definition = N'ALTER PROCEDURE dbo.HC_wsfc
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.12: WSFC CLUSTER, NODES, NETWORKS, QUORUM
 SET NOCOUNT ON;
@@ -3909,7 +3941,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_waits;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_waits
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_waits
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.13: AG-RELATED WAITS (commit latency on sync replicas)
 SET NOCOUNT ON;
@@ -3939,7 +3971,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_failover_history;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_failover_history
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_failover_history
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.14: FAILOVER / ROLE CHANGE HISTORY (AlwaysOn_health XE)
 SET NOCOUNT ON;
@@ -3973,7 +4005,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_lock_summary ORDER BY lock_count DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY lock_count DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_lock_summary
+    @definition = N'ALTER VIEW dbo.HC_lock_summary
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.1: LOCK SUMMARY BY SESSION
 SELECT tl.request_session_id AS session_id, DB_NAME(tl.resource_database_id) AS database_name,
@@ -3982,7 +4014,7 @@ FROM sys.dm_tran_locks AS tl
 WHERE tl.request_session_id <> @@SPID
 GROUP BY tl.request_session_id, tl.resource_database_id, tl.resource_type, tl.request_mode, tl.request_status;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_lock_summary
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_lock_summary
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.1: LOCK SUMMARY BY SESSION
 SET NOCOUNT ON;
@@ -4002,7 +4034,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_waiting_locks @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_waiting_locks
+    @definition = N'ALTER PROCEDURE dbo.HC_waiting_locks
     @database_name sysname = NULL
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.2: WAITING LOCKS WITH OBJECT NAMES - CURRENT DB
@@ -4036,7 +4068,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_session_locks @database_name = N''YourDB'', @spid = 55;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_session_locks
+    @definition = N'ALTER PROCEDURE dbo.HC_session_locks
     @database_name sysname = NULL,
     @spid int = 55
 AS
@@ -4068,7 +4100,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_lock_escalation @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_lock_escalation
+    @definition = N'ALTER PROCEDURE dbo.HC_lock_escalation
     @database_name sysname = NULL
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.4: LOCK ESCALATION HOTSPOTS - CURRENT DB
@@ -4098,7 +4130,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_deadlocks;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_deadlocks
+    @definition = N'ALTER PROCEDURE dbo.HC_deadlocks
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.5: DEADLOCKS FROM system_health (event_file)
 SET NOCOUNT ON;
@@ -4121,7 +4153,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_deadlock_detail;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_deadlock_detail
+    @definition = N'ALTER PROCEDURE dbo.HC_deadlock_detail
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.6: DEADLOCK DETAIL - SHRED PROCESSES (who, what statement)
 SET NOCOUNT ON;
@@ -4159,14 +4191,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_deadlock_count;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_deadlock_count
+    @definition = N'ALTER VIEW dbo.HC_deadlock_count
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.7: DEADLOCK COUNTER SINCE RESTART
 SELECT RTRIM(instance_name) AS lock_type, cntr_value AS deadlocks
 FROM sys.dm_os_performance_counters
 WHERE counter_name = N''Number of Deadlocks/sec'' AND cntr_value > 0;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_deadlock_count
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_deadlock_count
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.7: DEADLOCK COUNTER SINCE RESTART
 SET NOCOUNT ON;
@@ -4183,7 +4215,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_isolation_levels;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_isolation_levels
+    @definition = N'ALTER PROCEDURE dbo.HC_isolation_levels
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.9: ISOLATION LEVEL OF ACTIVE SESSIONS
 SET NOCOUNT ON;
@@ -4205,7 +4237,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_server_role_members;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_server_role_members
+    @definition = N'ALTER PROCEDURE dbo.HC_server_role_members
 AS
 -- Toolkit 13_security.sql section 13.1: SERVER ROLE MEMBERS (who is sysadmin etc.)
 SET NOCOUNT ON;
@@ -4226,7 +4258,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_logins ORDER BY type_desc, name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sp.type_desc, sp.name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_logins
+    @definition = N'ALTER VIEW dbo.HC_logins
 AS
 -- Toolkit 13_security.sql section 13.2: LOGINS - STATUS, POLICY, LAST PASSWORD CHANGE
 SELECT sp.name, sp.type_desc, sp.is_disabled, sp.default_database_name,
@@ -4241,7 +4273,7 @@ LEFT JOIN sys.sql_logins AS sl ON sl.principal_id = sp.principal_id
 WHERE sp.type IN (''S'', ''U'', ''G'', ''E'', ''X'')
   AND sp.name NOT LIKE N''##%'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_logins
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_logins
 AS
 -- Toolkit 13_security.sql section 13.2: LOGINS - STATUS, POLICY, LAST PASSWORD CHANGE
 SET NOCOUNT ON;
@@ -4267,7 +4299,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_weak_passwords;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_weak_passwords
+    @definition = N'ALTER PROCEDURE dbo.HC_weak_passwords
 AS
 -- Toolkit 13_security.sql section 13.3: WEAK SQL LOGIN PASSWORDS (blank or = login name)
 SET NOCOUNT ON;
@@ -4288,7 +4320,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_risky_server_perms ORDER BY permission_name, grantee;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sp.permission_name, grantee',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_risky_server_perms
+    @definition = N'ALTER VIEW dbo.HC_risky_server_perms
 AS
 -- Toolkit 13_security.sql section 13.4: HIGH-RISK SERVER PERMISSIONS (CONTROL SERVER, IMPERSONATE...)
 SELECT SUSER_NAME(sp.grantee_principal_id) AS grantee, sp.permission_name, sp.state_desc,
@@ -4299,7 +4331,7 @@ WHERE sp.permission_name IN (N''CONTROL SERVER'', N''IMPERSONATE'', N''ALTER ANY
         N''ALTER ANY DATABASE'', N''ADMINISTER BULK OPERATIONS'', N''UNSAFE ASSEMBLY'')
   AND SUSER_NAME(sp.grantee_principal_id) NOT LIKE N''##%'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_risky_server_perms
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_risky_server_perms
 AS
 -- Toolkit 13_security.sql section 13.4: HIGH-RISK SERVER PERMISSIONS (CONTROL SERVER, IMPERSONATE...)
 SET NOCOUNT ON;
@@ -4321,7 +4353,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_orphaned_users @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_orphaned_users
+    @definition = N'ALTER PROCEDURE dbo.HC_orphaned_users
     @database_name sysname = NULL
 AS
 -- Toolkit 13_security.sql section 13.5: ORPHANED USERS - CURRENT DB (+ fix statement)
@@ -4351,7 +4383,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_db_role_members @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_db_role_members
+    @definition = N'ALTER PROCEDURE dbo.HC_db_role_members
     @database_name sysname = NULL
 AS
 -- Toolkit 13_security.sql section 13.6: DATABASE ROLE MEMBERS - CURRENT DB
@@ -4377,7 +4409,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_db_permissions @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_db_permissions
+    @definition = N'ALTER PROCEDURE dbo.HC_db_permissions
     @database_name sysname = NULL
 AS
 -- Toolkit 13_security.sql section 13.7: EXPLICIT PERMISSIONS - CURRENT DB
@@ -4408,7 +4440,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_guest_enabled;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_guest_enabled
+    @definition = N'ALTER PROCEDURE dbo.HC_guest_enabled
 AS
 -- Toolkit 13_security.sql section 13.9: GUEST ENABLED IN USER DATABASES (should be off)
 SET NOCOUNT ON;
@@ -4432,7 +4464,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_risky_db_settings ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_risky_db_settings
+    @definition = N'ALTER VIEW dbo.HC_risky_db_settings
 AS
 -- Toolkit 13_security.sql section 13.10: RISKY DATABASE SETTINGS (TRUSTWORTHY, odd owners, chaining)
 SELECT name, SUSER_SNAME(owner_sid) AS owner_name, is_trustworthy_on, is_db_chaining_on,
@@ -4442,7 +4474,7 @@ WHERE (is_trustworthy_on = 1 AND name <> N''msdb'')
    OR is_db_chaining_on = 1
    OR SUSER_SNAME(owner_sid) IS NULL;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_risky_db_settings
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_risky_db_settings
 AS
 -- Toolkit 13_security.sql section 13.10: RISKY DATABASE SETTINGS (TRUSTWORTHY, odd owners, chaining)
 SET NOCOUNT ON;
@@ -4463,7 +4495,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tde_cert_expiry;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tde_cert_expiry
+    @definition = N'ALTER PROCEDURE dbo.HC_tde_cert_expiry
 AS
 -- Toolkit 13_security.sql section 13.11: TDE STATUS & CERTIFICATE EXPIRY
 SET NOCOUNT ON;
@@ -4493,14 +4525,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_unencrypted_connections;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_unencrypted_connections
+    @definition = N'ALTER VIEW dbo.HC_unencrypted_connections
 AS
 -- Toolkit 13_security.sql section 13.12: UNENCRYPTED CONNECTIONS
 SELECT c.encrypt_option, c.auth_scheme, c.net_transport, COUNT(*) AS connections
 FROM sys.dm_exec_connections AS c
 GROUP BY c.encrypt_option, c.auth_scheme, c.net_transport;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_unencrypted_connections
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_unencrypted_connections
 AS
 -- Toolkit 13_security.sql section 13.12: UNENCRYPTED CONNECTIONS
 SET NOCOUNT ON;
@@ -4517,7 +4549,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_failed_logins @log_number = 0;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_failed_logins
+    @definition = N'ALTER PROCEDURE dbo.HC_failed_logins
     @log_number int = 0
 AS
 -- Toolkit 13_security.sql section 13.13: FAILED LOGINS FROM ERROR LOG
@@ -4534,7 +4566,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_audit_status;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_audit_status
+    @definition = N'ALTER PROCEDURE dbo.HC_audit_status
 AS
 -- Toolkit 13_security.sql section 13.14: SQL SERVER AUDIT STATUS
 SET NOCOUNT ON;
@@ -4556,7 +4588,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_linked_servers;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_linked_servers
+    @definition = N'ALTER VIEW dbo.HC_linked_servers
 AS
 -- Toolkit 13_security.sql section 13.15: LINKED SERVERS & THEIR LOGIN MAPPINGS
 SELECT s.name, s.product, s.provider, s.data_source, s.is_rpc_out_enabled, s.is_data_access_enabled,
@@ -4565,7 +4597,7 @@ FROM sys.servers AS s
 LEFT JOIN sys.linked_logins AS ll ON ll.server_id = s.server_id
 WHERE s.is_linked = 1;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_linked_servers
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_linked_servers
 AS
 -- Toolkit 13_security.sql section 13.15: LINKED SERVERS & THEIR LOGIN MAPPINGS
 SET NOCOUNT ON;
@@ -4584,7 +4616,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_failed_jobs(DEFAULT) ORDER BY run_datetime DESC;  -- @hours = 24',
     @min_version = NULL,
     @sort_hint = N'ORDER BY run_datetime DESC',
-    @definition = N'CREATE OR ALTER FUNCTION dbo.HC_failed_jobs
+    @definition = N'ALTER FUNCTION dbo.HC_failed_jobs
 (
     @hours int = 24
 )
@@ -4603,7 +4635,7 @@ WHERE h.run_status = 0
   AND msdb.dbo.agent_datetime(h.run_date, h.run_time) >= DATEADD(HOUR, -@hours, GETDATE())
 );
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_failed_jobs
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_failed_jobs
     @hours int = 24
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.1: FAILED JOB STEPS - LAST N HOURS
@@ -4627,7 +4659,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_running_jobs ORDER BY start_execution_date;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ja.start_execution_date',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_running_jobs
+    @definition = N'ALTER VIEW dbo.HC_running_jobs
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.2: CURRENTLY RUNNING JOBS
 SELECT j.name AS job_name, ja.start_execution_date,
@@ -4641,7 +4673,7 @@ WHERE ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
   AND ja.start_execution_date IS NOT NULL
   AND ja.stop_execution_date IS NULL;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_running_jobs
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_running_jobs
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.2: CURRENTLY RUNNING JOBS
 SET NOCOUNT ON;
@@ -4666,7 +4698,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_job_inventory;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_job_inventory
+    @definition = N'ALTER PROCEDURE dbo.HC_job_inventory
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.3: JOB INVENTORY - OWNER, ENABLED, LAST OUTCOME, NEXT RUN
 SET NOCOUNT ON;
@@ -4694,7 +4726,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_long_running_jobs ORDER BY times_avg DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY times_avg DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_long_running_jobs
+    @definition = N'ALTER VIEW dbo.HC_long_running_jobs
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.4: JOBS RUNNING LONGER THAN THEIR AVERAGE
 WITH avg_run AS (
@@ -4714,7 +4746,7 @@ LEFT JOIN avg_run AS a ON a.job_id = ja.job_id
 WHERE ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
   AND ja.start_execution_date IS NOT NULL AND ja.stop_execution_date IS NULL;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_long_running_jobs
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_long_running_jobs
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.4: JOBS RUNNING LONGER THAN THEIR AVERAGE
 SET NOCOUNT ON;
@@ -4745,7 +4777,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_job_steps(DEFAULT) ORDER BY job_name, step_id;  -- @job_name = N''%''',
     @min_version = NULL,
     @sort_hint = N'ORDER BY j.name, s.step_id',
-    @definition = N'CREATE OR ALTER FUNCTION dbo.HC_job_steps
+    @definition = N'ALTER FUNCTION dbo.HC_job_steps
 (
     @job_name sysname = N''%''
 )
@@ -4763,7 +4795,7 @@ LEFT JOIN msdb.dbo.sysproxies AS p ON p.proxy_id = s.proxy_id
 WHERE j.name LIKE @job_name
 );
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_job_steps
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_job_steps
     @job_name sysname = N''%''
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.5: JOB STEP DETAILS (command, subsystem, proxy, database)
@@ -4786,7 +4818,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_jobs_owned_by_people;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_jobs_owned_by_people
+    @definition = N'ALTER PROCEDURE dbo.HC_jobs_owned_by_people
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.6: JOBS OWNED BY INDIVIDUAL ACCOUNTS (break when person leaves)
 SET NOCOUNT ON;
@@ -4805,7 +4837,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_agent_alerts_operators;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_agent_alerts_operators
+    @definition = N'ALTER PROCEDURE dbo.HC_agent_alerts_operators
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.7: AGENT SERVICE / ALERTS / OPERATORS
 SET NOCOUNT ON;
@@ -4823,7 +4855,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_dbmail_failures;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_dbmail_failures
+    @definition = N'ALTER PROCEDURE dbo.HC_dbmail_failures
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.8: DATABASE MAIL - FAILURES & QUEUE
 SET NOCOUNT ON;
@@ -4847,14 +4879,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_dbs_not_online;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_dbs_not_online
+    @definition = N'ALTER VIEW dbo.HC_dbs_not_online
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.1: DATABASES NOT ONLINE / NOT MULTI_USER
 SELECT name, state_desc, user_access_desc, is_read_only, is_in_standby
 FROM sys.databases
 WHERE state_desc <> N''ONLINE'' OR user_access_desc <> N''MULTI_USER'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_dbs_not_online
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_dbs_not_online
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.1: DATABASES NOT ONLINE / NOT MULTI_USER
 SET NOCOUNT ON;
@@ -4871,7 +4903,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_last_good_checkdb ORDER BY days_ago DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY days_ago DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_last_good_checkdb
+    @definition = N'ALTER VIEW dbo.HC_last_good_checkdb
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.2: LAST KNOWN GOOD CHECKDB (2016 SP2+)
 SELECT name,
@@ -4880,7 +4912,7 @@ SELECT name,
 FROM sys.databases
 WHERE database_id <> 2 AND state_desc = N''ONLINE'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_last_good_checkdb
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_last_good_checkdb
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.2: LAST KNOWN GOOD CHECKDB (2016 SP2+)
 SET NOCOUNT ON;
@@ -4900,7 +4932,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_suspect_pages;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_suspect_pages
+    @definition = N'ALTER PROCEDURE dbo.HC_suspect_pages
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.3: SUSPECT PAGES (823/824 errors recorded in msdb)
 SET NOCOUNT ON;
@@ -4921,13 +4953,13 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_page_repair ORDER BY modification_time DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY modification_time DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_page_repair
+    @definition = N'ALTER VIEW dbo.HC_ag_page_repair
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.4: AG AUTOMATIC PAGE REPAIR HISTORY
 SELECT DB_NAME(database_id) AS database_name, file_id, page_id, error_type, page_status, modification_time
 FROM sys.dm_hadr_auto_page_repair;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_page_repair
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_page_repair
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.4: AG AUTOMATIC PAGE REPAIR HISTORY
 SET NOCOUNT ON;
@@ -4944,7 +4976,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_config_antipatterns;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name, finding',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_config_antipatterns
+    @definition = N'ALTER VIEW dbo.HC_config_antipatterns
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.5: CONFIGURATION ANTI-PATTERNS
 SELECT name, finding FROM (
@@ -4960,7 +4992,7 @@ SELECT name, finding FROM (
     UNION ALL SELECT name, ''Query Store is OFF'' FROM sys.databases WHERE is_query_store_on = 0 AND database_id > 4
 ) AS x;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_config_antipatterns
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_config_antipatterns
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.5: CONFIGURATION ANTI-PATTERNS
 SET NOCOUNT ON;
@@ -4987,7 +5019,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_errorlog_search @log_number = 0, @search_text = N''error'', @search_text2 = N'''';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_errorlog_search
+    @definition = N'ALTER PROCEDURE dbo.HC_errorlog_search
     @log_number int = 0,
     @search_text nvarchar(200) = N''error'',
     @search_text2 nvarchar(200) = N''''
@@ -5006,7 +5038,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_errorlog_files;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_errorlog_files
+    @definition = N'ALTER PROCEDURE dbo.HC_errorlog_files
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.7: ERROR LOG FILE LIST (sizes / dates)
 SET NOCOUNT ON;
@@ -5022,7 +5054,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_high_severity_errors;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_high_severity_errors
+    @definition = N'ALTER PROCEDURE dbo.HC_high_severity_errors
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.8: HIGH SEVERITY ERRORS FROM system_health (XE)
 SET NOCOUNT ON;
@@ -5046,7 +5078,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_tier @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_tier
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_tier
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.1: SERVICE TIER / SIZE / LIMITS (user DB)
@@ -5076,7 +5108,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_resource_1h @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_resource_1h
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_resource_1h
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.2: RESOURCE USAGE - LAST HOUR (15-second samples) (user DB)
@@ -5111,7 +5143,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_waits @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_waits
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_waits
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.5: WAIT STATS - THIS DATABASE (user DB)
@@ -5138,7 +5170,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_space @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_space
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_space
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.6: SPACE USED vs ALLOCATED vs MAX (user DB)
@@ -5164,7 +5196,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_geo_repl @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_geo_repl
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_geo_repl
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.7: GEO-REPLICATION / FAILOVER GROUP LINK STATUS (user DB)
@@ -5188,7 +5220,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_auto_tuning @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_auto_tuning
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_auto_tuning
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.9: AUTOMATIC TUNING (user DB)
@@ -5218,7 +5250,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_connections @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_connections
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_connections
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.10: ACTIVE CONNECTIONS vs LIMIT (user DB)
@@ -5244,7 +5276,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_pvs @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_sqldb_pvs
+    @definition = N'ALTER PROCEDURE dbo.HC_sqldb_pvs
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.11: PERSISTENT VERSION STORE (ADR is always on in Azure SQL DB) (user DB)
@@ -5273,14 +5305,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_check;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_mi_check
+    @definition = N'ALTER VIEW dbo.HC_mi_check
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.1: AM I ON A MANAGED INSTANCE?
 SELECT SERVERPROPERTY(''EngineEdition'') AS engine_edition,
        SERVERPROPERTY(''ServerName'')    AS server_name,
        @@VERSION                       AS version;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_check
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_mi_check
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.1: AM I ON A MANAGED INSTANCE?
 SET NOCOUNT ON;
@@ -5297,7 +5329,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_mi_resource_history;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_resource_history
+    @definition = N'ALTER PROCEDURE dbo.HC_mi_resource_history
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.2: INSTANCE RESOURCE HISTORY - CPU / STORAGE / IO (master)
 SET NOCOUNT ON;
@@ -5325,12 +5357,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_governance;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_mi_governance
+    @definition = N'ALTER VIEW dbo.HC_mi_governance
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.3: INSTANCE GOVERNANCE LIMITS (log rate, IOPS, memory)
 SELECT * FROM sys.dm_instance_resource_governance;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_governance
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_mi_governance
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.3: INSTANCE GOVERNANCE LIMITS (log rate, IOPS, memory)
 SET NOCOUNT ON;
@@ -5345,7 +5377,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_mi_storage;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_storage
+    @definition = N'ALTER PROCEDURE dbo.HC_mi_storage
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.4: STORAGE: INSTANCE TOTAL vs RESERVED
 SET NOCOUNT ON;
@@ -5370,7 +5402,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_gp_file_perf ORDER BY total_io DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY total_io DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_mi_gp_file_perf
+    @definition = N'ALTER VIEW dbo.HC_mi_gp_file_perf
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.5: GENERAL PURPOSE: FILE SIZE vs REMOTE STORAGE PERFORMANCE
 SELECT DB_NAME(mf.database_id) AS database_name, mf.name, mf.type_desc,
@@ -5381,7 +5413,7 @@ SELECT DB_NAME(mf.database_id) AS database_name, mf.name, mf.type_desc,
 FROM sys.master_files AS mf
 JOIN sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs ON vfs.database_id = mf.database_id AND vfs.file_id = mf.file_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_gp_file_perf
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_mi_gp_file_perf
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.5: GENERAL PURPOSE: FILE SIZE vs REMOTE STORAGE PERFORMANCE
 SET NOCOUNT ON;
@@ -5403,7 +5435,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_log_rate_waits ORDER BY wait_time_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wait_time_ms DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_mi_log_rate_waits
+    @definition = N'ALTER VIEW dbo.HC_mi_log_rate_waits
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.6: LOG RATE GOVERNANCE WAITS
 SELECT wait_type, waiting_tasks_count, wait_time_ms
@@ -5412,7 +5444,7 @@ WHERE wait_type IN (N''INSTANCE_LOG_RATE_GOVERNOR'', N''LOG_RATE_GOVERNOR'', N''
                     N''HADR_THROTTLE_LOG_RATE_GOVERNOR'', N''HADR_THROTTLE_LOG_RATE_SEND_RECV_QUEUE_SIZE'',
                     N''WRITELOG'', N''IO_QUEUE_LIMIT'');
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_log_rate_waits
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_mi_log_rate_waits
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.6: LOG RATE GOVERNANCE WAITS
 SET NOCOUNT ON;
@@ -5432,7 +5464,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_replica_state ORDER BY database_name, is_primary_replica DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY database_name, is_primary_replica DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_mi_replica_state
+    @definition = N'ALTER VIEW dbo.HC_mi_replica_state
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.7: BUSINESS CRITICAL / FAILOVER GROUP REPLICA STATE
 SELECT DB_NAME(database_id) AS database_name, is_local, is_primary_replica,
@@ -5440,7 +5472,7 @@ SELECT DB_NAME(database_id) AS database_name, is_local, is_primary_replica,
        log_send_queue_size, redo_queue_size, secondary_lag_seconds, last_commit_time
 FROM sys.dm_hadr_database_replica_states;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_replica_state
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_mi_replica_state
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.7: BUSINESS CRITICAL / FAILOVER GROUP REPLICA STATE
 SET NOCOUNT ON;
@@ -5459,7 +5491,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_backup_history ORDER BY backup_start_date DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_mi_backup_history
+    @definition = N'ALTER VIEW dbo.HC_mi_backup_history
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.8: BACKUP HISTORY ON MI
 SELECT TOP (50) database_name, type, backup_start_date, backup_finish_date,
@@ -5467,7 +5499,7 @@ SELECT TOP (50) database_name, type, backup_start_date, backup_finish_date,
 FROM msdb.dbo.backupset
 ORDER BY backup_start_date DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_mi_backup_history
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_mi_backup_history
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.8: BACKUP HISTORY ON MI
 SET NOCOUNT ON;
@@ -5485,7 +5517,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_xe_sessions;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_xe_sessions
+    @definition = N'ALTER PROCEDURE dbo.HC_xe_sessions
 AS
 -- Toolkit 18_extended_events.sql section 18.1: RUNNING XE SESSIONS & TARGETS
 SET NOCOUNT ON;
@@ -5505,7 +5537,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_xe_blocked_process;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_xe_blocked_process
+    @definition = N'ALTER PROCEDURE dbo.HC_xe_blocked_process
 AS
 -- Toolkit 18_extended_events.sql section 18.2: BLOCKED PROCESS REPORT (who blocked whom, > N seconds)
 SET NOCOUNT ON;
@@ -5528,7 +5560,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_xe_long_queries;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_xe_long_queries
+    @definition = N'ALTER PROCEDURE dbo.HC_xe_long_queries
 AS
 -- Toolkit 18_extended_events.sql section 18.3: LONG-RUNNING QUERIES (> 5 seconds)
 SET NOCOUNT ON;
@@ -5556,7 +5588,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_generate_index_maint @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_generate_index_maint
+    @definition = N'ALTER PROCEDURE dbo.HC_generate_index_maint
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.1: GENERATE INDEX REORG / REBUILD - CURRENT DB
@@ -5600,7 +5632,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_generate_stats_update @database_name = N''YourDB'', @min_mod_pct = 10.0;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_generate_stats_update
+    @definition = N'ALTER PROCEDURE dbo.HC_generate_stats_update
     @database_name sysname = NULL,
     @min_mod_pct decimal(5,2) = 10.0
 AS
@@ -5633,7 +5665,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_find_object @object_name = N''%Customer%'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_find_object
+    @definition = N'ALTER PROCEDURE dbo.HC_find_object
     @object_name nvarchar(128) = N''%Customer%''
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.4: FIND AN OBJECT BY NAME ACROSS ALL DATABASES
@@ -5658,7 +5690,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_find_column @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_find_column
+    @definition = N'ALTER PROCEDURE dbo.HC_find_column
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.5: FIND A COLUMN BY NAME - CURRENT DB
@@ -5685,7 +5717,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_search_code @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_search_code
+    @definition = N'ALTER PROCEDURE dbo.HC_search_code
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.6: SEARCH CODE (procs, views, functions, triggers) - CURRENT DB
@@ -5712,7 +5744,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_row_counts @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_row_counts
+    @definition = N'ALTER PROCEDURE dbo.HC_row_counts
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.7: FAST ROW COUNTS - CURRENT DB (no table scans)
@@ -5739,7 +5771,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_recently_modified @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_recently_modified
+    @definition = N'ALTER PROCEDURE dbo.HC_recently_modified
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.8: RECENTLY MODIFIED OBJECTS (what changed?) - CURRENT DB
@@ -5764,7 +5796,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_v2017_features @database_name = N''YourDB'';',
     @min_version = 14,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_v2017_features
+    @definition = N'ALTER PROCEDURE dbo.HC_v2017_features
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.1: 2017+ : HOST INFO, AUTOMATIC TUNING, RESUMABLE INDEX
@@ -5788,7 +5820,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_adr_status @database_name = N''YourDB'';',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_adr_status
+    @definition = N'ALTER PROCEDURE dbo.HC_adr_status
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.2: 2019+ : ACCELERATED DATABASE RECOVERY (ADR)
@@ -5815,7 +5847,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_decode_page;',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_decode_page
+    @definition = N'ALTER VIEW dbo.HC_decode_page
 AS
 -- Toolkit 20_version_specific_features.sql section 20.3: 2019+ : DECODE A wait_resource PAGE (PAGELATCH / PAGEIOLATCH)
 SELECT r.session_id, r.wait_type, r.wait_resource,
@@ -5826,7 +5858,7 @@ CROSS APPLY sys.fn_PageResCracker(r.page_resource) AS prc
 CROSS APPLY sys.dm_db_page_info(prc.db_id, prc.file_id, prc.page_id, ''LIMITED'') AS pi
 WHERE r.page_resource IS NOT NULL;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_decode_page
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_decode_page
 AS
 -- Toolkit 20_version_specific_features.sql section 20.3: 2019+ : DECODE A wait_resource PAGE (PAGELATCH / PAGEIOLATCH)
 SET NOCOUNT ON;
@@ -5847,7 +5879,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_last_actual_plan;',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_last_actual_plan
+    @definition = N'ALTER VIEW dbo.HC_last_actual_plan
 AS
 -- Toolkit 20_version_specific_features.sql section 20.4: 2019+ : LAST ACTUAL EXECUTION PLAN FROM CACHE
 SELECT TOP (10) DB_NAME(t.dbid) AS database_name, qs.execution_count, t.text, qps.query_plan AS last_actual_plan
@@ -5856,7 +5888,7 @@ CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS t
 CROSS APPLY sys.dm_exec_query_plan_stats(qs.plan_handle) AS qps
 ORDER BY qs.total_worker_time DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_last_actual_plan
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_last_actual_plan
 AS
 -- Toolkit 20_version_specific_features.sql section 20.4: 2019+ : LAST ACTUAL EXECUTION PLAN FROM CACHE
 SET NOCOUNT ON;
@@ -5875,7 +5907,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_missing_index_queries;',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_missing_index_queries
+    @definition = N'ALTER VIEW dbo.HC_missing_index_queries
 AS
 -- Toolkit 20_version_specific_features.sql section 20.5: 2019+ : MISSING INDEX -> WHICH QUERY ASKED FOR IT
 SELECT TOP (20) mid.statement AS table_name, mid.equality_columns, mid.inequality_columns, mid.included_columns,
@@ -5889,7 +5921,7 @@ JOIN sys.dm_db_missing_index_details AS mid ON mid.index_handle = mig.index_hand
 CROSS APPLY sys.dm_exec_sql_text(migsq.last_sql_handle) AS t
 ORDER BY migsq.avg_total_user_cost * migsq.avg_user_impact * migsq.user_seeks DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_missing_index_queries
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_missing_index_queries
 AS
 -- Toolkit 20_version_specific_features.sql section 20.5: 2019+ : MISSING INDEX -> WHICH QUERY ASKED FOR IT
 SET NOCOUNT ON;
@@ -5913,7 +5945,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_iqp_settings @database_name = N''YourDB'';',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_iqp_settings
+    @definition = N'ALTER PROCEDURE dbo.HC_iqp_settings
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.6: 2019+ : INTELLIGENT QUERY PROCESSING SETTINGS (current DB)
@@ -5943,12 +5975,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_contained_ags;',
     @min_version = 16,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_contained_ags
+    @definition = N'ALTER VIEW dbo.HC_contained_ags
 AS
 -- Toolkit 20_version_specific_features.sql section 20.7: 2022+ : CONTAINED AVAILABILITY GROUPS
 SELECT name, is_contained, cluster_type_desc FROM sys.availability_groups;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_contained_ags
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_contained_ags
 AS
 -- Toolkit 20_version_specific_features.sql section 20.7: 2022+ : CONTAINED AVAILABILITY GROUPS
 SET NOCOUNT ON;
@@ -5963,7 +5995,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_psp_variants @database_name = N''YourDB'';',
     @min_version = 16,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_psp_variants
+    @definition = N'ALTER PROCEDURE dbo.HC_psp_variants
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.8: 2022+ : PARAMETER SENSITIVE PLAN (PSP) VARIANTS IN QUERY STORE
@@ -5988,7 +6020,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ledger_tables @database_name = N''YourDB'';',
     @min_version = 16,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ledger_tables
+    @definition = N'ALTER PROCEDURE dbo.HC_ledger_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.9: 2022+ : LEDGER TABLES
@@ -6012,12 +6044,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_oom_events_2022;',
     @min_version = 16,
     @sort_hint = N'ORDER BY event_time DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_oom_events_2022
+    @definition = N'ALTER VIEW dbo.HC_oom_events_2022
 AS
 -- Toolkit 20_version_specific_features.sql section 20.10: 2022+ : OUT-OF-MEMORY EVENTS
 SELECT * FROM sys.dm_os_out_of_memory_events;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_oom_events_2022
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_oom_events_2022
 AS
 -- Toolkit 20_version_specific_features.sql section 20.10: 2022+ : OUT-OF-MEMORY EVENTS
 SET NOCOUNT ON;
@@ -6032,7 +6064,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_optimized_locking ORDER BY name;',
     @min_version = 17,
     @sort_hint = N'ORDER BY name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_optimized_locking
+    @definition = N'ALTER VIEW dbo.HC_optimized_locking
 AS
 -- Toolkit 20_version_specific_features.sql section 20.11: 2025 (and Azure SQL DB) : OPTIMIZED LOCKING
 SELECT name,
@@ -6042,7 +6074,7 @@ SELECT name,
 FROM sys.databases
 WHERE database_id > 4;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_optimized_locking
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_optimized_locking
 AS
 -- Toolkit 20_version_specific_features.sql section 20.11: 2025 (and Azure SQL DB) : OPTIMIZED LOCKING
 SET NOCOUNT ON;
@@ -6063,7 +6095,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_version_decoder;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_version_decoder
+    @definition = N'ALTER PROCEDURE dbo.HC_version_decoder
 AS
 -- Toolkit 20_version_specific_features.sql section 20.12: QUICK "WHAT VERSION AM I ON" DECODER
 SET NOCOUNT ON;
@@ -6091,7 +6123,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_ct_databases;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_ct_databases
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_ct_databases
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.1: DATABASES WITH CDC / CHANGE TRACKING ENABLED
 SET NOCOUNT ON;
@@ -6114,7 +6146,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_tables
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.2: CDC TRACKED TABLES & CAPTURE INSTANCES - CURRENT DB
@@ -6148,7 +6180,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_columns @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_columns
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_columns
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.3: CAPTURED COLUMNS PER CAPTURE INSTANCE - CURRENT DB
@@ -6173,7 +6205,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_schema_drift @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_schema_drift
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_schema_drift
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.4: SOURCE TABLE COLUMNS NOT CAPTURED (schema drift after enabling CDC)
@@ -6202,7 +6234,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_latency @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_latency
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_latency
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.5: CDC CAPTURE LATENCY & THROUGHPUT (log scan sessions)
@@ -6228,7 +6260,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_errors @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_errors
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_errors
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.6: CDC ERRORS
@@ -6252,7 +6284,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_jobs;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_jobs
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_jobs
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.7: CDC AGENT JOBS & SETTINGS (retention, polling)
 SET NOCOUNT ON;
@@ -6279,14 +6311,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_cdc_log_hold;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_cdc_log_hold
+    @definition = N'ALTER VIEW dbo.HC_cdc_log_hold
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.8: CDC IS HOLDING THE LOG? (log_reuse_wait = REPLICATION)
 SELECT name, is_cdc_enabled, is_published, log_reuse_wait_desc
 FROM sys.databases
 WHERE log_reuse_wait_desc = N''REPLICATION'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_log_hold
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_cdc_log_hold
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.8: CDC IS HOLDING THE LOG? (log_reuse_wait = REPLICATION)
 SET NOCOUNT ON;
@@ -6303,7 +6335,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_table_sizes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_cdc_table_sizes
+    @definition = N'ALTER PROCEDURE dbo.HC_cdc_table_sizes
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.9: CHANGE TABLE SIZES - CURRENT DB
@@ -6331,7 +6363,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ct_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ct_tables
+    @definition = N'ALTER PROCEDURE dbo.HC_ct_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.13: CHANGE TRACKING - TABLES & VERSIONS - CURRENT DB
@@ -6368,7 +6400,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tde_status;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tde_status
+    @definition = N'ALTER PROCEDURE dbo.HC_tde_status
 AS
 -- Toolkit 22_tde_encryption.sql section 22.1: TDE STATUS PER DATABASE + PROTECTING CERTIFICATE
 SET NOCOUNT ON;
@@ -6398,7 +6430,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_dbs_not_encrypted ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY d.name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_dbs_not_encrypted
+    @definition = N'ALTER VIEW dbo.HC_dbs_not_encrypted
 AS
 -- Toolkit 22_tde_encryption.sql section 22.2: USER DATABASES NOT ENCRYPTED
 SELECT d.name, d.is_encrypted, d.state_desc
@@ -6407,7 +6439,7 @@ LEFT JOIN sys.dm_database_encryption_keys AS dek ON dek.database_id = d.database
 WHERE d.database_id > 4
   AND ISNULL(dek.encryption_state, 1) <> 3;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_dbs_not_encrypted
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_dbs_not_encrypted
 AS
 -- Toolkit 22_tde_encryption.sql section 22.2: USER DATABASES NOT ENCRYPTED
 SET NOCOUNT ON;
@@ -6427,7 +6459,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_certificates;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_certificates
+    @definition = N'ALTER PROCEDURE dbo.HC_certificates
 AS
 -- Toolkit 22_tde_encryption.sql section 22.3: CERTIFICATES IN MASTER - EXPIRY & PRIVATE KEY BACKUP
 SET NOCOUNT ON;
@@ -6453,7 +6485,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_master_keys;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_master_keys
+    @definition = N'ALTER PROCEDURE dbo.HC_master_keys
 AS
 -- Toolkit 22_tde_encryption.sql section 22.4: DATABASE MASTER KEY (master DB) & SERVICE MASTER KEY
 SET NOCOUNT ON;
@@ -6475,7 +6507,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tde_progress;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_tde_progress
+    @definition = N'ALTER VIEW dbo.HC_tde_progress
 AS
 -- Toolkit 22_tde_encryption.sql section 22.5: TDE PROGRESS (encryption / decryption scan)
 SELECT DB_NAME(database_id) AS database_name, encryption_state, percent_complete
@@ -6483,7 +6515,7 @@ SELECT DB_NAME(database_id) AS database_name, encryption_state, percent_complete
 FROM sys.dm_database_encryption_keys
 WHERE encryption_state IN (2, 4, 5, 6);
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tde_progress
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tde_progress
 AS
 -- Toolkit 22_tde_encryption.sql section 22.5: TDE PROGRESS (encryption / decryption scan)
 SET NOCOUNT ON;
@@ -6501,7 +6533,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_encrypted_backups;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_encrypted_backups
+    @definition = N'ALTER PROCEDURE dbo.HC_encrypted_backups
 AS
 -- Toolkit 22_tde_encryption.sql section 22.6: ENCRYPTED BACKUPS - WHICH CERT / ALGORITHM
 SET NOCOUNT ON;
@@ -6524,7 +6556,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tde_cert_thumbprints;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_tde_cert_thumbprints
+    @definition = N'ALTER PROCEDURE dbo.HC_tde_cert_thumbprints
 AS
 -- Toolkit 22_tde_encryption.sql section 22.7: ALWAYS ON + TDE: CERT THUMBPRINTS TO COMPARE ACROSS REPLICAS
 SET NOCOUNT ON;
@@ -6546,7 +6578,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ekm_akv;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ekm_akv
+    @definition = N'ALTER PROCEDURE dbo.HC_ekm_akv
 AS
 -- Toolkit 22_tde_encryption.sql section 22.8: EKM / AZURE KEY VAULT (customer-managed keys)
 SET NOCOUNT ON;
@@ -6565,7 +6597,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_always_encrypted @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_always_encrypted
+    @definition = N'ALTER PROCEDURE dbo.HC_always_encrypted
     @database_name sysname = NULL
 AS
 -- Toolkit 22_tde_encryption.sql section 22.9: ALWAYS ENCRYPTED INVENTORY - CURRENT DB
@@ -6599,7 +6631,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_masked_columns @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_masked_columns
+    @definition = N'ALTER PROCEDURE dbo.HC_masked_columns
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.1: MASKED COLUMNS
@@ -6626,7 +6658,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_unmask_permissions @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_unmask_permissions
+    @definition = N'ALTER PROCEDURE dbo.HC_unmask_permissions
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.2: WHO CAN SEE UNMASKED DATA
@@ -6661,7 +6693,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_unmasked_sensitive_cols @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_unmasked_sensitive_cols
+    @definition = N'ALTER PROCEDURE dbo.HC_unmasked_sensitive_cols
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.4: POSSIBLY SENSITIVE COLUMNS NOT MASKED (name-based finder)
@@ -6696,7 +6728,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_rls_policies @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_rls_policies
+    @definition = N'ALTER PROCEDURE dbo.HC_rls_policies
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.6: ROW-LEVEL SECURITY POLICIES & PREDICATES
@@ -6723,7 +6755,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_data_classification @database_name = N''YourDB'';',
     @min_version = 15,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_data_classification
+    @definition = N'ALTER PROCEDURE dbo.HC_data_classification
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.7: DATA CLASSIFICATION / SENSITIVITY LABELS (2019+, Azure)
@@ -6749,7 +6781,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_protection_summary @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_protection_summary
+    @definition = N'ALTER PROCEDURE dbo.HC_protection_summary
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.8: PROTECTION SUMMARY PER TABLE
@@ -6779,7 +6811,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_missing_indexes_per_table @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_missing_indexes_per_table
+    @definition = N'ALTER PROCEDURE dbo.HC_missing_indexes_per_table
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.1: MISSING INDEXES CONSOLIDATED PER TABLE - CURRENT DB
@@ -6816,7 +6848,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_column_map @database_name = N''YourDB'', @table = N''dbo.YourTable'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_index_column_map
+    @definition = N'ALTER PROCEDURE dbo.HC_index_column_map
     @database_name sysname = NULL,
     @table sysname = N''dbo.YourTable''
 AS
@@ -6846,7 +6878,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_key_lookups;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_key_lookups
+    @definition = N'ALTER PROCEDURE dbo.HC_key_lookups
 AS
 -- Toolkit 24_index_tuning.sql section 24.3: KEY / RID LOOKUPS IN CACHED PLANS (covering index candidates)
 SET NOCOUNT ON;
@@ -6883,7 +6915,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_scans_in_cache;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_scans_in_cache
+    @definition = N'ALTER PROCEDURE dbo.HC_scans_in_cache
 AS
 -- Toolkit 24_index_tuning.sql section 24.4: TABLE / CLUSTERED INDEX SCANS IN CACHED PLANS
 SET NOCOUNT ON;
@@ -6914,7 +6946,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_fk_without_index @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_fk_without_index
+    @definition = N'ALTER PROCEDURE dbo.HC_fk_without_index
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.5: FOREIGN KEYS WITHOUT A SUPPORTING INDEX - CURRENT DB
@@ -6965,7 +6997,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_clustered_key_review @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_clustered_key_review
+    @definition = N'ALTER PROCEDURE dbo.HC_clustered_key_review
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.6: CLUSTERED INDEX KEY REVIEW - CURRENT DB
@@ -7003,7 +7035,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_over_indexed_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_over_indexed_tables
+    @definition = N'ALTER PROCEDURE dbo.HC_over_indexed_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.7: OVER-INDEXED & WIDE INDEXES - CURRENT DB
@@ -7047,7 +7079,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_page_splits @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_page_splits
+    @definition = N'ALTER PROCEDURE dbo.HC_page_splits
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.8: PAGE SPLITS (instance counter + per-index "bad" splits)
@@ -7083,7 +7115,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_fill_factors @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_fill_factors
+    @definition = N'ALTER PROCEDURE dbo.HC_fill_factors
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.9: NON-DEFAULT FILL FACTORS - CURRENT DB
@@ -7109,7 +7141,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compression_candidates @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_compression_candidates
+    @definition = N'ALTER PROCEDURE dbo.HC_compression_candidates
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.10: COMPRESSION CANDIDATES - LARGE UNCOMPRESSED INDEXES
@@ -7144,7 +7176,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_partitions @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_partitions
+    @definition = N'ALTER PROCEDURE dbo.HC_partitions
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.11: PARTITIONED TABLES - BOUNDARIES & ROWS PER PARTITION
@@ -7179,7 +7211,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_disabled_hypothetical_indexes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_disabled_hypothetical_indexes
+    @definition = N'ALTER PROCEDURE dbo.HC_disabled_hypothetical_indexes
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.12: DISABLED & HYPOTHETICAL (leftover DTA) INDEXES
@@ -7208,7 +7240,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_alert @max_send_queue_kb = 1048576, @max_redo_queue_kb = 1048576, @max_lag_s = 300;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_alert
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_alert
     @max_send_queue_kb bigint = 1048576,
     @max_redo_queue_kb bigint = 1048576,
     @max_lag_s int = 300
@@ -7254,7 +7286,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_not_syncing_checklist;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_not_syncing_checklist
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_not_syncing_checklist
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.2: "NOT SYNCHRONIZING" TROUBLESHOOTING CHECKLIST
 SET NOCOUNT ON;
@@ -7282,7 +7314,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_redo_blocked;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_redo_blocked
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_redo_blocked
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.3: READABLE SECONDARY: REDO BLOCKED BY REPORTING QUERIES
 SET NOCOUNT ON;
@@ -7310,7 +7342,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_secondary_version_store;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_secondary_version_store
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_secondary_version_store
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.4: READABLE SECONDARY: VERSION STORE / GHOST CLEANUP IMPACT
 SET NOCOUNT ON;
@@ -7335,7 +7367,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_commit_latency;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_commit_latency
+    @definition = N'ALTER VIEW dbo.HC_ag_commit_latency
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.5: COMMIT LATENCY ON THE PRIMARY (sync replicas)
 SELECT RTRIM(instance_name) AS database_name,
@@ -7346,7 +7378,7 @@ WHERE object_name LIKE N''%Database Replica%''
   AND counter_name IN (N''Transaction Delay'', N''Mirrored Write Transactions/sec'')
 GROUP BY instance_name;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_commit_latency
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_commit_latency
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.5: COMMIT LATENCY ON THE PRIMARY (sync replicas)
 SET NOCOUNT ON;
@@ -7367,7 +7399,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_distributed_ags;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_distributed_ags
+    @definition = N'ALTER PROCEDURE dbo.HC_distributed_ags
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.6: DISTRIBUTED AVAILABILITY GROUPS
 SET NOCOUNT ON;
@@ -7396,12 +7428,12 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_contained_ags_detail;',
     @min_version = 16,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_contained_ags_detail
+    @definition = N'ALTER VIEW dbo.HC_contained_ags_detail
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.7: CONTAINED AVAILABILITY GROUPS (2022+)
 SELECT name, is_contained, cluster_type_desc FROM sys.availability_groups WHERE is_contained = 1;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_contained_ags_detail
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_contained_ags_detail
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.7: CONTAINED AVAILABILITY GROUPS (2022+)
 SET NOCOUNT ON;
@@ -7416,7 +7448,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_login_drift ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_login_drift
+    @definition = N'ALTER VIEW dbo.HC_ag_login_drift
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.8: LOGIN DRIFT BETWEEN REPLICAS
 SELECT @@SERVERNAME AS replica, name, type_desc, sid, is_disabled, default_database_name,
@@ -7424,7 +7456,7 @@ SELECT @@SERVERNAME AS replica, name, type_desc, sid, is_disabled, default_datab
 FROM sys.server_principals
 WHERE type IN (''S'', ''U'', ''G'') AND name NOT LIKE N''##%'' AND name NOT LIKE N''NT %'';
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_login_drift
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_login_drift
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.8: LOGIN DRIFT BETWEEN REPLICAS
 SET NOCOUNT ON;
@@ -7443,13 +7475,13 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_job_drift ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY j.name',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_job_drift
+    @definition = N'ALTER VIEW dbo.HC_ag_job_drift
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.9: JOB DRIFT BETWEEN REPLICAS + "AM I PRIMARY" JOB GUARD
 SELECT @@SERVERNAME AS replica, j.name, j.enabled, j.date_modified
 FROM msdb.dbo.sysjobs AS j;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_job_drift
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_job_drift
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.9: JOB DRIFT BETWEEN REPLICAS + "AM I PRIMARY" JOB GUARD
 SET NOCOUNT ON;
@@ -7466,7 +7498,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_backup_preference;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_ag_backup_preference
+    @definition = N'ALTER VIEW dbo.HC_ag_backup_preference
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.10: BACKUP PREFERENCE CHECK PER DATABASE (run on each replica)
 SELECT ag.name AS ag_name, ag.automated_backup_preference_desc, ar.replica_server_name, ar.backup_priority,
@@ -7476,7 +7508,7 @@ FROM sys.availability_groups AS ag
 JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id AND ar.replica_server_name = @@SERVERNAME
 JOIN sys.availability_databases_cluster AS adc ON adc.group_id = ag.group_id;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_backup_preference
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_backup_preference
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.10: BACKUP PREFERENCE CHECK PER DATABASE (run on each replica)
 SET NOCOUNT ON;
@@ -7496,7 +7528,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_config;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filestream_config
+    @definition = N'ALTER PROCEDURE dbo.HC_filestream_config
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.1: INSTANCE FILESTREAM CONFIGURATION
 SET NOCOUNT ON;
@@ -7516,7 +7548,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_dbs;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filestream_dbs
+    @definition = N'ALTER PROCEDURE dbo.HC_filestream_dbs
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.2: DATABASES USING FILESTREAM + NON-TRANSACTED ACCESS (FileTable)
 SET NOCOUNT ON;
@@ -7541,7 +7573,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_containers @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filestream_containers
+    @definition = N'ALTER PROCEDURE dbo.HC_filestream_containers
     @database_name sysname = NULL
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.3: FILESTREAM FILEGROUPS & CONTAINERS - CURRENT DB
@@ -7570,7 +7602,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_columns @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filestream_columns
+    @definition = N'ALTER PROCEDURE dbo.HC_filestream_columns
     @database_name sysname = NULL
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.4: TABLES / COLUMNS STORING FILESTREAM DATA - CURRENT DB
@@ -7599,7 +7631,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filetables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filetables
+    @definition = N'ALTER PROCEDURE dbo.HC_filetables
     @database_name sysname = NULL
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.5: FILETABLES - CURRENT DB
@@ -7624,14 +7656,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_filetable_handles ORDER BY open_time;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY open_time',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_filetable_handles
+    @definition = N'ALTER VIEW dbo.HC_filetable_handles
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.6: OPEN NON-TRANSACTED HANDLES (who has FileTable files open)
 SELECT DB_NAME(database_id) AS database_name, OBJECT_NAME(object_id, database_id) AS filetable_name,
        handle_id, opened_file_name, login_name, open_time, read_access, write_access, share_read, share_write
 FROM sys.dm_filestream_non_transacted_handles;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filetable_handles
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_filetable_handles
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.6: OPEN NON-TRANSACTED HANDLES (who has FileTable files open)
 SET NOCOUNT ON;
@@ -7649,7 +7681,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_filestream_waits ORDER BY wait_time_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wait_time_ms DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_filestream_waits
+    @definition = N'ALTER VIEW dbo.HC_filestream_waits
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.8: FILESTREAM-RELATED WAITS
 SELECT wait_type, waiting_tasks_count, wait_time_ms,
@@ -7658,7 +7690,7 @@ FROM sys.dm_os_wait_stats
 WHERE (wait_type LIKE N''FS%'' OR wait_type LIKE N''FILESTREAM%'' OR wait_type LIKE N''%FSAGENT%'' OR wait_type LIKE N''FFT%'')
   AND waiting_tasks_count > 0;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_filestream_waits
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_filestream_waits
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.8: FILESTREAM-RELATED WAITS
 SET NOCOUNT ON;
@@ -7678,7 +7710,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_schema_fingerprint @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_schema_fingerprint
+    @definition = N'ALTER PROCEDURE dbo.HC_schema_fingerprint
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.1: SCHEMA FINGERPRINT - CURRENT DB (run on both envs, compare)
@@ -7731,7 +7763,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compare_db_objects @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_compare_db_objects
+    @definition = N'ALTER PROCEDURE dbo.HC_compare_db_objects
     @source_db sysname = N''App_PROD_Copy'',
     @target_db sysname = N''App_UAT''
 AS
@@ -7768,7 +7800,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compare_db_columns @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_compare_db_columns
+    @definition = N'ALTER PROCEDURE dbo.HC_compare_db_columns
     @source_db sysname = N''App_PROD_Copy'',
     @target_db sysname = N''App_UAT''
 AS
@@ -7805,7 +7837,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_broken_objects @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_broken_objects
+    @definition = N'ALTER PROCEDURE dbo.HC_broken_objects
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.4: BROKEN OBJECTS - CURRENT DB
@@ -7859,7 +7891,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_constraint_integrity @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_constraint_integrity
+    @definition = N'ALTER PROCEDURE dbo.HC_constraint_integrity
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.5: CONSTRAINT & TRIGGER INTEGRITY - CURRENT DB
@@ -7894,7 +7926,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_exact_row_counts @database_name = N''YourDB'', @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_exact_row_counts
+    @definition = N'ALTER PROCEDURE dbo.HC_exact_row_counts
     @database_name sysname = NULL,
     @source_db sysname = N''App_PROD_Copy'',
     @target_db sysname = N''App_UAT''
@@ -7937,7 +7969,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_collation_mismatches @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_collation_mismatches
+    @definition = N'ALTER PROCEDURE dbo.HC_collation_mismatches
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.7: COLLATION MISMATCHES (column vs database) - CURRENT DB
@@ -7966,7 +7998,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_column_type_mismatches @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_column_type_mismatches
+    @definition = N'ALTER PROCEDURE dbo.HC_column_type_mismatches
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.8: SAME COLUMN NAME, DIFFERENT DATA TYPES - CURRENT DB
@@ -7997,7 +8029,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_identity_near_max @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_identity_near_max
+    @definition = N'ALTER PROCEDURE dbo.HC_identity_near_max
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.9: IDENTITY COLUMNS CLOSE TO THEIR MAXIMUM - CURRENT DB
@@ -8030,7 +8062,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_object_counts @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_object_counts
+    @definition = N'ALTER PROCEDURE dbo.HC_object_counts
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.10: OBJECT COUNTS BY TYPE (quick env-to-env sanity check)
@@ -8059,7 +8091,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_failed_logins_decoded;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_failed_logins_decoded
+    @definition = N'ALTER PROCEDURE dbo.HC_failed_logins_decoded
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.1: FAILED LOGINS DECODED (error 18456 state -> reason)
 SET NOCOUNT ON;
@@ -8108,7 +8140,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_connectivity_ring_buffer;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_connectivity_ring_buffer
+    @definition = N'ALTER PROCEDURE dbo.HC_connectivity_ring_buffer
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.2: CONNECTIVITY RING BUFFER (closed connections, login timeouts)
 SET NOCOUNT ON;
@@ -8151,7 +8183,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_auth_scheme_spn;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_auth_scheme_spn
+    @definition = N'ALTER PROCEDURE dbo.HC_auth_scheme_spn
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.3: KERBEROS OR NTLM? + SPN CHECKS
 SET NOCOUNT ON;
@@ -8172,7 +8204,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_listening_ports;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_listening_ports
+    @definition = N'ALTER PROCEDURE dbo.HC_listening_ports
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.4: WHAT IS SQL LISTENING ON? (ports, protocols, TLS)
 SET NOCOUNT ON;
@@ -8197,7 +8229,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_connection_storms;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_connection_storms
+    @definition = N'ALTER PROCEDURE dbo.HC_connection_storms
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.5: CONNECTION STORMS / POOL LEAKS
 SET NOCOUNT ON;
@@ -8224,7 +8256,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_linked_server_check;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_linked_server_check
+    @definition = N'ALTER VIEW dbo.HC_linked_server_check
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.6: LINKED SERVER TROUBLESHOOTING
 SELECT r.session_id, r.wait_type, r.wait_time, s.login_name, t.text
@@ -8233,7 +8265,7 @@ JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
 OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
 WHERE r.wait_type IN (N''OLEDB'', N''PREEMPTIVE_OLEDBOPS'', N''PREEMPTIVE_OS_AUTHENTICATIONOPS'', N''MSQL_DQ'');
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_linked_server_check
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_linked_server_check
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.6: LINKED SERVER TROUBLESHOOTING
 SET NOCOUNT ON;
@@ -8252,7 +8284,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_dtc_orphans;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_dtc_orphans
+    @definition = N'ALTER PROCEDURE dbo.HC_dtc_orphans
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.7: DISTRIBUTED TRANSACTIONS (DTC) & ORPHANED SPID -2
 SET NOCOUNT ON;
@@ -8277,7 +8309,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_service_broker @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_service_broker
+    @definition = N'ALTER PROCEDURE dbo.HC_service_broker
     @database_name sysname = NULL
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.8: SERVICE BROKER HEALTH - CURRENT DB
@@ -8313,7 +8345,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stack_dumps_nonyield;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_stack_dumps_nonyield
+    @definition = N'ALTER PROCEDURE dbo.HC_stack_dumps_nonyield
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.9: HANGS, STACK DUMPS, NON-YIELDING SCHEDULERS
 SET NOCOUNT ON;
@@ -8347,7 +8379,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stats_histogram @database_name = N''YourDB'', @table = N''dbo.Orders'', @stats_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_stats_histogram
+    @definition = N'ALTER PROCEDURE dbo.HC_stats_histogram
     @database_name sysname = NULL,
     @table sysname = N''dbo.Orders'',
     @stats_id int = 1
@@ -8384,7 +8416,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ascending_key @database_name = N''YourDB'', @table = N''dbo.Orders'', @stats_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ascending_key
+    @definition = N'ALTER PROCEDURE dbo.HC_ascending_key
     @database_name sysname = NULL,
     @table sysname = N''dbo.Orders'',
     @stats_id int = 1
@@ -8410,7 +8442,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stats_past_threshold @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_stats_past_threshold
+    @definition = N'ALTER PROCEDURE dbo.HC_stats_past_threshold
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.3: STATS PAST THE AUTO-UPDATE THRESHOLD BUT NOT YET UPDATED
@@ -8443,7 +8475,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_est_vs_actual_rows @database_name = N''YourDB'', @spid = 55;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_est_vs_actual_rows
+    @definition = N'ALTER PROCEDURE dbo.HC_est_vs_actual_rows
     @database_name sysname = NULL,
     @spid int = 55
 AS
@@ -8472,7 +8504,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_parallelism;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_parallelism
+    @definition = N'ALTER PROCEDURE dbo.HC_parallelism
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.5: PARALLELISM: WHO GOES PARALLEL, AND SKEW
 SET NOCOUNT ON;
@@ -8511,7 +8543,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compile_cost @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_compile_cost
+    @definition = N'ALTER PROCEDURE dbo.HC_compile_cost
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.6: COMPILE COST & OPTIMIZER TIMEOUTS
@@ -8552,7 +8584,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_plan_guides @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_plan_guides
+    @definition = N'ALTER PROCEDURE dbo.HC_plan_guides
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.7: PLAN GUIDES - CURRENT DB (forgotten ones cause odd plans)
@@ -8578,7 +8610,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_resource_governor;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_resource_governor
+    @definition = N'ALTER PROCEDURE dbo.HC_resource_governor
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.8: RESOURCE GOVERNOR
 SET NOCOUNT ON;
@@ -8615,7 +8647,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_inmemory_oltp @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_inmemory_oltp
+    @definition = N'ALTER PROCEDURE dbo.HC_inmemory_oltp
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.9: IN-MEMORY OLTP (memory-optimized tables) - CURRENT DB
@@ -8655,14 +8687,14 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_spinlocks ORDER BY spins DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_spinlocks
+    @definition = N'ALTER VIEW dbo.HC_spinlocks
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.10: SPINLOCK CONTENTION (advanced - high CPU with low waits)
 SELECT TOP (20) name, collisions, spins, spins_per_collision, sleep_time, backoffs
 FROM sys.dm_os_spinlock_stats
 ORDER BY spins DESC;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_spinlocks
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_spinlocks
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.10: SPINLOCK CONTENTION (advanced - high CPU with low waits)
 SET NOCOUNT ON;
@@ -8679,7 +8711,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_rpo_rto_scorecard @default_rpo_min = 15, @default_rto_min = 60, @restore_factor = 1.30, @zero_mb_per_s = 300, @days = 7, @ifi = ''Y'';',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_rpo_rto_scorecard
+    @definition = N'ALTER PROCEDURE dbo.HC_rpo_rto_scorecard
     @default_rpo_min int = 15,
     @default_rto_min int = 60,
     @restore_factor decimal(5,2) = 1.30,
@@ -8783,7 +8815,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_rpo_gaps(DEFAULT, DEFAULT);  -- @gap_days = 7, @gap_threshold_min = 15',
     @min_version = NULL,
     @sort_hint = N'ORDER BY gap_min DESC',
-    @definition = N'CREATE OR ALTER FUNCTION dbo.HC_rpo_gaps
+    @definition = N'ALTER FUNCTION dbo.HC_rpo_gaps
 (
     @gap_days int = 7,
     @gap_threshold_min int = 15
@@ -8810,7 +8842,7 @@ GROUP BY database_name
 HAVING DATEDIFF(MINUTE, MAX(backup_finish_date), GETDATE()) > @gap_threshold_min
 );
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_rpo_gaps
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_rpo_gaps
     @gap_days int = 7,
     @gap_threshold_min int = 15
 AS
@@ -8842,7 +8874,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_broken_log_chains ORDER BY log_backup_after_gap DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY backup_start_date DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_broken_log_chains
+    @definition = N'ALTER VIEW dbo.HC_broken_log_chains
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.3: BROKEN LOG CHAINS (an unrestorable point in time)
 WITH l AS (
@@ -8858,7 +8890,7 @@ SELECT database_name, prev_start AS previous_log_backup, backup_start_date AS lo
 FROM l
 WHERE prev_last_lsn IS NOT NULL AND first_lsn > prev_last_lsn;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_broken_log_chains
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_broken_log_chains
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.3: BROKEN LOG CHAINS (an unrestorable point in time)
 SET NOCOUNT ON;
@@ -8885,7 +8917,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_rogue_backups;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_rogue_backups
+    @definition = N'ALTER PROCEDURE dbo.HC_rogue_backups
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.4: CHAIN-BREAKING / ROGUE BACKUPS
 SET NOCOUNT ON;
@@ -8928,7 +8960,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_backup_quality;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_backup_quality
+    @definition = N'ALTER PROCEDURE dbo.HC_backup_quality
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.5: BACKUP QUALITY (last 7 days)
 SET NOCOUNT ON;
@@ -8953,7 +8985,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_backup_files_exist;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_backup_files_exist
+    @definition = N'ALTER PROCEDURE dbo.HC_backup_files_exist
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.6: DO THE FILES NEEDED FOR A RESTORE STILL EXIST?
 SET NOCOUNT ON;
@@ -8994,7 +9026,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_restore_chain_length;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_restore_chain_length
+    @definition = N'ALTER PROCEDURE dbo.HC_restore_chain_length
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.7: RESTORE CHAIN LENGTH (long chains = long RTO, more ways to fail)
 SET NOCOUNT ON;
@@ -9024,7 +9056,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_crash_recovery_rto;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_crash_recovery_rto
+    @definition = N'ALTER PROCEDURE dbo.HC_crash_recovery_rto
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.8: CRASH-RECOVERY RTO (how long a restart / failover takes)
 SET NOCOUNT ON;
@@ -9049,7 +9081,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_restore_tests ORDER BY days_ago DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY days_ago DESC',
-    @definition = N'CREATE OR ALTER VIEW dbo.HC_restore_tests
+    @definition = N'ALTER VIEW dbo.HC_restore_tests
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.9: RESTORE TESTS - EVIDENCE THAT BACKUPS ACTUALLY WORK
 SELECT bs.database_name AS source_db, bs.server_name AS source_server,
@@ -9059,7 +9091,7 @@ FROM msdb.dbo.restorehistory AS rh
 JOIN msdb.dbo.backupset AS bs ON bs.backup_set_id = rh.backup_set_id
 GROUP BY bs.database_name, bs.server_name;
 ',
-    @fallback_definition = N'CREATE OR ALTER PROCEDURE dbo.HC_restore_tests
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_restore_tests
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.9: RESTORE TESTS - EVIDENCE THAT BACKUPS ACTUALLY WORK
 SET NOCOUNT ON;
@@ -9080,7 +9112,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ha_dr_coverage;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ha_dr_coverage
+    @definition = N'ALTER PROCEDURE dbo.HC_ha_dr_coverage
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.10: HA / DR COVERAGE PER DATABASE
 SET NOCOUNT ON;
@@ -9119,7 +9151,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_failover_rto;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ag_failover_rto
+    @definition = N'ALTER PROCEDURE dbo.HC_ag_failover_rto
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.11: AG: CAN WE FAIL OVER WITHIN RTO / WITHOUT DATA LOSS RIGHT NOW?
 SET NOCOUNT ON;
@@ -9150,7 +9182,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_problems @log_rpo_min = 30, @full_max_days = 7, @checkdb_days = 7, @disk_free_pct = 15, @log_used_pct = 80, @tempdb_free_pct = 20, @blocking_min = 5, @open_tran_min = 30, @cert_days = 30, @vlf_max = 1000;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_problems
+    @definition = N'ALTER PROCEDURE dbo.HC_problems
     @log_rpo_min int = 30,
     @full_max_days int = 7,
     @checkdb_days int = 7,
@@ -9302,7 +9334,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_growth_forecast;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_growth_forecast
+    @definition = N'ALTER PROCEDURE dbo.HC_growth_forecast
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.2: GROWTH FORECAST - DAYS UNTIL DISK FULL
 SET NOCOUNT ON;
@@ -9363,7 +9395,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_autogrowth_will_fail;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_autogrowth_will_fail
+    @definition = N'ALTER PROCEDURE dbo.HC_autogrowth_will_fail
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.3: FILES THAT WILL FAIL THEIR NEXT AUTOGROWTH
 SET NOCOUNT ON;
@@ -9394,7 +9426,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_alerts_notify;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_alerts_notify
+    @definition = N'ALTER PROCEDURE dbo.HC_alerts_notify
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.5: VERIFY ALERTS ACTUALLY NOTIFY SOMEONE
 SET NOCOUNT ON;
@@ -9421,7 +9453,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_restart_history;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_restart_history
+    @definition = N'ALTER PROCEDURE dbo.HC_restart_history
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.6: RESTART / SHUTDOWN HISTORY (from all error logs)
 SET NOCOUNT ON;
@@ -9455,7 +9487,7 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_config_changes;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_config_changes
+    @definition = N'ALTER PROCEDURE dbo.HC_config_changes
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.7: CONFIGURATION CHANGES (who changed what, when)
 SET NOCOUNT ON;
@@ -9484,7 +9516,11 @@ GO
      SELECT * FROM dbo.HC_catalog;                               -- everything
      SELECT * FROM dbo.HC_catalog WHERE title LIKE N'%block%';   -- find one
 ============================================================================*/
-CREATE OR ALTER VIEW dbo.HC_catalog
+IF OBJECT_ID(N'dbo.HC_catalog', N'V') IS NULL
+    EXEC (N'CREATE VIEW dbo.HC_catalog AS SELECT 1 AS placeholder;');
+GO
+
+ALTER VIEW dbo.HC_catalog
 AS
 SELECT
     r.name,
@@ -9508,6 +9544,36 @@ LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(r.name
 GO
 
 /*----------------------------------------------------------------------------
+  Remove objects an earlier run installed that this version no longer contains
+  (only names registered in dbo.HC_objects are touched - nothing else in DBAdmin)
+----------------------------------------------------------------------------*/
+DECLARE @run_start datetime2(0) = CAST(SESSION_CONTEXT(N'hc_run_start') AS datetime2(0)),
+        @n sysname, @t char(2), @cmd nvarchar(400);
+IF @run_start IS NOT NULL
+BEGIN
+    DECLARE stale CURSOR LOCAL FAST_FORWARD FOR
+        SELECT r.name, o.type
+        FROM dbo.HC_objects AS r
+        LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(r.name))
+        WHERE r.deployed_at < @run_start;
+    OPEN stale; FETCH NEXT FROM stale INTO @n, @t;
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF RTRIM(@t) IN ('V', 'P', 'IF')
+        BEGIN
+            SET @cmd = N'DROP ' + CASE RTRIM(@t) WHEN 'V' THEN N'VIEW' WHEN 'P' THEN N'PROCEDURE' ELSE N'FUNCTION' END
+                     + N' dbo.' + QUOTENAME(@n);
+            EXEC sys.sp_executesql @cmd;
+        END;
+        DELETE dbo.HC_objects WHERE name = @n;
+        PRINT N'Removed ' + @n + N' (no longer in the toolkit).';
+        FETCH NEXT FROM stale INTO @n, @t;
+    END;
+    CLOSE stale; DEALLOCATE stale;
+END;
+GO
+
+/*----------------------------------------------------------------------------
   Deployment summary
 ----------------------------------------------------------------------------*/
 SELECT status, COUNT(*) AS objects
@@ -9525,14 +9591,18 @@ SET NOEXEC OFF;
 GO
 
 /*----------------------------------------------------------------------------
-  OPTIONAL: let a team group use the objects (run once, adjust names)
+  OPTIONAL: let a team group use the objects. Replace DOMAIN\DBA-Team, then
+  un-comment. Every step checks first, so it is safe to run repeatedly.
 ----------------------------------------------------------------------------
 USE DBAdmin;
-CREATE ROLE HC_users;
-GRANT SELECT, EXECUTE ON SCHEMA::dbo TO HC_users;
-CREATE USER [DOMAIN\DBA-Team] FOR LOGIN [DOMAIN\DBA-Team];
-ALTER ROLE HC_users ADD MEMBER [DOMAIN\DBA-Team];
+IF DATABASE_PRINCIPAL_ID(N'HC_users') IS NULL
+    CREATE ROLE HC_users;
+GRANT SELECT, EXECUTE ON SCHEMA::dbo TO HC_users;          -- re-granting is harmless
+IF DATABASE_PRINCIPAL_ID(N'DOMAIN\DBA-Team') IS NULL
+    CREATE USER [DOMAIN\DBA-Team] FOR LOGIN [DOMAIN\DBA-Team];
+IF IS_ROLEMEMBER(N'HC_users', N'DOMAIN\DBA-Team') = 0
+    ALTER ROLE HC_users ADD MEMBER [DOMAIN\DBA-Team];
 USE master;
-GRANT VIEW SERVER STATE TO [DOMAIN\DBA-Team];      -- 2022+: VIEW SERVER PERFORMANCE STATE + VIEW SERVER SECURITY STATE
+GRANT VIEW SERVER STATE TO [DOMAIN\DBA-Team];             -- 2022+: VIEW SERVER PERFORMANCE STATE + VIEW SERVER SECURITY STATE
 GRANT VIEW ANY DEFINITION TO [DOMAIN\DBA-Team];
 ----------------------------------------------------------------------------*/
