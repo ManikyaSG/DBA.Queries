@@ -872,7 +872,7 @@ function Send-DbMailQueryAttachment($Connection, [string]$MailProfileName, [stri
     $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
     [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
     [void]$cmd.Parameters.AddWithValue('@importance', $Importance)
-    $pQ = $cmd.Parameters.Add('@query', [System.Data.SqlDbType]::NVarChar, -1); $pQ.Value = "SET NOCOUNT ON; SELECT N'" + $AttachHtml.Replace("'", "''") + "';"
+    $pQ = $cmd.Parameters.Add('@query', [System.Data.SqlDbType]::NVarChar, -1); $pQ.Value = "SET NOCOUNT ON; SELECT CAST(N'" + $AttachHtml.Replace("'", "''") + "' AS varchar(max));"   # varchar = plain text file
     [void]$cmd.Parameters.AddWithValue('@execute_query_database', 'master')
     [void]$cmd.Parameters.AddWithValue('@attach_query_result_as_file', 1)
     [void]$cmd.Parameters.AddWithValue('@query_attachment_filename', $FileName)
@@ -880,7 +880,6 @@ function Send-DbMailQueryAttachment($Connection, [string]$MailProfileName, [stri
     [void]$cmd.Parameters.AddWithValue('@query_no_truncate', 1)
     [void]$cmd.Parameters.AddWithValue('@query_result_no_padding', 1)
     [void]$cmd.Parameters.AddWithValue('@exclude_query_output', 1)
-    [void]$cmd.Parameters.AddWithValue('@ansi_attachment', 1)
     $pId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pId.Direction = [System.Data.ParameterDirection]::Output
     [void]$cmd.ExecuteNonQuery()
     return [int]$pId.Value
