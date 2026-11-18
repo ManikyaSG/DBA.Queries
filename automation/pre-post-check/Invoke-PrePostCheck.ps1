@@ -62,6 +62,8 @@ $Config = @{
     FromAddress           = ''                           # optional, e.g. 'SQL Alerts <sqlalerts@yourcompany.com>' ('' = profile's account)
     ReplyTo               = ''                           # optional reply-to address
     MailProfile           = 'DBA_Mail'                   # preferred; else default / only profile on the instance
+    AutoSetupDbMail       = $true    # Database Mail off / no profile on an instance -> run DbMailSetupFile there, then re-check
+    DbMailSetupFile       = Join-Path $PSScriptRoot 'db_mail_setup.sql'   # your Database Mail setup script (GO-separated batches)
     ReportTitle           = 'SQL Server Change Check'
     HealthReportTitle     = 'SQL Server Health Check'      # used for -Phase HEALTH
     IncludeLocalInstances = $true
@@ -400,6 +402,45 @@ ORDER BY CASE WHEN p.name = @pref THEN 0 WHEN pp.profile_id IS NOT NULL THEN 1 E
     $r = Invoke-Scalar $Connection $q @{ '@pref' = $Config.MailProfile }
     if ($null -eq $r -or $r -is [DBNull]) { return $null }
     return [string]$r
+}
+
+function Invoke-DbMailSetup($Connection, [string]$Instance) {
+    # Runs $Config.DbMailSetupFile on this instance (batches split on GO). Returns $true if it ran without errors.
+    $file = $Config.DbMailSetupFile
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) {
+        Write-Step "Database Mail setup script not found ($file) - skipping auto-setup on $Instance." 'Yellow'; return $false
+    }
+    Write-Step "Database Mail not configured / enabled on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
+    $text = Get-Content -LiteralPath $file -Raw
+    $batches = [regex]::Split($text, '(?im)^[ \t]*GO[ \t]*(?:--.*)?\r?$') | Where-Object { $_ -match '\S' }
+    $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
+        param($sender, $e)
+        foreach ($m in ($e.Message -split "`r?`n")) { if ($m.Trim()) { Write-Step "  [dbmail] $m" 'DarkGray' } }
+    }
+    $Connection.add_InfoMessage($handler)
+    $ok = $true; $n = 0
+    try {
+        foreach ($b in $batches) {
+            $n++
+            if ($b -match '(?im)^[ \t]*:(setvar|connect|r)\b') {
+                Write-Step "  Batch $n uses SQLCMD-mode commands (:setvar / :connect / :r), which can't run from PowerShell - remove them from the script." 'Red'
+                $ok = $false; break
+            }
+            $cmd = $Connection.CreateCommand(); $cmd.CommandText = $b; $cmd.CommandTimeout = 300
+            try { [void]$cmd.ExecuteNonQuery() }
+            catch {
+                $msg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                Write-Step "  Batch $n failed: $msg" 'Red'; $ok = $false; break
+            }
+        }
+    }
+    finally {
+        $Connection.remove_InfoMessage($handler)
+        try { $Connection.ChangeDatabase('master') } catch { }   # the script may have switched database
+    }
+    if ($ok) { Write-Step "  Database Mail setup script completed on $Instance ($n batch(es))." 'Green' }
+    else     { Write-Step "  Database Mail setup did not complete on $Instance (needs sysadmin). Continuing without it." 'Yellow' }
+    return $ok
 }
 
 function Get-Snapshot($Connection, [string]$SqlText) {
@@ -799,6 +840,13 @@ try {
             $profileName = $null
             try { $profileName = Get-MailProfileName $conn }
             catch { Write-Step "WARNING: could not read Database Mail profiles on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
+            if (-not $profileName -and $Config.AutoSetupDbMail) {
+                try {
+                    if (Invoke-DbMailSetup $conn $t.Instance) { $profileName = Get-MailProfileName $conn }
+                    if ($profileName) { Write-Step "Database Mail profile now available: $profileName" 'Green' }
+                }
+                catch { Write-Step "WARNING: Database Mail auto-setup failed on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
+            }
             if ($profileName) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $profileName; Local = [bool]$t.Service } }
             else { Write-Step "Database Mail is not configured / enabled on $($t.Instance) - another instance will be used to send, if any." 'Yellow' }
 
