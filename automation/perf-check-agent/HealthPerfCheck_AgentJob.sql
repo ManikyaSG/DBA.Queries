@@ -25,8 +25,9 @@
       waits / long running), memory grants, tempdb users, every deadlock process
       (+ the graph XML), every query over @LongQuerySec s (XE), and the top 20
       queries of the window by duration / CPU / reads (plan cache, no Query Store).
-   3. One email: summary + needs attention + head blockers + top problem sessions
-      in the body, the FULL report attached as an .html file (query attachment).
+   3. One email with the FULL report in the body (no attachment). If Database Mail
+      rejects it, a compact report (no per-interval tables / deadlock XML) is sent,
+      then the short summary - an email always goes out.
 
  SERVER CHANGES during the window, always put back: 'blocked process threshold (s)'
  is set to @BlockedThresholdSec and the XE session DBA_PerfCheckJob is created. At
@@ -45,9 +46,8 @@
    or mailed:
        EXEC dbo.usp_DBA_HealthPerfCheck @Recipients = N'dba-team@yourcompany.com', @SampleSec = 10, @DurationMin = 2;
 
- NEEDS: SQL Server 2016 SP1+ (any edition with Agent), Database Mail with a profile
- (scripts/45_database_mail_setup.sql makes it public/default and raises the
- attachment limit - the report is usually 0.3-3 MB). The job runs as its owner
+ NEEDS: SQL Server 2016 RTM+ (any edition with Agent), Database Mail with a profile
+ (scripts/45_database_mail_setup.sql sets it up). The job runs as its owner
  (sa by default) so it has all permissions; run by hand as a non-sysadmin and the
  parts it can't read are skipped with a warning.
  Tags    : [BOX] SQL Server 2016 SP1 - 2025 / Azure VM. Not for Azure SQL Database.
@@ -137,7 +137,7 @@ SET @sql2 = N''SELECT @rows = (SELECT N''''<tr'''' + '' + @style + N'' + N''''>'
 FROM #r WHERE @max = 0 OR _rn <= @max ORDER BY _rn FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)'''');'';
 EXEC sys.sp_executesql @sql2, N''@rows nvarchar(max) OUTPUT, @max int'', @rows OUTPUT, @max;
 SET @html = N''<h3>'' + dbo.fn_DBA_Html(@title) + N'' ('' + CAST(@n AS nvarchar(10)) + N'')</h3><table><tr>'' + @hdr + N''</tr>'' + ISNULL(@rows, N'''') + N''</table>''
-          + CASE WHEN @max > 0 AND @n > @max THEN N''<div style="color:#555">First '' + CAST(@max AS nvarchar(10)) + N'' of '' + CAST(@n AS nvarchar(10)) + N'' rows - all rows are in the attached report.</div>'' ELSE N'''' END;
+          + CASE WHEN @max > 0 AND @n > @max THEN N''<div style="color:#555">First '' + CAST(@max AS nvarchar(10)) + N'' of '' + CAST(@n AS nvarchar(10)) + N'' rows - run the procedure with @SendEmail = 0 for all.</div>'' ELSE N'''' END;
 ', N'{ORDER}', @OrderBy), N'{QUERY}', @Query);
     SET @Html = N'';
     BEGIN TRY
@@ -173,7 +173,6 @@ ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @AgSendQueueMB       int            = 100,
     @NoHealth            bit            = 0,          -- 1 = performance window only
     @NoPerf              bit            = 0,          -- 1 = health check only
-    @AttachReport        bit            = 1,          -- attach the full report (.html); 0 = summary only
     @SendEmail           bit            = 1           -- 0 = return the report as a result set (testing in SSMS)
 AS
 BEGIN
@@ -1362,7 +1361,7 @@ FROM #s_head GROUP BY session_id, statement',
        MAX(program) AS program, MAX(db) AS db, MAX(status) AS status, MAX(open_tran) AS open_tran, MAX(blocked_sessions) AS blocked_sessions,
        MAX(max_blocked_s) AS max_blocked_s, MAX(statement_source) AS statement_source, statement
 FROM #s_head GROUP BY session_id, statement',
-         @Title = N'Head blockers (top of each blocking chain) - top 10, all in the attachment', @OrderBy = N'max_blocked_s DESC', @MaxRows = 10, @SkipEmpty = 1, @Html = @p_part OUTPUT;
+         @Title = N'Head blockers (top of each blocking chain) - top 10 (all rows in the full report)', @OrderBy = N'max_blocked_s DESC', @MaxRows = 10, @SkipEmpty = 1, @Html = @p_part OUTPUT;
     SET @p_pShort += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen, COUNT(*) AS samples, reason, session_id, MAX(login) AS login,
        MAX(host) AS host, MAX(program) AS program, MAX(db) AS db, MAX(command) AS command, MAX(wait_type) AS wait_type, MAX(wait_ms) AS max_wait_ms,
@@ -1379,7 +1378,7 @@ FROM #s_prob GROUP BY session_id, reason, statement',
        MAX(logical_reads) AS max_reads, MAX(writes) AS max_writes, MAX(granted_mb) AS granted_mb, MAX(tempdb_mb) AS tempdb_mb, MAX(open_tran) AS open_tran,
        MAX(object_name) AS object_name, statement
 FROM #s_prob GROUP BY session_id, reason, statement',
-         @Title = N'Problem sessions (blocked, I/O / log / memory / tempdb waits, long running) - top 10, all in the attachment', @OrderBy = N'max_elapsed_s DESC', @MaxRows = 10, @SkipEmpty = 1, @Html = @p_part OUTPUT;
+         @Title = N'Problem sessions (blocked, I/O / log / memory / tempdb waits, long running) - top 10 (all rows in the full report)', @OrderBy = N'max_elapsed_s DESC', @MaxRows = 10, @SkipEmpty = 1, @Html = @p_part OUTPUT;
     SET @p_pShort += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT MIN(seen_at) AS first_seen, MAX(seen_at) AS last_seen, COUNT(*) AS samples, session_id, MAX(login) AS login, MAX(program) AS program,
        MAX(db) AS db, MAX(grant_state) AS grant_state, MAX(requested_mb) AS requested_mb, MAX(granted_mb) AS granted_mb, MAX(used_mb) AS used_mb,
@@ -1490,9 +1489,8 @@ END;
   REPORT + EMAIL
 #############################################################################*/
 DECLARE @r_tag varchar(10), @r_head nvarchar(max), @r_full nvarchar(max), @r_short nvarchar(max), @r_subject nvarchar(255),
-        @r_file nvarchar(260), @r_query nvarchar(max), @r_max bigint = 0, @r_mailId int, @r_how nvarchar(200), @r_crit int, @r_warn int,
-        @r_imp varchar(6), @r_body nvarchar(max), @r_compact nvarchar(max), @r_try int = 1, @r_rc int, @r_att nvarchar(max), @r_kind nvarchar(100),
-        @r_note nvarchar(max);
+        @r_mailId int, @r_how nvarchar(200), @r_crit int, @r_warn int,
+        @r_imp varchar(6), @r_body nvarchar(max), @r_compact nvarchar(max), @r_try int = 1, @r_rc int, @r_kind nvarchar(100);
 SET @r_crit = @p_hCrit + @p_pCrit; SET @r_warn = @p_hWarn + @p_pWarn;
 SET @r_tag = CASE WHEN @r_crit > 0 THEN 'CRITICAL' WHEN @r_warn > 0 THEN 'WARNING' ELSE 'OK' END;
 SET @r_imp = CASE WHEN @r_tag = 'CRITICAL' THEN 'High' ELSE 'Normal' END;   -- EXEC parameters can't be expressions
@@ -1517,7 +1515,7 @@ h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6
 table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
 td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
-</style></head><body>' + @r_head + @p_hShort + @p_pShort;
+</style></head><body>' + @r_head + @p_hShort + @p_pShort;   -- summary: last-resort email body
 SET @r_compact = N'<html><head><style>
 body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
 h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
@@ -1525,9 +1523,8 @@ table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#f
 td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
 </style></head><body>' + @r_head + @p_hFull + @p_pMid
-               + N'<p style="color:#555">Compact report: the per-interval tables and the deadlock graph XML were left out to fit Database Mail''s attachment limit.</p></body></html>';
+               + N'<p style="color:#555">Compact report: the per-interval tables and the deadlock graph XML were left out because the full report could not be sent. Run the procedure with @SendEmail = 0 to see them.</p></body></html>';
 SET @r_subject = N'[' + @r_tag + N'] SQL Server Health & Performance Check [' + @Label + N'] - ' + @@SERVERNAME;
-SET @r_file = REPLACE(REPLACE(@@SERVERNAME, N'\', N'_'), N',', N'_') + N'_HEALTHPERF_' + @Label + N'_' + FORMAT(@p_runStart, 'yyyyMMdd_HHmm') + N'.html';
 
 IF @SendEmail = 0
 BEGIN
@@ -1546,60 +1543,39 @@ IF @MailProfile IS NULL
     ORDER BY CASE WHEN pp.profile_id IS NOT NULL THEN 0 ELSE 1 END, p.profile_id;
 IF @MailProfile IS NULL
     RAISERROR(N'No Database Mail profile with an SMTP account on this instance - run scripts/45_database_mail_setup.sql. The report was not sent.', 16, 1);
-SELECT @r_max = CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';
 
 SET @r_mailId = NULL;
--- Attach the full report; if Database Mail rejects it, try the compact report; else send the summary only.
--- sp_send_dbmail can reject a query attachment WITHOUT raising a catchable error, so the return code is checked too.
-WHILE @AttachReport = 1 AND @r_mailId IS NULL AND @r_try <= 2
+-- The full report is the email body (no attachment). If Database Mail rejects it, the compact report
+-- (without the per-interval tables and deadlock XML) is sent, then the short summary, so an email always goes out.
+-- sp_send_dbmail can fail WITHOUT raising a catchable error, so the return code is checked too.
+WHILE @r_mailId IS NULL AND @r_try <= 3
 BEGIN
-    SET @r_att  = CASE WHEN @r_try = 1 THEN @r_full ELSE @r_compact END;
-    SET @r_kind = CASE WHEN @r_try = 1 THEN N'full report' ELSE N'compact report' END;
-    IF @r_max > 0 AND LEN(@r_att) > @r_max
-        SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' is ' + CAST(LEN(@r_att) / 1024 AS nvarchar(20)) + N' KB, above Database Mail MaxFileSize ('
-                   + CAST(@r_max / 1024 AS nvarchar(20)) + N' KB)';
-    ELSE
-    BEGIN
-        BEGIN TRY
-            -- the report is attached as a query result (works for every login; no file on disk needed);
-            -- varchar result = plain (ANSI) text file, which every browser opens correctly
-            SET @r_query = N'SET NOCOUNT ON; SELECT CAST(N''' + REPLACE(@r_att, N'''', N'''''') + N''' AS varchar(max));';
-            SET @r_body = @r_short + N'<p style="color:#555">The ' + @r_kind + N' (all sections' + CASE WHEN @r_try = 1 THEN N', per-interval tables and query lists' ELSE N' except the per-interval tables' END
-                        + N') is attached: ' + @r_file + N'</p></body></html>';
-            SET @r_rc = NULL;
-            EXEC @r_rc = msdb.dbo.sp_send_dbmail
-                 @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
-                 @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body,
-                 @query = @r_query, @execute_query_database = N'master', @attach_query_result_as_file = 1, @query_attachment_filename = @r_file,
-                 @query_result_header = 0, @query_no_truncate = 1, @query_result_no_padding = 1, @exclude_query_output = 1,
-                 @mailitem_id = @r_mailId OUTPUT;
-            IF ISNULL(@r_rc, 1) <> 0 OR @r_mailId IS NULL
-            BEGIN
-                SET @r_mailId = NULL;
-                SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' (' + CAST(LEN(@r_att) / 1024 AS nvarchar(20)) + N' KB) rejected by Database Mail (return code '
-                           + ISNULL(CAST(@r_rc AS nvarchar(10)), N'none') + N', MaxFileSize ' + CAST(@r_max / 1024 AS nvarchar(20)) + N' KB - the reason is in the job step messages)';
-            END
-            ELSE SET @r_how = N'with the ' + @r_kind + N' attached (' + CAST(LEN(@r_att) / 1024 AS nvarchar(20)) + N' KB)';
-        END TRY
-        BEGIN CATCH
+    SET @r_body = CASE @r_try WHEN 1 THEN @r_full WHEN 2 THEN @r_compact
+                  ELSE @r_short + N'<p style="color:#a94442">Only the summary is shown: ' + dbo.fn_DBA_Html(ISNULL(@r_how, N''))
+                       + N'. Run EXEC ' + DB_NAME() + N'.dbo.usp_DBA_HealthPerfCheck @SendEmail = 0 in SSMS to see the full report.</p></body></html>' END;
+    SET @r_kind = CASE @r_try WHEN 1 THEN N'full report' WHEN 2 THEN N'compact report' ELSE N'summary' END;
+    BEGIN TRY
+        SET @r_rc = NULL;
+        EXEC @r_rc = msdb.dbo.sp_send_dbmail
+             @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
+             @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body, @mailitem_id = @r_mailId OUTPUT;
+        IF ISNULL(@r_rc, 1) <> 0 OR @r_mailId IS NULL
+        BEGIN
             SET @r_mailId = NULL;
-            SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' failed: ' + ERROR_MESSAGE();
-        END CATCH;
-    END;
+            SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' (' + CAST(LEN(@r_body) / 1024 AS nvarchar(20)) + N' KB) rejected by Database Mail (return code '
+                       + ISNULL(CAST(@r_rc AS nvarchar(10)), N'none') + N')';
+        END
+        ELSE SET @r_how = @r_kind + N' in the email body (' + CAST(LEN(@r_body) / 1024 AS nvarchar(20)) + N' KB)';
+    END TRY
+    BEGIN CATCH
+        SET @r_mailId = NULL;
+        SET @r_how = ISNULL(@r_how + N'; ', N'') + @r_kind + N' failed: ' + ERROR_MESSAGE();
+    END CATCH;
     SET @r_try += 1;
 END;
-
 IF @r_mailId IS NULL
-BEGIN
-    -- summary only (the per-section tables of the email body are still included)
-    SET @r_note = N'<p style="color:#a94442">Report not attached: ' + dbo.fn_DBA_Html(ISNULL(@r_how, N'@AttachReport = 0')) + N'. '
-        + N'Run EXEC ' + DB_NAME() + N'.dbo.usp_DBA_HealthPerfCheck @SendEmail = 0 in SSMS to see it.</p></body></html>';
-    SET @r_body = @r_short + @r_note;
-    EXEC msdb.dbo.sp_send_dbmail
-         @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
-         @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body, @mailitem_id = @r_mailId OUTPUT;
-    SET @r_how = N'summary only - ' + ISNULL(@r_how, N'');
-END;
+    RAISERROR(N'The report could not be emailed: %s', 16, 1, @r_how);
+
 PRINT N'Report ' + @r_tag + N' queued as Database Mail item ' + CAST(@r_mailId AS nvarchar(20)) + N' via profile ''' + @MailProfile + N''' (' + @r_how + N'). '
     + N'Check: SELECT sent_status FROM msdb.dbo.sysmail_allitems WHERE mailitem_id = ' + CAST(@r_mailId AS nvarchar(20)) + N';';
 
