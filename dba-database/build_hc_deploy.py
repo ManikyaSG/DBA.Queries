@@ -374,7 +374,7 @@ def mutates(code):
     return m.group(0).strip() if m else None
 
 def main(src, out, report=None):
-    objs, skipped, seen = [], [], {}
+    objs, skipped, seen, problems = [], [], {}, []
     for f in FILES:
         path = glob.glob(os.path.join(src, f + '_*.sql'))[0]
         for sec in sections(path):
@@ -382,17 +382,27 @@ def main(src, out, report=None):
             if SKIP_TITLE.search(sec['title']):
                 skipped.append((sec['file'], sec['num'], sec['title_clean'], 'template / action')); continue
             if sec['num'] in CUSTOM: sec['code'] = CUSTOM[sec['num']]
+            if sec['num'] in SETUP: sec['code'] = SETUP[sec['num']] + '\n' + sec['code']
             if not sec['code'].strip():
                 skipped.append((sec['file'], sec['num'], sec['title_clean'], 'commented out in the script - run by hand')); continue
             mut = mutates(sec['code'])
             if mut and sec['num'] not in ALLOW_MUTATE:
                 skipped.append((sec['file'], sec['num'], sec['title_clean'], f'changes something ({mut})')); continue
+            missing = undeclared(sec['code'])
+            if missing:
+                problems.append(f"{sec['num']} {sec['title_clean']}: uses {', '.join(missing)} without declaring/creating it "
+                                f"(declared in an earlier section?) - add a SETUP entry")
+                continue
             o = build(sec)
             if o['name'] in seen:
                 o['name'] += '_' + sec['num'].replace('.', '_')
             seen[o['name']] = 1
             o.update(sec=sec)
             objs.append(o)
+    if problems:
+        print('BUILD STOPPED - these sections depend on code outside themselves:')
+        for p in problems: print('  ' + p)
+        sys.exit(1)
     write_sql(objs, skipped, out)
     write_index(objs, skipped, os.path.join(os.path.dirname(os.path.abspath(out)), 'HC_OBJECTS.md'))
     if report:
@@ -404,6 +414,45 @@ def main(src, out, report=None):
     print(len(objs), 'objects,', len(skipped), 'skipped')
 
 ALLOW_MUTATE = set()
+
+# Sections written to run straight after the previous one in the same window (they reuse its
+# variables / #temp tables). Each object runs on its own, so give it that setup here.
+SETUP = {
+ '31.3': "DECLARE @src sysname = N'App_PROD_Copy', @tgt sysname = N'App_UAT';\n"
+         "DECLARE @sql nvarchar(max);",
+ '31.6': "DECLARE @src sysname = N'App_PROD_Copy', @tgt sysname = N'App_UAT';\n"
+         "DECLARE @sql nvarchar(max);",
+ '39.2': "DECLARE @tbl sysname = N'dbo.Orders';\n"
+         "DECLARE @stats_id int = 1;",
+ '41.7': "IF OBJECT_ID('tempdb..#logs') IS NOT NULL DROP TABLE #logs;\n"
+         "IF OBJECT_ID('tempdb..#ev') IS NOT NULL DROP TABLE #ev;\n"
+         "CREATE TABLE #logs (ArchiveNo int, LogDate datetime, LogSize bigint);\n"
+         "CREATE TABLE #ev (LogDate datetime, ProcessInfo nvarchar(50), [Text] nvarchar(max));\n"
+         "INSERT #logs EXEC sys.sp_enumerrorlogs;\n"
+         "DECLARE @n int, @max int = (SELECT MAX(ArchiveNo) FROM #logs);",
+}
+
+def undeclared(code):
+    """Variables used but never declared, and #temp tables used but never created, in one section.
+    Text inside string literals is ignored (dynamic SQL declares its own)."""
+    bare = re.sub(r"N?'(?:[^']|'')*'", "''", code)
+    bare = re.sub(r'\[[^\]]*\]', '[]', bare)
+    # named arguments of a procedure call (EXEC proc @name = value, @x = value) are not variables
+    bare = re.sub(r'(\bEXEC(?:UTE)?\s+[\w.@\[\]]+\s+(?:[^;\n]*?,\s*)?)@\w+(\s*=)', r'\1\2', bare, flags=re.I)
+    while True:
+        new = re.sub(r'(\bEXEC(?:UTE)?\s+[\w.@\[\]]+\s+[^;]*?,\s*)@\w+(\s*=(?!=))', r'\1\2', bare, flags=re.I)
+        if new == bare: break
+        bare = new
+    used_v = {v.lower() for v in re.findall(r'(?<![@\w])@\w+', bare)}
+    decl_v = set()
+    for d in re.findall(r'\bDECLARE\b(.*?)(?=;|\bDECLARE\b|\n\s*\n|$)', bare, re.I | re.S):
+        decl_v |= {v.lower() for v in re.findall(r'(?:^|,)\s*(@\w+)', d)}
+    decl_v |= {v.lower() for v in re.findall(r'\bDECLARE\s+(@\w+)', bare, re.I)}
+    decl_v |= {v.lower() for v in re.findall(r'\bFETCH\s+NEXT\s+FROM\s+\w+\s+INTO\s+(@\w+)', bare, re.I)}
+    used_t = {t.lower() for t in re.findall(r'(?<![\w#])#\w+', bare)}
+    made_t = {t.lower() for t in re.findall(r'\b(?:CREATE\s+TABLE|INTO)\s+(#\w+)', bare, re.I)}
+    used_t |= {t.lower() for t in re.findall(r"tempdb\.\.(#\w+)", code)}
+    return sorted((used_v - decl_v) | (used_t - made_t))
 
 # friendlier parameter names
 RENAME = {'@spid2': '@spid', '@hrs': '@hours', '@tbl': '@table', '@obj': '@object_name',

@@ -7765,22 +7765,25 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_compare_db_columns', @section = N'31.3', @source_file = N'31_schema_validation.sql',
     @title = N'COMPARE TWO DATABASES - COLUMNS', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_compare_db_columns;',
+    @usage = N'EXEC dbo.HC_compare_db_columns @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
     @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_compare_db_columns
+    @source_db sysname = N''App_PROD_Copy'',
+    @target_db sysname = N''App_UAT''
 AS
 -- Toolkit 31_schema_validation.sql section 31.3: COMPARE TWO DATABASES - COLUMNS
 SET NOCOUNT ON;
+DECLARE @sql nvarchar(max);
 SET @sql = N''
 WITH s AS (SELECT sc.name + N''''.'''' + t.name AS tbl, c.name AS col, ty.name AS data_type, c.max_length, c.precision, c.scale, c.is_nullable, c.collation_name
-           FROM '' + QUOTENAME(@src) + N''.sys.columns c JOIN '' + QUOTENAME(@src) + N''.sys.tables t ON t.object_id = c.object_id
-           JOIN '' + QUOTENAME(@src) + N''.sys.schemas sc ON sc.schema_id = t.schema_id
-           JOIN '' + QUOTENAME(@src) + N''.sys.types ty ON ty.user_type_id = c.user_type_id WHERE t.is_ms_shipped = 0),
+           FROM '' + QUOTENAME(@source_db) + N''.sys.columns c JOIN '' + QUOTENAME(@source_db) + N''.sys.tables t ON t.object_id = c.object_id
+           JOIN '' + QUOTENAME(@source_db) + N''.sys.schemas sc ON sc.schema_id = t.schema_id
+           JOIN '' + QUOTENAME(@source_db) + N''.sys.types ty ON ty.user_type_id = c.user_type_id WHERE t.is_ms_shipped = 0),
      t AS (SELECT sc.name + N''''.'''' + t.name AS tbl, c.name AS col, ty.name AS data_type, c.max_length, c.precision, c.scale, c.is_nullable, c.collation_name
-           FROM '' + QUOTENAME(@tgt) + N''.sys.columns c JOIN '' + QUOTENAME(@tgt) + N''.sys.tables t ON t.object_id = c.object_id
-           JOIN '' + QUOTENAME(@tgt) + N''.sys.schemas sc ON sc.schema_id = t.schema_id
-           JOIN '' + QUOTENAME(@tgt) + N''.sys.types ty ON ty.user_type_id = c.user_type_id WHERE t.is_ms_shipped = 0)
+           FROM '' + QUOTENAME(@target_db) + N''.sys.columns c JOIN '' + QUOTENAME(@target_db) + N''.sys.tables t ON t.object_id = c.object_id
+           JOIN '' + QUOTENAME(@target_db) + N''.sys.schemas sc ON sc.schema_id = t.schema_id
+           JOIN '' + QUOTENAME(@target_db) + N''.sys.types ty ON ty.user_type_id = c.user_type_id WHERE t.is_ms_shipped = 0)
 SELECT COALESCE(s.tbl, t.tbl) AS table_name, COALESCE(s.col, t.col) AS column_name,
        s.data_type + ''''('''' + CAST(s.max_length AS varchar(10)) + '''')'''' + CASE s.is_nullable WHEN 1 THEN '''' NULL'''' ELSE '''' NOT NULL'''' END AS source_def,
        t.data_type + ''''('''' + CAST(t.max_length AS varchar(10)) + '''')'''' + CASE t.is_nullable WHEN 1 THEN '''' NULL'''' ELSE '''' NOT NULL'''' END AS target_def,
@@ -7888,11 +7891,13 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_exact_row_counts', @section = N'31.6', @source_file = N'31_schema_validation.sql',
     @title = N'ROW COUNTS - CURRENT DB (run on source & target, compare)', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_exact_row_counts @database_name = N''YourDB'';',
+    @usage = N'EXEC dbo.HC_exact_row_counts @database_name = N''YourDB'', @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
     @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_exact_row_counts
-    @database_name sysname = NULL
+    @database_name sysname = NULL,
+    @source_db sysname = N''App_PROD_Copy'',
+    @target_db sysname = N''App_UAT''
 AS
 -- Toolkit 31_schema_validation.sql section 31.6: ROW COUNTS - CURRENT DB (run on source & target, compare)
 SET NOCOUNT ON;
@@ -7900,7 +7905,8 @@ IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5
 IF DB_ID(@database_name) IS NULL
 BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
 DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
+DECLARE @hc_sql nvarchar(max) = N''DECLARE @sql nvarchar(max);
+SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
        SUM(row_count) AS row_count
 FROM sys.dm_db_partition_stats
 WHERE index_id IN (0, 1) AND OBJECTPROPERTY(object_id, ''''IsUserTable'''') = 1
@@ -7909,17 +7915,17 @@ ORDER BY table_name;
 
 SET @sql = N''''
 SELECT COALESCE(s.tbl, t.tbl) AS table_name, s.rows AS source_rows, t.rows AS target_rows, ISNULL(s.rows,0) - ISNULL(t.rows,0) AS diff
-FROM (SELECT sc.name + N''''''''.'''''''' + tb.name AS tbl, SUM(p.rows) AS rows FROM '''' + QUOTENAME(@src) + N''''.sys.partitions p
-      JOIN '''' + QUOTENAME(@src) + N''''.sys.tables tb ON tb.object_id = p.object_id JOIN '''' + QUOTENAME(@src) + N''''.sys.schemas sc ON sc.schema_id = tb.schema_id
+FROM (SELECT sc.name + N''''''''.'''''''' + tb.name AS tbl, SUM(p.rows) AS rows FROM '''' + QUOTENAME(@source_db) + N''''.sys.partitions p
+      JOIN '''' + QUOTENAME(@source_db) + N''''.sys.tables tb ON tb.object_id = p.object_id JOIN '''' + QUOTENAME(@source_db) + N''''.sys.schemas sc ON sc.schema_id = tb.schema_id
       WHERE p.index_id IN (0,1) GROUP BY sc.name, tb.name) s
 FULL JOIN
-     (SELECT sc.name + N''''''''.'''''''' + tb.name AS tbl, SUM(p.rows) AS rows FROM '''' + QUOTENAME(@tgt) + N''''.sys.partitions p
-      JOIN '''' + QUOTENAME(@tgt) + N''''.sys.tables tb ON tb.object_id = p.object_id JOIN '''' + QUOTENAME(@tgt) + N''''.sys.schemas sc ON sc.schema_id = tb.schema_id
+     (SELECT sc.name + N''''''''.'''''''' + tb.name AS tbl, SUM(p.rows) AS rows FROM '''' + QUOTENAME(@target_db) + N''''.sys.partitions p
+      JOIN '''' + QUOTENAME(@target_db) + N''''.sys.tables tb ON tb.object_id = p.object_id JOIN '''' + QUOTENAME(@target_db) + N''''.sys.schemas sc ON sc.schema_id = tb.schema_id
       WHERE p.index_id IN (0,1) GROUP BY sc.name, tb.name) t ON t.tbl = s.tbl
 WHERE ISNULL(s.rows, -1) <> ISNULL(t.rows, -1)
 ORDER BY ABS(ISNULL(s.rows,0) - ISNULL(t.rows,0)) DESC;'''';
 EXEC sys.sp_executesql @sql;'';
-EXEC @hc_exec @hc_sql;
+EXEC @hc_exec @hc_sql, N''@source_db sysname, @target_db sysname'', @source_db = @source_db, @target_db = @target_db;
 ',
     @fallback_definition = NULL;
 GO
@@ -8375,11 +8381,13 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_ascending_key', @section = N'39.2', @source_file = N'39_advanced_tuning.sql',
     @title = N'ASCENDING KEY PROBLEM (new rows beyond the last histogram step)', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_ascending_key @database_name = N''YourDB'';',
+    @usage = N'EXEC dbo.HC_ascending_key @database_name = N''YourDB'', @table = N''dbo.Orders'', @stats_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
     @definition = N'CREATE OR ALTER PROCEDURE dbo.HC_ascending_key
-    @database_name sysname = NULL
+    @database_name sysname = NULL,
+    @table sysname = N''dbo.Orders'',
+    @stats_id int = 1
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.2: ASCENDING KEY PROBLEM (new rows beyond the last histogram step)
 SET NOCOUNT ON;
@@ -8388,9 +8396,9 @@ IF DB_ID(@database_name) IS NULL
 BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
 DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
 DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (3) step_number, range_high_key, equal_rows, range_rows
-FROM sys.dm_db_stats_histogram(OBJECT_ID(@tbl), @stats_id)
+FROM sys.dm_db_stats_histogram(OBJECT_ID(@table), @stats_id)
 ORDER BY step_number DESC;'';
-EXEC @hc_exec @hc_sql;
+EXEC @hc_exec @hc_sql, N''@table sysname, @stats_id int'', @table = @table, @stats_id = @stats_id;
 ',
     @fallback_definition = NULL;
 GO
@@ -9451,6 +9459,12 @@ EXEC dbo.HC_usp_deploy
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.7: CONFIGURATION CHANGES (who changed what, when)
 SET NOCOUNT ON;
+IF OBJECT_ID(''tempdb..#logs'') IS NOT NULL DROP TABLE #logs;
+IF OBJECT_ID(''tempdb..#ev'') IS NOT NULL DROP TABLE #ev;
+CREATE TABLE #logs (ArchiveNo int, LogDate datetime, LogSize bigint);
+CREATE TABLE #ev (LogDate datetime, ProcessInfo nvarchar(50), [Text] nvarchar(max));
+INSERT #logs EXEC sys.sp_enumerrorlogs;
+DECLARE @n int, @max int = (SELECT MAX(ArchiveNo) FROM #logs);
 TRUNCATE TABLE #ev;
 SET @n = 0;
 WHILE @n <= @max

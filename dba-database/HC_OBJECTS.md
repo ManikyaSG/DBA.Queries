@@ -388,10 +388,10 @@ actually installed there (some objects are skipped on older versions or other pl
 |---|---|---|---|
 | 31.1 | `HC_schema_fingerprint` | procedure (per database) | `EXEC dbo.HC_schema_fingerprint @database_name = N'YourDB';` |
 | 31.2 | `HC_compare_db_objects` | procedure | `EXEC dbo.HC_compare_db_objects @source_db = N'App_PROD_Copy', @target_db = N'App_UAT';` |
-| 31.3 | `HC_compare_db_columns` | procedure | `EXEC dbo.HC_compare_db_columns;` |
+| 31.3 | `HC_compare_db_columns` | procedure | `EXEC dbo.HC_compare_db_columns @source_db = N'App_PROD_Copy', @target_db = N'App_UAT';` |
 | 31.4 | `HC_broken_objects` | procedure (per database) | `EXEC dbo.HC_broken_objects @database_name = N'YourDB';` |
 | 31.5 | `HC_constraint_integrity` | procedure (per database) | `EXEC dbo.HC_constraint_integrity @database_name = N'YourDB';` |
-| 31.6 | `HC_exact_row_counts` | procedure (per database) | `EXEC dbo.HC_exact_row_counts @database_name = N'YourDB';` |
+| 31.6 | `HC_exact_row_counts` | procedure (per database) | `EXEC dbo.HC_exact_row_counts @database_name = N'YourDB', @source_db = N'App_PROD_Copy', @target_db = N'App_UAT';` |
 | 31.7 | `HC_collation_mismatches` | procedure (per database) | `EXEC dbo.HC_collation_mismatches @database_name = N'YourDB';` |
 | 31.8 | `HC_column_type_mismatches` | procedure (per database) | `EXEC dbo.HC_column_type_mismatches @database_name = N'YourDB';` |
 | 31.9 | `HC_identity_near_max` | procedure (per database) | `EXEC dbo.HC_identity_near_max @database_name = N'YourDB';` |
@@ -416,7 +416,7 @@ actually installed there (some objects are skipped on older versions or other pl
 | § | Object | Type | How to run |
 |---|---|---|---|
 | 39.1 | `HC_stats_histogram` | procedure (per database) | `EXEC dbo.HC_stats_histogram @database_name = N'YourDB', @table = N'dbo.Orders', @stats_id = 1;` |
-| 39.2 | `HC_ascending_key` | procedure (per database) | `EXEC dbo.HC_ascending_key @database_name = N'YourDB';` |
+| 39.2 | `HC_ascending_key` | procedure (per database) | `EXEC dbo.HC_ascending_key @database_name = N'YourDB', @table = N'dbo.Orders', @stats_id = 1;` |
 | 39.3 | `HC_stats_past_threshold` | procedure (per database) | `EXEC dbo.HC_stats_past_threshold @database_name = N'YourDB';` |
 | 39.4 | `HC_est_vs_actual_rows` | procedure (per database) | `EXEC dbo.HC_est_vs_actual_rows @database_name = N'YourDB', @spid = 55;` |
 | 39.5 | `HC_parallelism` | procedure | `EXEC dbo.HC_parallelism;` |
