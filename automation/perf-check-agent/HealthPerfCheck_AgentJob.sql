@@ -36,9 +36,10 @@
  HOW TO USE
    PART 1 - run once (sysadmin): creates the table, two helper objects and the
             procedure in the database chosen on the USE line below (master by
-            default; change it to your DBA database if you have one).
-   PART 2 - set the parameters at its top and run it: creates (or replaces) the
-            SQL Agent job + schedule.
+            default; change it to your DBA database if you have one). Re-run
+            it to upgrade: existing objects are ALTERed, nothing is dropped.
+   PART 2 - set the parameters at its top and run it: creates the SQL Agent
+            job + schedule, or updates the existing job in place (history kept).
    Test by hand first (short window, report returned as a grid instead of mailed):
        EXEC dbo.usp_DBA_HealthPerfCheck @SampleSec = 10, @DurationMin = 1, @SendEmail = 0;
    or mailed:
@@ -67,10 +68,13 @@ IF OBJECT_ID(N'dbo.DBA_PerfCheck_State', N'U') IS NULL
         changed_at     datetime NOT NULL CONSTRAINT DF_DBA_PerfCheck_State_at DEFAULT (GETDATE()),
         changed_by     sysname  NOT NULL CONSTRAINT DF_DBA_PerfCheck_State_by DEFAULT (SUSER_SNAME()));
 GO
-IF OBJECT_ID(N'dbo.fn_DBA_Html', N'FN') IS NOT NULL DROP FUNCTION dbo.fn_DBA_Html;
+-- Objects are created once (as a stub) and then ALTERed: re-running this part upgrades them in place,
+-- keeps their permissions, and nothing needs to be dropped or cleaned up first.
+IF OBJECT_ID(N'dbo.fn_DBA_Html', N'FN') IS NULL
+    EXEC (N'CREATE FUNCTION dbo.fn_DBA_Html (@v nvarchar(max)) RETURNS nvarchar(max) AS BEGIN RETURN @v; END;');
 GO
 -- HTML-encodes a value and removes control characters that are not valid in XML
-CREATE FUNCTION dbo.fn_DBA_Html (@v nvarchar(max))
+ALTER FUNCTION dbo.fn_DBA_Html (@v nvarchar(max))
 RETURNS nvarchar(max)
 AS
 BEGIN
@@ -85,12 +89,13 @@ BEGIN
     RETURN REPLACE(REPLACE(REPLACE(@v, N'&', N'&amp;'), N'<', N'&lt;'), N'>', N'&gt;');
 END;
 GO
-IF OBJECT_ID(N'dbo.usp_DBA_HtmlTable', N'P') IS NOT NULL DROP PROCEDURE dbo.usp_DBA_HtmlTable;
+IF OBJECT_ID(N'dbo.usp_DBA_HtmlTable', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.usp_DBA_HtmlTable AS RETURN 0;');
 GO
 -- Renders any query as an HTML table: <h3>Title (rows)</h3><table>...</table>
 -- @Query can read the caller's #temp tables. @OrderBy uses the query's column names.
 -- A column named in @StatusColumn colours the row (CRITICAL red, WARNING yellow).
-CREATE PROCEDURE dbo.usp_DBA_HtmlTable
+ALTER PROCEDURE dbo.usp_DBA_HtmlTable
     @Query        nvarchar(max),
     @Title        nvarchar(400),
     @OrderBy      nvarchar(2000) = N'(SELECT NULL)',
@@ -145,9 +150,10 @@ SET @html = N''<h3>'' + dbo.fn_DBA_Html(@title) + N'' ('' + CAST(@n AS nvarchar(
 END;
 GO
 
-IF OBJECT_ID(N'dbo.usp_DBA_HealthPerfCheck', N'P') IS NOT NULL DROP PROCEDURE dbo.usp_DBA_HealthPerfCheck;
+IF OBJECT_ID(N'dbo.usp_DBA_HealthPerfCheck', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.usp_DBA_HealthPerfCheck AS RETURN 0;');
 GO
-CREATE PROCEDURE dbo.usp_DBA_HealthPerfCheck
+ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @Recipients          nvarchar(max)  = NULL,       -- ; separated. Required when @SendEmail = 1
     @CopyRecipients      nvarchar(max)  = NULL,
     @MailProfile         sysname        = NULL,       -- NULL = default public profile, else the first profile
@@ -1602,7 +1608,11 @@ td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 END CATCH;
 END;
 GO
-PRINT N'PART 1 done: dbo.usp_DBA_HealthPerfCheck created in ' + DB_NAME() + N'.';
+-- the empty stub has no parameters, so this tells whether the ALTER above worked
+IF EXISTS (SELECT 1 FROM sys.parameters WHERE object_id = OBJECT_ID(N'dbo.usp_DBA_HealthPerfCheck') AND name = N'@Recipients')
+    PRINT N'PART 1 done: dbo.usp_DBA_HealthPerfCheck is installed / up to date in ' + DB_NAME() + N'.';
+ELSE
+    RAISERROR(N'PART 1 did NOT complete: dbo.usp_DBA_HealthPerfCheck is missing or still the empty stub - see the errors above.', 16, 1);
 GO
 
 /*=============================================================================
@@ -1639,7 +1649,7 @@ DECLARE
     @OnceDate        date          = NULL,                         -- ONCE only, e.g. '2026-11-25'
     @JobOwner        sysname       = NULL,                         -- NULL = sa (found by SID, works when sa is renamed or disabled)
     @NotifyOperator  sysname       = NULL,                         -- optional Agent operator emailed when the JOB fails
-    @ReplaceExisting bit           = 1;
+    @UpdateExisting  bit           = 1;                            -- 1 = update the existing job in place (history kept); 0 = stop if it exists
 
 /*---------------------------------------------------------------------------*/
 DECLARE @jobId uniqueidentifier, @cmd nvarchar(max), @freqType int, @freqInterval int = 0, @recur int = 0,
@@ -1666,27 +1676,38 @@ SET @cmd = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ARITHABORT ON; SET
     + N', @DurationMin = ' + CAST(@DurationMin AS nvarchar(10)) + N', @NoPerf = ' + CAST(@NoPerf AS nvarchar(1))
     + CASE WHEN @PerfDatabases IS NOT NULL THEN N', @PerfDatabases = N''' + REPLACE(@PerfDatabases, N'''', N'''''') + N'''' ELSE N'' END + N';';
 
-SELECT @jobId = job_id FROM dbo.sysjobs WHERE name = @JobName;
-IF @jobId IS NOT NULL
-BEGIN
-    IF @ReplaceExisting = 0 BEGIN RAISERROR(N'Job %s already exists (set @ReplaceExisting = 1 to replace it).', 16, 1, @JobName); RETURN; END;
-    EXEC dbo.sp_delete_job @job_id = @jobId, @delete_unused_schedule = 1;
-    SET @jobId = NULL;
-END;
-
 IF NOT EXISTS (SELECT 1 FROM dbo.syscategories WHERE name = N'Database Maintenance' AND category_class = 1)
     EXEC dbo.sp_add_category @class = N'JOB', @type = N'LOCAL', @name = N'Database Maintenance';
 
-EXEC dbo.sp_add_job
-     @job_name = @JobName, @enabled = 1, @category_name = N'Database Maintenance',
-     @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-agent).',
-     @owner_login_name = @JobOwner, @notify_level_eventlog = 2,
-     @notify_level_email = 0, @job_id = @jobId OUTPUT;
-IF @JobOwner IS NULL
+DECLARE @existed bit = 0, @stepId int, @schedId int;
+SELECT @jobId = job_id FROM dbo.sysjobs WHERE name = @JobName;
+IF @jobId IS NOT NULL
 BEGIN
-    DECLARE @sa sysname = SUSER_SNAME(0x01);
-    EXEC dbo.sp_update_job @job_id = @jobId, @owner_login_name = @sa;
-END;
+    -- update in place: job history is kept; steps and schedules are rebuilt from the parameters above
+    IF @UpdateExisting = 0 BEGIN RAISERROR(N'Job %s already exists (set @UpdateExisting = 1 to update it).', 16, 1, @JobName); RETURN; END;
+    SET @existed = 1;
+    EXEC dbo.sp_update_job @job_id = @jobId, @enabled = 1, @category_name = N'Database Maintenance',
+         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-agent).',
+         @notify_level_eventlog = 2, @notify_level_email = 0, @start_step_id = 1;
+    WHILE EXISTS (SELECT 1 FROM dbo.sysjobsteps WHERE job_id = @jobId)
+    BEGIN
+        SELECT @stepId = MAX(step_id) FROM dbo.sysjobsteps WHERE job_id = @jobId;
+        EXEC dbo.sp_delete_jobstep @job_id = @jobId, @step_id = @stepId;
+    END;
+    WHILE EXISTS (SELECT 1 FROM dbo.sysjobschedules WHERE job_id = @jobId)
+    BEGIN
+        SELECT @schedId = MIN(schedule_id) FROM dbo.sysjobschedules WHERE job_id = @jobId;
+        EXEC dbo.sp_detach_schedule @job_id = @jobId, @schedule_id = @schedId, @delete_unused_schedule = 1;
+    END;
+END
+ELSE
+    EXEC dbo.sp_add_job
+         @job_name = @JobName, @enabled = 1, @category_name = N'Database Maintenance',
+         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-agent).',
+         @owner_login_name = @JobOwner, @notify_level_eventlog = 2,
+         @notify_level_email = 0, @job_id = @jobId OUTPUT;
+DECLARE @owner sysname = ISNULL(@JobOwner, SUSER_SNAME(0x01));
+EXEC dbo.sp_update_job @job_id = @jobId, @owner_login_name = @owner;
 IF @NotifyOperator IS NOT NULL
     EXEC dbo.sp_update_job @job_id = @jobId, @notify_level_email = 2, @notify_email_operator_name = @NotifyOperator;
 
@@ -1738,9 +1759,10 @@ BEGIN
          @freq_recurrence_factor = @recur, @active_start_date = @startDate, @active_start_time = @startTimeInt;
 END;
 
-EXEC dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)';
+IF NOT EXISTS (SELECT 1 FROM dbo.sysjobservers WHERE job_id = @jobId)
+    EXEC dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)';
 
-PRINT N'Job created: ' + @JobName + N' (' + CASE WHEN @Schedule = 'NONE' THEN N'no schedule' ELSE @Schedule + N' at ' + @StartTime
+PRINT CASE WHEN @existed = 1 THEN N'Job updated (history kept): ' ELSE N'Job created: ' END + @JobName + N' (' + CASE WHEN @Schedule = 'NONE' THEN N'no schedule' ELSE @Schedule + N' at ' + @StartTime
       + CASE WHEN @Schedule = 'WEEKLY' THEN N' on ' + @WeekDays WHEN @Schedule = 'ONCE' THEN N' on ' + CONVERT(nvarchar(10), @OnceDate, 120) ELSE N'' END END + N').';
 PRINT CASE WHEN @PrimaryOnly = 1 THEN N'Step 1: AG role check (runs step 2 only on the primary). ' ELSE N'' END + N'Check step command:' + NCHAR(13) + NCHAR(10) + @cmd;
 PRINT N'Run it now: EXEC msdb.dbo.sp_start_job @job_name = N''' + @JobName + N''';';

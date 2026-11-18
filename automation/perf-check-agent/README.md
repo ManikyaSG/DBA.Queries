@@ -14,7 +14,7 @@ The same check as [`automation/perf-check`](../perf-check/README.md), written en
 
 1. **Database Mail** must work on the instance. [`scripts/45_database_mail_setup.sql`](../../scripts/45_database_mail_setup.sql) sets it up, makes the profile the default and raises the attachment limit to 10 MB (the report is usually 0.3–3 MB).
 2. Open `HealthPerfCheck_AgentJob.sql` in SSMS as **sysadmin**.
-3. **PART 1** (top of the file): leave `USE [master];` or change it to your DBA database, then run PART 1. It creates `dbo.DBA_PerfCheck_State`, `dbo.fn_DBA_Html`, `dbo.usp_DBA_HtmlTable` and `dbo.usp_DBA_HealthPerfCheck`. Safe to re-run to upgrade.
+3. **PART 1** (top of the file): leave `USE [master];` or change it to your DBA database, then run PART 1. It creates `dbo.DBA_PerfCheck_State`, `dbo.fn_DBA_Html`, `dbo.usp_DBA_HtmlTable` and `dbo.usp_DBA_HealthPerfCheck`. Re-run it to upgrade: each object is created only if it's missing and then `ALTER`ed, so nothing is dropped and granted permissions stay. It ends with *PART 1 done* or, if the procedure didn't compile, an error.
 4. **Test by hand** with a short window; the report comes back as a clickable XML cell instead of an email:
    ```sql
    EXEC dbo.usp_DBA_HealthPerfCheck @SampleSec = 10, @DurationMin = 1, @SendEmail = 0;
@@ -23,7 +23,7 @@ The same check as [`automation/perf-check`](../perf-check/README.md), written en
    ```sql
    EXEC dbo.usp_DBA_HealthPerfCheck @Recipients = N'dba-team@yourcompany.com', @SampleSec = 10, @DurationMin = 2;
    ```
-5. **PART 2** (bottom of the file): set the parameters at its top and run it. It creates (or replaces) the job **DBA - Health & Performance Check** with one T-SQL step and a schedule:
+5. **PART 2** (bottom of the file): set the parameters at its top and run it. It creates the job **DBA - Health & Performance Check** with its steps and schedule, or, if the job already exists, **updates it in place** (`@UpdateExisting = 1`): the job and its history stay, the steps and schedule are rebuilt from the parameters.
 
 | Parameter | Meaning |
 |---|---|
