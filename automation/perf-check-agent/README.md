@@ -8,11 +8,11 @@ The same check as [`automation/perf-check`](../perf-check/README.md), written en
    *Not included:* the data / log file list, the Agent job list, logins, server role members, and SSAS databases (those need PowerShell / the MSOLAP provider).
 2. **Performance window:** a sample every `@SampleSec` seconds for `@DurationMin` minutes (default 60 s for 30 min), with the same metrics as the PowerShell version: throughput, compilations, connections and connection pool usage, locking / blocking / deadlocks, memory, wait stats per interval, file latency, log flush, tempdb, Always On queues / transaction delay / listener connections.
    **Root cause with SPID and statement:** head blockers (including idle sessions holding an open transaction), problem sessions (blocked, I/O / log / memory / tempdb waits, long running), memory grants, tempdb users, every deadlock process plus the deadlock graph XML, every query over 5 s (Extended Events), and the top 20 queries of the window by duration / CPU / reads from the plan cache (no Query Store needed).
-3. **One email:** the body has the summary, both *needs attention* tables, head blockers, the top 10 problem sessions and the metric summary; the **full report is attached** as an `.html` file.
+3. **One email with the full report in the body** (no attachment). If Database Mail rejects it, a compact report (without the per-interval tables and deadlock XML) is sent instead, then the short summary, so an email always goes out.
 
 ## Install
 
-1. **Database Mail** must work on the instance. [`scripts/45_database_mail_setup.sql`](../../scripts/45_database_mail_setup.sql) sets it up, makes the profile the default and raises the attachment limit to 10 MB (the report is usually 0.3–3 MB).
+1. **Database Mail** must work on the instance. [`scripts/45_database_mail_setup.sql`](../../scripts/45_database_mail_setup.sql) sets it up and makes the profile the default.
 2. Open `HealthPerfCheck_AgentJob.sql` in SSMS as **sysadmin**.
 3. **PART 1** (top of the file): leave `USE [master];` or change it to your DBA database, then run PART 1. It creates `dbo.DBA_PerfCheck_State`, `dbo.fn_DBA_Html`, `dbo.usp_DBA_HtmlTable` and `dbo.usp_DBA_HealthPerfCheck`. Re-run it to upgrade: each object is created only if it's missing and then `ALTER`ed, so nothing is dropped and granted permissions stay. It ends with *PART 1 done* or, if the procedure didn't compile, an error.
 4. **Test by hand** with a short window; the report comes back as a clickable XML cell instead of an email:
@@ -59,10 +59,11 @@ SELECT * FROM dbo.DBA_PerfCheck_State;   -- empty = nothing to restore
 
 ## Email
 
-- The full report is attached as a **query result** (Database Mail's `@query` attachment), so no file is written to disk and it works for any login.
-- If the report is bigger than Database Mail's `MaxFileSize`, or the attachment fails, the email still goes out with the summary and a note.
-- If the check itself fails, a `[FAILED]` email with the error is sent and the job step fails, so the job history and `@NotifyOperator` show it.
+- The **full report is the email body**: no attachment, so Database Mail's attachment limit (`MaxFileSize`) doesn't matter.
+- If Database Mail rejects the full body, the **compact report** is sent (everything except the per-interval tables and the deadlock XML), and if that is rejected too, the **short summary** with the reason. The return code of `sp_send_dbmail` is checked, so a silent rejection is caught too.
+- If no email at all can be sent, or the check itself fails, the job step fails (after trying to send a `[FAILED]` email), so the job history and `@NotifyOperator` show it.
 - The step's output in the job history shows the `mailitem_id`; check delivery with `SELECT sent_status FROM msdb.dbo.sysmail_allitems WHERE mailitem_id = <id>;`.
+- Very large bodies (several MB, e.g. a long window with many problem sessions) can be clipped by some mail clients; shorten `@DurationMin` or raise `@SampleSec` if that happens.
 
 ## Differences from the PowerShell version
 
@@ -70,6 +71,7 @@ SELECT * FROM dbo.DBA_PerfCheck_State;   -- empty = nothing to restore
 |---|---|---|
 | Instances | every instance on the VM, one combined email | the instance it runs on |
 | SSAS | services + SSAS databases | service state only |
-| Deadlock graphs | saved as `.xdl` files and attached | XML shown in the attached report (copy into a `.xdl` file to see the diagram) |
+| Report | attached `.html` file + summary in the body | full report in the email body |
+| Deadlock graphs | saved as `.xdl` files and attached | XML shown in the report (copy into a `.xdl` file to see the diagram) |
 | SMTP fallback | yes | no (Database Mail only) |
 | Login | SQL login with Windows fallback | the job owner (`sa`) |
