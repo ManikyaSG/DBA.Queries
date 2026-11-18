@@ -23,7 +23,7 @@
 
     What is compared (POST vs PRE):
       instance settings, services, sp_configure, global trace flags, databases (state,
-      recovery model, compat, owner, options, AG role/sync, backup folders), AG replicas
+      recovery model, compat, owner, options, AG role/sync), AG replicas
       (roles, primary, modes, health, listeners), AG databases per replica, cluster &
       quorum, disks, data/log files (paths, growth, max size), jobs (enabled, owner),
       logins, server role members, linked servers, endpoints, certificates, XE sessions,
@@ -98,8 +98,7 @@ $Spec = [ordered]@{
     traceflags     = @{ Title = 'Global trace flags';  Key = @('trace_flag');    Compare = @() }
     databases      = @{ Title = 'Databases';           Key = @('name');
                         Compare = @('state', 'user_access', 'recovery_model', 'compat_level', 'owner_name', 'is_read_only', 'page_verify', 'rcsi',
-                                    'snapshot_isolation', 'is_encrypted', 'broker', 'trustworthy', 'query_store', 'ag_name', 'ag_role', 'ag_sync_state',
-                                    'last_full_folder', 'last_log_folder')
+                                    'snapshot_isolation', 'is_encrypted', 'broker', 'trustworthy', 'query_store', 'ag_name', 'ag_role', 'ag_sync_state')
                         Drift = @{ size_mb = 'pct' } }
     ag_replicas    = @{ Title = 'Always On replicas';  Key = @('ag_name', 'replica_node');
                         Compare = @('primary_replica', 'role', 'availability_mode', 'failover_mode', 'connected_state', 'sync_health', 'readable',
@@ -127,7 +126,7 @@ $Spec = [ordered]@{
 }
 # Order + titles for the full report in the email
 $ReportSections = [ordered]@{
-    issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases, backups & CHECKDB'
+    issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases & backups'
     ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
     files = 'Data & log files'; job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
     traceflags = 'Global trace flags'; config = 'sp_configure'
@@ -584,9 +583,10 @@ function ConvertTo-HtmlTable($Rows, [string[]]$Columns, [string]$RowStyle = '', 
     return $sb.ToString()
 }
 
-function Get-FullReportHtml($Snap) {
+function Get-FullReportHtml($Snap, [string[]]$Exclude = @()) {
     $sb = New-Object System.Text.StringBuilder
     foreach ($sec in $ReportSections.Keys) {
+        if ($Exclude -contains $sec) { continue }
         $rows = @(Get-Rows $Snap $sec)
         $cols = $null
         if ($Snap['columns'] -and $Snap['columns'].ContainsKey($sec)) { $cols = @($Snap['columns'][$sec]) }
@@ -783,12 +783,12 @@ try {
     if ($script:HandOffMail) { $mailCandidates = @($script:HandOffMail) }
 
     foreach ($t in $targets) {
-        $row = [ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; ShortHtml = ''; FullHtml = '' }
+        $row = [ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; Unexpected = ''; NewProblems = ''; Expected = ''; Baseline = ''; ShortHtml = ''; FullHtml = ''; BodyHtml = '' }
         Write-Step "`n--- $($t.Instance) ---" 'Green'
         if ($t.Status -notin @('Running', 'Listed')) {
             $row.Outcome = "SKIPPED - service $($t.Service) is $($t.Status)"; $row.State = 'FAILED'
             $row.ShortHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
-            $row.FullHtml = $row.ShortHtml
+            $row.FullHtml = $row.ShortHtml; $row.BodyHtml = $row.ShortHtml
             Write-Step $row.Outcome 'Red'; $summary += [pscustomobject]$row; continue
         }
         $conn = $null; $stage = 'connect'
@@ -839,6 +839,7 @@ try {
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
             $warn = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'WARNING' }).Count
             $fullReport = [string](Get-FullReportHtml $snap)
+            $bodyReport = [string](Get-FullReportHtml $snap -Exclude @('files'))   # email body: no data/log file list (it is in the report file)
 
             if ($Phase -eq 'HEALTH') {
                 $color = if ($crit -gt 0) { '#f8d7da' } elseif ($warn -gt 0) { '#fff3cd' } else { '#d4edda' }
@@ -851,7 +852,8 @@ try {
                     "<h3>Needs attention ($($issues.Count))</h3>"
                     [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
                 ) -join '')
-                $row.FullHtml = $row.ShortHtml + ([string](Get-FullReportHtml $snap) -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
+                $row.FullHtml = $row.ShortHtml + ($fullReport -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
+                $row.BodyHtml = $row.ShortHtml + ($bodyReport -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
                 Write-Step $row.Outcome $(if ($row.State -eq 'OK') { 'Green' } else { 'Yellow' })
             }
             elseif ($Phase -eq 'PRE') {
@@ -866,6 +868,7 @@ try {
                     [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
                 ) -join '')
                 $row.FullHtml = $row.ShortHtml + $fullReport
+                $row.BodyHtml = $row.ShortHtml + $bodyReport
                 Write-Step $row.Outcome 'Green'
             }
             else {
@@ -915,6 +918,7 @@ try {
                         [string](ConvertTo-HtmlTable $cmp.OldProblems $issueCols 'background-color:#fff3cd')
                     ) -join '')
                     $row.FullHtml = $row.ShortHtml + '<h2>Full POST report</h2>' + $fullReport
+                    $row.BodyHtml = $row.ShortHtml + '<h2>Full POST report</h2>' + $bodyReport
                     Write-Step $row.Outcome $(if ($ok) { 'Green' } else { 'Red' })
                     if (-not $ok) { $cmp.Unexpected | Select-Object -First 25 | Format-Table Section, Item, Attribute, Before, After -AutoSize | Out-String -Width 220 | Write-Host }
                 }
@@ -927,6 +931,7 @@ try {
                         [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
                     ) -join '')
                     $row.FullHtml = $row.ShortHtml + $fullReport
+                    $row.BodyHtml = $row.ShortHtml + $bodyReport
                     Write-Step $row.Outcome 'Yellow'
                 }
             }
@@ -941,7 +946,7 @@ try {
             if ($HandOff -and $stage -eq 'connect') { $row.State = 'RETRY'; $row.Outcome = $_.Exception.Message }
             if ($script:RetryErrors -and $stage -eq 'connect') { $row.Outcome = "FAILED: $($script:KeyedUser): $($script:RetryErrors[[string]$t.Instance]) | $($me): $($_.Exception.Message)" }
             $row.ShortHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
-            $row.FullHtml = $row.ShortHtml
+            $row.FullHtml = $row.ShortHtml; $row.BodyHtml = $row.ShortHtml
             if ($row.State -eq 'RETRY') { Write-Step "$($row.Outcome) -> will be retried as the RDP user" 'Yellow' } else { Write-Step $row.Outcome 'Red' }
             if ($row.State -ne 'RETRY' -and $_.Exception.Message -match 'Login failed') { Write-Step "  -> $me has no login on $($t.Instance). Use the account you use for SSMS." 'Yellow' }
         }
@@ -1033,8 +1038,11 @@ try {
                 }
             }
             if (-not $mailId) {
-                $mailId = Send-DbMail $c $sender.Profile $subject $combinedHtml $importance
-                $mailStatus = 'Queued (report in body)'
+                # report in the body - without the data/log file list, which stays in the report file on the VM
+                $bodyHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { if ($_.BodyHtml) { $_.BodyHtml } else { $_.ShortHtml } }) -join "<hr style='margin:30px 0'>") `
+                          + "<p style='color:#555'>Data &amp; log file details are in the report file on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p></body></html>"
+                $mailId = Send-DbMail $c $sender.Profile $subject $bodyHtml $importance
+                $mailStatus = 'Queued (report in body, file list in the report file)'
             }
             Write-Step "Email queued   : mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)'" 'Green'
 
