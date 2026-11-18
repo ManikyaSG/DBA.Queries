@@ -1470,9 +1470,11 @@ END;
   REPORT + EMAIL
 #############################################################################*/
 DECLARE @r_tag varchar(10), @r_head nvarchar(max), @r_full nvarchar(max), @r_short nvarchar(max), @r_subject nvarchar(255),
-        @r_file nvarchar(260), @r_query nvarchar(max), @r_max bigint = 0, @r_mailId int, @r_how nvarchar(200), @r_crit int, @r_warn int;
+        @r_file nvarchar(260), @r_query nvarchar(max), @r_max bigint = 0, @r_mailId int, @r_how nvarchar(200), @r_crit int, @r_warn int,
+        @r_imp varchar(6), @r_body nvarchar(max);
 SET @r_crit = @p_hCrit + @p_pCrit; SET @r_warn = @p_hWarn + @p_pWarn;
 SET @r_tag = CASE WHEN @r_crit > 0 THEN 'CRITICAL' WHEN @r_warn > 0 THEN 'WARNING' ELSE 'OK' END;
+SET @r_imp = CASE WHEN @r_tag = 'CRITICAL' THEN 'High' ELSE 'Normal' END;   -- EXEC parameters can't be expressions
 SET @r_head = N'<h1>' + dbo.fn_DBA_Html(@@SERVERNAME) + N'</h1>'
     + N'<div class="banner" style="background:' + CASE @r_tag WHEN 'CRITICAL' THEN N'#f8d7da' WHEN 'WARNING' THEN N'#fff3cd' ELSE N'#d4edda' END + N'">'
     + @r_tag + N' - ' + CASE WHEN @NoHealth = 0 THEN N'health: ' + CAST(@p_hCrit AS nvarchar(10)) + N' critical, ' + CAST(@p_hWarn AS nvarchar(10)) + N' warning(s)' ELSE N'' END
@@ -1523,10 +1525,10 @@ BEGIN
     BEGIN TRY
         -- the report is attached as a query result (works for every login; no file on disk needed)
         SET @r_query = N'SET NOCOUNT ON; SELECT N''' + REPLACE(@r_full, N'''', N'''''') + N''';';
+        SET @r_body = @r_short + N'<p style="color:#555">The full report (all sections, per-interval tables and query lists) is attached: ' + @r_file + N'</p></body></html>';
         EXEC msdb.dbo.sp_send_dbmail
              @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
-             @subject = @r_subject, @body_format = 'HTML', @importance = CASE WHEN @r_tag = 'CRITICAL' THEN 'High' ELSE 'Normal' END,
-             @body = @r_short + N'<p style="color:#555">The full report (all sections, per-interval tables and query lists) is attached: ' + @r_file + N'</p></body></html>',
+             @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body,
              @query = @r_query, @execute_query_database = N'master', @attach_query_result_as_file = 1, @query_attachment_filename = @r_file,
              @query_result_header = 0, @query_no_truncate = 1, @query_result_no_padding = 1, @exclude_query_output = 1, @ansi_attachment = 1,
              @mailitem_id = @r_mailId OUTPUT;
@@ -1546,10 +1548,10 @@ BEGIN
     -- summary only (the per-section tables of the email body are still included)
     DECLARE @r_note nvarchar(max) = N'<p style="color:#a94442">Full report not attached: ' + dbo.fn_DBA_Html(ISNULL(@r_how, N'@AttachReport = 0')) + N'. '
         + N'Run EXEC ' + DB_NAME() + N'.dbo.usp_DBA_HealthPerfCheck @SendEmail = 0 in SSMS to see it.</p></body></html>';
+    SET @r_body = @r_short + @r_note;
     EXEC msdb.dbo.sp_send_dbmail
          @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
-         @subject = @r_subject, @body_format = 'HTML', @importance = CASE WHEN @r_tag = 'CRITICAL' THEN 'High' ELSE 'Normal' END,
-         @body = @r_short + @r_note, @mailitem_id = @r_mailId OUTPUT;
+         @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body, @mailitem_id = @r_mailId OUTPUT;
     SET @r_how = N'summary only - ' + ISNULL(@r_how, N'');
 END;
 PRINT N'Report ' + @r_tag + N' queued as Database Mail item ' + CAST(@r_mailId AS nvarchar(20)) + N' via profile ''' + @MailProfile + N''' (' + @r_how + N'). '
