@@ -324,6 +324,7 @@ $script:ImpUser     = $null
 $script:RetryErrors = $null   # set in the original window when the run-as window hands instances back
 $script:HandOffRows = $null
 $script:HandOffMail = $null
+$script:DbMailNotes = [ordered]@{}   # instance -> why Database Mail auto-setup didn't give a usable profile
 $script:KeyedUser   = $null
 
 function Connect-AsUser([pscredential]$Credential) {
@@ -408,7 +409,8 @@ function Invoke-DbMailSetup($Connection, [string]$Instance) {
     # Runs $Config.DbMailSetupFile on this instance (batches split on GO). Returns $true if it ran without errors.
     $file = $Config.DbMailSetupFile
     if (-not $file -or -not (Test-Path -LiteralPath $file)) {
-        Write-Step "Database Mail setup script not found ($file) - skipping auto-setup on $Instance." 'Yellow'; return $false
+        Write-Step "Database Mail setup script not found ($file) - skipping auto-setup on $Instance." 'Yellow'
+        $script:DbMailNotes[$Instance] = "setup script not found: $file"; return $false
     }
     Write-Step "Database Mail not configured / enabled on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
     $text = Get-Content -LiteralPath $file -Raw
@@ -424,13 +426,15 @@ function Invoke-DbMailSetup($Connection, [string]$Instance) {
             $n++
             if ($b -match '(?im)^[ \t]*:(setvar|connect|r)\b') {
                 Write-Step "  Batch $n uses SQLCMD-mode commands (:setvar / :connect / :r), which can't run from PowerShell - remove them from the script." 'Red'
+                $script:DbMailNotes[$Instance] = "setup script batch $n uses SQLCMD-mode commands (:setvar / :r / :connect)"
                 $ok = $false; break
             }
             $cmd = $Connection.CreateCommand(); $cmd.CommandText = $b; $cmd.CommandTimeout = 300
             try { [void]$cmd.ExecuteNonQuery() }
             catch {
                 $msg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                Write-Step "  Batch $n failed: $msg" 'Red'; $ok = $false; break
+                Write-Step "  Batch $n failed: $msg" 'Red'; $ok = $false
+                $script:DbMailNotes[$Instance] = "setup script batch $n failed: $msg"; break
             }
         }
     }
@@ -844,8 +848,20 @@ try {
                 try {
                     if (Invoke-DbMailSetup $conn $t.Instance) { $profileName = Get-MailProfileName $conn }
                     if ($profileName) { Write-Step "Database Mail profile now available: $profileName" 'Green' }
+                    elseif (-not $script:DbMailNotes.Contains($t.Instance)) {
+                        $diag = Invoke-Scalar $conn @"
+SELECT 'Database Mail XPs = ' + ISNULL((SELECT CAST(value_in_use AS varchar(5)) FROM sys.configurations WHERE name = N'Database Mail XPs'), '?')
+     + ', profiles = '  + CAST((SELECT COUNT(*) FROM msdb.dbo.sysmail_profile) AS varchar(10))
+     + ', accounts = '  + CAST((SELECT COUNT(*) FROM msdb.dbo.sysmail_account) AS varchar(10));
+"@
+                        $script:DbMailNotes[$t.Instance] = "setup script ran but Database Mail is still not usable ($diag)"
+                        Write-Step "  $($script:DbMailNotes[$t.Instance])" 'Yellow'
+                    }
                 }
-                catch { Write-Step "WARNING: Database Mail auto-setup failed on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
+                catch {
+                    Write-Step "WARNING: Database Mail auto-setup failed on $($t.Instance): $($_.Exception.Message)" 'Yellow'
+                    $script:DbMailNotes[$t.Instance] = "auto-setup error: $($_.Exception.Message)"
+                }
             }
             if ($profileName) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $profileName; Local = [bool]$t.Service } }
             else { Write-Step "Database Mail is not configured / enabled on $($t.Instance) - another instance will be used to send, if any." 'Yellow' }
@@ -1061,6 +1077,8 @@ try {
     $sender = @($mailCandidates | Sort-Object @{ Expression = { -not $_.Local } }) | Select-Object -First 1
     if (-not $sender) {
         $mailStatus = 'Not sent - no instance with Database Mail'
+        if (-not $Config.AutoSetupDbMail) { $mailStatus += ' (auto-setup is off: AutoSetupDbMail = $false)' }
+        elseif ($script:DbMailNotes.Count -gt 0) { $mailStatus += ' (auto-setup: ' + (($script:DbMailNotes.Keys | ForEach-Object { "$_ - $($script:DbMailNotes[$_])" }) -join '; ') + ')' }
         Write-Step 'No instance has Database Mail configured/enabled - email not sent. Open the combined report instead.' 'Yellow'
     }
     else {
