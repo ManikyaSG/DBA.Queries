@@ -1716,18 +1716,27 @@ IF @PrimaryOnly = 1
 BEGIN
     DECLARE @agCmd nvarchar(max) = N'SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
 -- Step 1: run the check only on the primary replica (or when there is no AG / no primary)
+DECLARE @inAg bit = 0, @allSecondary bit = 0, @ags nvarchar(2000) = N'''', @m nvarchar(2000);
 IF CAST(SERVERPROPERTY(''IsHadrEnabled'') AS int) = 1
-   AND EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1)
-   AND NOT EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1 AND role_desc <> N''SECONDARY'')
 BEGIN
-    DECLARE @m nvarchar(2000) = N''Skipped: '' + @@SERVERNAME + N'' is a SECONDARY replica for every availability group (''
-        + STUFF((SELECT N'', '' + ag.name FROM sys.availability_groups AS ag ORDER BY ag.name FOR XML PATH('''')), 1, 2, N'''')
-        + N''). The primary replica runs the check. The job ends as succeeded.'';
+    IF EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1)
+        SET @inAg = 1;
+    IF @inAg = 1 AND NOT EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1 AND role_desc <> N''SECONDARY'')
+        SET @allSecondary = 1;
+    SET @ags = ISNULL(STUFF((SELECT N'', '' + ag.name FROM sys.availability_groups AS ag ORDER BY ag.name FOR XML PATH('''')), 1, 2, N''''), N'''');
+END;
+IF @allSecondary = 1
+BEGIN
+    SET @m = N''Skipped: '' + @@SERVERNAME + N'' is a SECONDARY replica for every availability group ('' + @ags
+           + N''). The primary replica runs the check. The job ends as succeeded.'';
     RAISERROR(N''%s'', 16, 1, @m);   -- step 1 "fails" on purpose -> the job quits reporting success
 END
 ELSE
-    PRINT N''Proceeding: '' + @@SERVERNAME + CASE WHEN EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1)
-                                             THEN N'' is PRIMARY (or RESOLVING) for at least one availability group.'' ELSE N'' has no availability group.'' END;';
+BEGIN
+    SET @m = N''Proceeding: '' + @@SERVERNAME + CASE WHEN @inAg = 1 THEN N'' is PRIMARY (or RESOLVING) for at least one availability group ('' + @ags + N'').''
+                                                     ELSE N'' has no availability group (Always On not configured).'' END;
+    PRINT @m;
+END;';
     EXEC dbo.sp_add_jobstep
          @job_id = @jobId, @step_id = 1, @step_name = N'AG role check - continue only on the primary', @subsystem = N'TSQL',
          @database_name = N'master', @command = @agCmd,
