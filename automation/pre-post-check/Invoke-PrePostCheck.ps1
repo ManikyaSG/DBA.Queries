@@ -62,7 +62,7 @@ $Config = @{
     FromAddress           = ''                           # optional, e.g. 'SQL Alerts <sqlalerts@yourcompany.com>' ('' = profile's account)
     ReplyTo               = ''                           # optional reply-to address
     MailProfile           = 'DBA_Mail'                   # preferred; else default / only profile on the instance
-    AutoSetupDbMail       = $true    # Database Mail off / no profile on an instance -> run DbMailSetupFile there, then re-check
+    AutoSetupDbMail       = $true    # XPs off -> enable them; no mail profile -> run DbMailSetupFile; then re-check
     DbMailSetupFile       = Join-Path $PSScriptRoot 'db_mail_setup.sql'   # your Database Mail setup script (GO-separated batches)
     ReportTitle           = 'SQL Server Change Check'
     HealthReportTitle     = 'SQL Server Health Check'      # used for -Phase HEALTH
@@ -405,6 +405,39 @@ ORDER BY CASE WHEN p.name = @pref THEN 0 WHEN pp.profile_id IS NOT NULL THEN 1 E
     return [string]$r
 }
 
+function Get-DbMailState($Connection) {
+    # XpsOn = 'Database Mail XPs' value_in_use = 1; Profiles = number of profiles in msdb
+    $q = @"
+SELECT CAST(ISNULL((SELECT value_in_use FROM sys.configurations WHERE name = N'Database Mail XPs'), 0) AS int) AS xps,
+       (SELECT COUNT(*) FROM msdb.dbo.sysmail_profile) AS profiles;
+"@
+    $cmd = $Connection.CreateCommand(); $cmd.CommandText = $q; $cmd.CommandTimeout = 60
+    $r = $cmd.ExecuteReader()
+    try { [void]$r.Read(); return [pscustomobject]@{ XpsOn = ([int]$r.GetValue(0) -eq 1); Profiles = [int]$r.GetValue(1) } }
+    finally { $r.Close() }
+}
+
+function Enable-DbMailXps($Connection, [string]$Instance) {
+    # sp_configure 'Database Mail XPs', 1 + RECONFIGURE. 'show advanced options' is put back the way it was.
+    Write-Step "Database Mail XPs is disabled on $Instance - enabling it..." 'Yellow'
+    $q = @"
+SET NOCOUNT ON;
+DECLARE @adv int = CAST((SELECT value_in_use FROM sys.configurations WHERE name = N'show advanced options') AS int);
+IF @adv = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 1; RECONFIGURE; END;
+EXEC sys.sp_configure N'Database Mail XPs', 1; RECONFIGURE;
+IF @adv = 0 BEGIN EXEC sys.sp_configure N'show advanced options', 0; RECONFIGURE; END;
+"@
+    try {
+        $cmd = $Connection.CreateCommand(); $cmd.CommandText = $q; $cmd.CommandTimeout = 120; [void]$cmd.ExecuteNonQuery()
+        Write-Step "  Database Mail XPs enabled on $Instance." 'Green'; return $true
+    }
+    catch {
+        $msg = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        Write-Step "  Could not enable Database Mail XPs on $Instance (needs sysadmin / ALTER SETTINGS): $msg" 'Red'
+        $script:DbMailNotes[$Instance] = "could not enable Database Mail XPs: $msg"; return $false
+    }
+}
+
 function Invoke-DbMailSetup($Connection, [string]$Instance) {
     # Runs $Config.DbMailSetupFile on this instance (batches split on GO). Returns $true if it ran without errors.
     $file = $Config.DbMailSetupFile
@@ -412,7 +445,7 @@ function Invoke-DbMailSetup($Connection, [string]$Instance) {
         Write-Step "Database Mail setup script not found ($file) - skipping auto-setup on $Instance." 'Yellow'
         $script:DbMailNotes[$Instance] = "setup script not found: $file"; return $false
     }
-    Write-Step "Database Mail not configured / enabled on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
+    Write-Step "No Database Mail profile on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
     $text = Get-Content -LiteralPath $file -Raw
     $batches = [regex]::Split($text, '(?im)^[ \t]*GO[ \t]*(?:--.*)?\r?$') | Where-Object { $_ -match '\S' }
     $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
@@ -846,15 +879,17 @@ try {
             catch { Write-Step "WARNING: could not read Database Mail profiles on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
             if (-not $profileName -and $Config.AutoSetupDbMail) {
                 try {
-                    if (Invoke-DbMailSetup $conn $t.Instance) { $profileName = Get-MailProfileName $conn }
+                    $st = Get-DbMailState $conn
+                    Write-Step "Database Mail on $($t.Instance): XPs $(if ($st.XpsOn) { 'enabled' } else { 'disabled' }), $($st.Profiles) profile(s)" 'Yellow'
+                    # 1) XPs off -> enable them (sp_configure + RECONFIGURE)
+                    if (-not $st.XpsOn) { [void](Enable-DbMailXps $conn $t.Instance) }
+                    # 2) no profile -> run the Database Mail setup script
+                    if ($st.Profiles -eq 0) { [void](Invoke-DbMailSetup $conn $t.Instance) }
+                    $profileName = Get-MailProfileName $conn
                     if ($profileName) { Write-Step "Database Mail profile now available: $profileName" 'Green' }
                     elseif (-not $script:DbMailNotes.Contains($t.Instance)) {
-                        $diag = Invoke-Scalar $conn @"
-SELECT 'Database Mail XPs = ' + ISNULL((SELECT CAST(value_in_use AS varchar(5)) FROM sys.configurations WHERE name = N'Database Mail XPs'), '?')
-     + ', profiles = '  + CAST((SELECT COUNT(*) FROM msdb.dbo.sysmail_profile) AS varchar(10))
-     + ', accounts = '  + CAST((SELECT COUNT(*) FROM msdb.dbo.sysmail_account) AS varchar(10));
-"@
-                        $script:DbMailNotes[$t.Instance] = "setup script ran but Database Mail is still not usable ($diag)"
+                        $st2 = Get-DbMailState $conn
+                        $script:DbMailNotes[$t.Instance] = "still not usable after auto-setup (Database Mail XPs = $(if ($st2.XpsOn) { 1 } else { 0 }), profiles = $($st2.Profiles))"
                         Write-Step "  $($script:DbMailNotes[$t.Instance])" 'Yellow'
                     }
                 }
