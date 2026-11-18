@@ -473,6 +473,11 @@ CUSTOM = {
           "EXEC sys.xp_readerrorlog @log_number, 1, @search_text, @search_text2;",
 }   # sections reviewed by hand and known to only touch #temp / generate text
 
+def as_alter(defn):
+    """The deploy helper creates a placeholder IF NOT EXISTS and then ALTERs it, so it ships ALTER text."""
+    assert defn.startswith('CREATE OR ALTER '), defn[:60]
+    return 'ALTER ' + defn[len('CREATE OR ALTER '):]
+
 def write_sql(objs, skipped, out):
     L = []
     L.append(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deploy_header.sql')).read())
@@ -486,8 +491,8 @@ def write_sql(objs, skipped, out):
                  f"    @usage = N'{q(usage)}',\n"
                  f"    @min_version = {min_version(s) or 'NULL'},\n"
                  f"    @sort_hint = {('N' + chr(39) + q(o['order']) + chr(39)) if o['order'] else 'NULL'},\n"
-                 f"    @definition = N'{q(o['primary'])}',\n"
-                 f"    @fallback_definition = {('N' + chr(39) + q(o['fallback']) + chr(39)) if o['fallback'] else 'NULL'};\nGO\n")
+                 f"    @definition = N'{q(as_alter(o['primary']))}',\n"
+                 f"    @fallback_definition = {('N' + chr(39) + q(as_alter(o['fallback'])) + chr(39)) if o['fallback'] else 'NULL'};\nGO\n")
     L.append(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deploy_footer.sql')).read())
     with open(out, 'w', encoding='utf-8', newline='\r\n') as fh:
         fh.write(''.join(L))

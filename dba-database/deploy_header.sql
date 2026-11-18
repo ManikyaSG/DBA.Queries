@@ -15,7 +15,8 @@
              Install on EVERY AG replica (DBAdmin is a local database - keep it out of AGs).
            * Azure SQL Database  : connect to the user database you want it in and run
                                    the script there (the USE below errors harmlessly).
- Safe to  : re-run any time. Every object is CREATE OR ALTER inside TRY/CATCH, so one
+ Safe to  : re-run any number of times. Every object is IF NOT EXISTS -> create placeholder,
+            then ALTER, inside TRY/CATCH (works on every 2016 build), so one
             failure never stops the rest. Objects that need a newer version or another
             platform are skipped and listed in dbo.HC_catalog with the reason.
  Security : objects run with the CALLER's permissions. Users still need
@@ -50,22 +51,35 @@ GO
   Registry + deploy helper
 ----------------------------------------------------------------------------*/
 IF OBJECT_ID(N'dbo.HC_objects', N'U') IS NULL
-CREATE TABLE dbo.HC_objects
-(
-    name          sysname        NOT NULL CONSTRAINT PK_HC_objects PRIMARY KEY,
-    section       varchar(10)    NOT NULL,
-    source_file   nvarchar(128)  NOT NULL,
-    title         nvarchar(400)  NOT NULL,
-    tags          varchar(30)    NOT NULL,
-    usage         nvarchar(1000) NOT NULL,
-    sort_hint     nvarchar(1000) NULL,
-    status        varchar(30)    NOT NULL,
-    message       nvarchar(4000) NULL,
-    deployed_at   datetime2(0)   NOT NULL CONSTRAINT DF_HC_objects_deployed DEFAULT SYSDATETIME()
-);
+BEGIN
+    CREATE TABLE dbo.HC_objects
+    (
+        name          sysname        NOT NULL CONSTRAINT PK_HC_objects PRIMARY KEY,
+        section       varchar(10)    NOT NULL,
+        source_file   nvarchar(128)  NOT NULL,
+        title         nvarchar(400)  NOT NULL,
+        tags          varchar(30)    NOT NULL,
+        usage         nvarchar(1000) NOT NULL,
+        sort_hint     nvarchar(1000) NULL,
+        status        varchar(30)    NOT NULL,
+        message       nvarchar(4000) NULL,
+        deployed_at   datetime2(0)   NOT NULL CONSTRAINT DF_HC_objects_deployed DEFAULT SYSDATETIME()
+    );
+    PRINT 'Created table dbo.HC_objects.';
+END;
 GO
 
-CREATE OR ALTER PROCEDURE dbo.HC_usp_deploy
+-- Remember when this run started; the end of the script drops objects that an earlier
+-- run installed but this version of the toolkit no longer contains.
+DECLARE @hc_run_start datetime2(0) = SYSDATETIME();
+EXEC sys.sp_set_session_context @key = N'hc_run_start', @value = @hc_run_start;
+GO
+
+IF OBJECT_ID(N'dbo.HC_usp_deploy', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_usp_deploy AS RETURN;');
+GO
+
+ALTER PROCEDURE dbo.HC_usp_deploy
     @name                sysname,
     @section             varchar(10),
     @source_file         nvarchar(128),
@@ -74,7 +88,7 @@ CREATE OR ALTER PROCEDURE dbo.HC_usp_deploy
     @usage               nvarchar(1000),
     @sort_hint           nvarchar(1000) = NULL,
     @min_version         int            = NULL,   -- SQL Server major version: 13=2016 14=2017 15=2019 16=2022 17=2025
-    @definition          nvarchar(max),
+    @definition          nvarchar(max),            -- 'ALTER VIEW|FUNCTION|PROCEDURE dbo.HC_x ...'
     @fallback_definition nvarchar(max)  = NULL
 AS
 SET NOCOUNT ON;
@@ -82,6 +96,7 @@ DECLARE @platform varchar(5) =
         CASE CAST(SERVERPROPERTY('EngineEdition') AS int) WHEN 5 THEN 'SQLDB' WHEN 8 THEN 'MI' ELSE 'BOX' END;
 DECLARE @status varchar(30), @msg nvarchar(4000), @fq nvarchar(300) = N'dbo.' + QUOTENAME(@name),
         @want char(2), @have char(2), @try nvarchar(max), @attempt int = 1, @errno int,
+        @stub nvarchar(400), @created bit,
         @major int = CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int);
 
 IF (@tags <> '' AND CHARINDEX(@platform, @tags) = 0)
@@ -92,7 +107,7 @@ BEGIN
     ELSE
         SELECT @status = 'NOT ON THIS VERSION',
                @msg = N'Needs major version ' + CAST(@min_version AS nvarchar(5)) + N'+; this is ' + CAST(@major AS nvarchar(5)) + N'.';
-    IF OBJECT_ID(@fq) IS NOT NULL
+    IF OBJECT_ID(@fq) IS NOT NULL      -- installed by an earlier run on a different platform/version
     BEGIN
         SET @try = N'DROP ' + CASE (SELECT type FROM sys.objects WHERE object_id = OBJECT_ID(@fq))
                                 WHEN 'V' THEN N'VIEW' WHEN 'P' THEN N'PROCEDURE' ELSE N'FUNCTION' END + N' ' + @fq;
@@ -104,16 +119,28 @@ BEGIN
     SET @try = @definition;
     WHILE @try IS NOT NULL
     BEGIN
-        SET @want = CASE WHEN @try LIKE N'CREATE OR ALTER VIEW%'     THEN 'V'
-                         WHEN @try LIKE N'CREATE OR ALTER FUNCTION%' THEN 'IF'
-                         ELSE 'P' END;
+        SELECT @want = CASE WHEN @try LIKE N'ALTER VIEW%'     THEN 'V'
+                            WHEN @try LIKE N'ALTER FUNCTION%' THEN 'IF'
+                            ELSE 'P' END,
+               @created = 0;
         BEGIN TRY
+            -- IF EXISTS with a different type (e.g. was a view, now a procedure): drop it first
             SELECT @have = type FROM sys.objects WHERE object_id = OBJECT_ID(@fq);
             IF @have IS NOT NULL AND RTRIM(@have) <> RTRIM(@want)
             BEGIN
                 DECLARE @drop nvarchar(400) = N'DROP ' + CASE RTRIM(@have) WHEN 'V' THEN N'VIEW' WHEN 'P' THEN N'PROCEDURE'
                                                           ELSE N'FUNCTION' END + N' ' + @fq;
                 EXEC sys.sp_executesql @drop;
+            END;
+            -- IF NOT EXISTS: create an empty placeholder, then ALTER it into the real object
+            IF OBJECT_ID(@fq) IS NULL
+            BEGIN
+                SET @stub = CASE @want
+                    WHEN 'V'  THEN N'CREATE VIEW ' + @fq + N' AS SELECT 1 AS placeholder;'
+                    WHEN 'IF' THEN N'CREATE FUNCTION ' + @fq + N'() RETURNS TABLE AS RETURN (SELECT 1 AS placeholder);'
+                    ELSE           N'CREATE PROCEDURE ' + @fq + N' AS RETURN;' END;
+                EXEC sys.sp_executesql @stub;
+                SET @created = 1;
             END;
             EXEC sys.sp_executesql @try;
             SELECT @status = CASE WHEN @attempt = 1 THEN 'OK' ELSE 'OK (as procedure)' END,
@@ -123,6 +150,11 @@ BEGIN
         BEGIN CATCH
             SELECT @msg = CASE WHEN @msg IS NULL THEN N'' ELSE @msg + N' | ' END + ERROR_MESSAGE(),
                    @errno = ERROR_NUMBER();
+            IF @created = 1 AND OBJECT_ID(@fq) IS NOT NULL      -- don't leave an empty placeholder behind
+            BEGIN
+                SET @stub = N'DROP ' + CASE @want WHEN 'V' THEN N'VIEW' WHEN 'IF' THEN N'FUNCTION' ELSE N'PROCEDURE' END + N' ' + @fq;
+                EXEC sys.sp_executesql @stub;
+            END;
             IF @attempt = 1 AND @fallback_definition IS NOT NULL
                 SELECT @try = @fallback_definition, @attempt = 2;
             ELSE      -- 207/208/195/4121 on older builds = column/function/syntax the version lacks

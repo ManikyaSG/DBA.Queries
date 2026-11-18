@@ -23,7 +23,8 @@ Get-Content .\servers.txt | ForEach-Object {
 
 - **Box / Azure VM / Managed Instance:** creates `DBAdmin` if it is missing. Install on **every AG replica**; keep `DBAdmin` out of the AG, because DMVs are per instance.
 - **Azure SQL Database:** connect to the user database and run it there. The `USE DBAdmin` line errors, and that is expected.
-- **Re-runnable:** each object is `CREATE OR ALTER` inside TRY/CATCH, so one failure never stops the rest. The summary at the end, and `HC_catalog.status`, show `OK`, `OK (as procedure)`, `NOT APPLICABLE` (wrong platform), `NOT ON THIS VERSION` or `FAILED` with the error.
+- **Re-runnable any number of times:** nothing is created blindly. The database, registry table, helper procedure, catalog view and every `HC_` object is checked with `IF EXISTS` / `IF NOT EXISTS` first: a missing object gets an empty placeholder, which is then `ALTER`ed into the real one. That also works on 2016 builds before SP1, where `CREATE OR ALTER` doesn't exist. Each object deploys inside TRY/CATCH, so one failure never stops the rest, and a failed object doesn't leave a placeholder behind.
+- **Cleans up after itself:** an object that an earlier run installed but the toolkit no longer contains is dropped at the end of the run. Only names recorded in `dbo.HC_objects` are touched. The summary at the end, and `HC_catalog.status`, show `OK`, `OK (as procedure)`, `NOT APPLICABLE` (wrong platform), `NOT ON THIS VERSION` or `FAILED` with the error.
 
 ## Which object type you get
 
