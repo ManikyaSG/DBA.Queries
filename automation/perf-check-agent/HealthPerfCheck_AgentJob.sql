@@ -1489,14 +1489,14 @@ SET @r_head = N'<h1>' + dbo.fn_DBA_Html(@@SERVERNAME) + N'</h1>'
     + N'<div>Label: <b>' + dbo.fn_DBA_Html(@Label) + N'</b> &nbsp;|&nbsp; '
     + CASE WHEN @NoPerf = 0 THEN N'Window: every ' + CAST(@SampleSec AS nvarchar(10)) + N' s for ' + CAST(@DurationMin AS nvarchar(10)) + N' min &nbsp;|&nbsp; ' ELSE N'' END
     + N'Run as: ' + dbo.fn_DBA_Html(SUSER_SNAME()) + N' &nbsp;|&nbsp; ' + CONVERT(nvarchar(16), @p_runStart, 120) + N' - ' + CONVERT(nvarchar(5), GETDATE(), 108) + N'</div>';
-SET @r_full  = N'<html><head><meta charset="utf-8"><style>
+SET @r_full  = N'<html><head><style>
 body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
 h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
 table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
 td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
 </style></head><body>' + @r_head + @p_hFull + @p_pFull + N'</body></html>';
-SET @r_short = N'<html><head><meta charset="utf-8"><style>
+SET @r_short = N'<html><head><style>
 body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
 h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
 table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
@@ -1530,13 +1530,14 @@ IF @AttachReport = 1 AND (@r_max <= 0 OR LEN(@r_full) <= @r_max)
 BEGIN
     BEGIN TRY
         -- the report is attached as a query result (works for every login; no file on disk needed)
-        SET @r_query = N'SET NOCOUNT ON; SELECT N''' + REPLACE(@r_full, N'''', N'''''') + N''';';
+        -- varchar result = plain (ANSI) text file, which every browser opens correctly
+        SET @r_query = N'SET NOCOUNT ON; SELECT CAST(N''' + REPLACE(@r_full, N'''', N'''''') + N''' AS varchar(max));';
         SET @r_body = @r_short + N'<p style="color:#555">The full report (all sections, per-interval tables and query lists) is attached: ' + @r_file + N'</p></body></html>';
         EXEC msdb.dbo.sp_send_dbmail
              @profile_name = @MailProfile, @recipients = @Recipients, @copy_recipients = @CopyRecipients, @from_address = @FromAddress,
              @subject = @r_subject, @body_format = 'HTML', @importance = @r_imp, @body = @r_body,
              @query = @r_query, @execute_query_database = N'master', @attach_query_result_as_file = 1, @query_attachment_filename = @r_file,
-             @query_result_header = 0, @query_no_truncate = 1, @query_result_no_padding = 1, @exclude_query_output = 1, @ansi_attachment = 1,
+             @query_result_header = 0, @query_no_truncate = 1, @query_result_no_padding = 1, @exclude_query_output = 1,
              @mailitem_id = @r_mailId OUTPUT;
         SET @r_how = N'with the report attached';
     END TRY
@@ -1589,7 +1590,7 @@ BEGIN CATCH
                 SELECT TOP (1) @MailProfile = p.name FROM msdb.dbo.sysmail_profile AS p
                 WHERE EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profileaccount AS pa WHERE pa.profile_id = p.profile_id) ORDER BY p.profile_id;
             DECLARE @c_subj nvarchar(255) = N'[FAILED] SQL Server Health & Performance Check [' + @Label + N'] - ' + @@SERVERNAME,
-                    @c_body nvarchar(max) = N'<html><head><meta charset="utf-8"><style>
+                    @c_body nvarchar(max) = N'<html><head><style>
 body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
 h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
 table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
