@@ -6,7 +6,7 @@
 
  WHAT IT DOES (dbo.usp_DBA_HealthPerfCheck)
    1. Health check: instance & build, SQL / Windows uptime, services, vitals,
-      databases (state, recovery, backups, CHECKDB, log use, AG role), Always On
+      databases (state, recovery, backups, log use, AG role), Always On
       replicas / listeners (IP, DHCP) / databases, cluster & quorum, disks, failed
       job steps (24 h), severe error log entries, sp_configure, trace flags, linked
       servers, endpoints, certificates, XE sessions, SSIS catalog / projects /
@@ -210,7 +210,6 @@ BEGIN
     DECLARE @LogBackupMaxMin    int = 60,
             @FullBackupMaxDays  int = 7,
             @DiffBackupMaxHours int = 26,
-            @CheckDbMaxDays     int = 7,
             @DiskWarnPct        int = 15,
             @DiskCritPct        int = 10,
             @LogUsedWarnPct     int = 80,
@@ -294,7 +293,7 @@ BEGIN
     INSERT #issues SELECT status, 'Vitals', metric, value FROM #vitals WHERE status <> 'OK';
 
     /*=============================================================================
-      4. DATABASES + BACKUPS + CHECKDB + LOG USE + AG ROLE
+      4. DATABASES + BACKUPS + LOG USE + AG ROLE
     =============================================================================*/
     -- Last full / diff / log backup per database (msdb read access needed; without it backups are not judged)
     IF OBJECT_ID('tempdb..#bk') IS NOT NULL DROP TABLE #bk;
@@ -327,7 +326,6 @@ BEGIN
            bf.backup_finish_date AS last_full, bf.physical_device_name AS last_full_path,
            bd.backup_finish_date AS last_diff,
            bl.backup_finish_date AS last_log,  bl.physical_device_name AS last_log_path,
-           CAST(DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS datetime) AS last_checkdb,
            CAST('OK' AS varchar(10)) AS status, CAST(N'' AS nvarchar(1000)) AS notes
     INTO #db
     FROM sys.databases AS d
@@ -350,7 +348,6 @@ BEGIN
                  OR (last_full < DATEADD(DAY, -@FullBackupMaxDays, @now) AND ISNULL(last_diff, '19000101') < DATEADD(HOUR, -@DiffBackupMaxHours, @now))
                  OR (recovery_model_desc <> N'SIMPLE' AND database_id > 4 AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now)))
                  THEN 'CRITICAL'
-            WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN 'WARNING'
             WHEN log_used_pct >= @LogUsedWarnPct THEN 'WARNING'
             WHEN user_access_desc <> N'MULTI_USER' THEN 'WARNING'
             ELSE 'OK' END,
@@ -362,7 +359,6 @@ BEGIN
             + CASE WHEN state_desc = N'ONLINE' AND backup_preferred_here = 1 AND recovery_model_desc <> N'SIMPLE' AND database_id > 4
                         AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now) THEN N'Log backup older than ' + CAST(@LogBackupMaxMin AS nvarchar(10)) + N' min. ' ELSE N'' END
             + CASE WHEN backup_preferred_here = 0 AND @bkOk = 1 THEN N'Backups run on another AG replica. ' ELSE N'' END
-            + CASE WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN N'CHECKDB older than ' + CAST(@CheckDbMaxDays AS nvarchar(10)) + N' days. ' ELSE N'' END
             + CASE WHEN log_used_pct >= @LogUsedWarnPct THEN N'Log ' + CAST(log_used_pct AS nvarchar(10)) + N'% used (' + log_reuse_wait_desc + N'). ' ELSE N'' END
             + CASE WHEN user_access_desc <> N'MULTI_USER' THEN user_access_desc + N'. ' ELSE N'' END);
 
@@ -678,10 +674,10 @@ CROSS APPLY (VALUES
        d.compatibility_level AS compat, d.owner_name, d.size_mb, d.log_used_pct, d.log_reuse_wait_desc AS log_reuse_wait,
        ISNULL(d.ag_name, N'''') AS ag_name, d.ag_role, ISNULL(d.ag_sync_state, N'''') AS ag_sync_state,
        CONVERT(nvarchar(16), d.last_full, 120) AS last_full, CONVERT(nvarchar(16), d.last_diff, 120) AS last_diff,
-       CONVERT(nvarchar(16), d.last_log, 120) AS last_log, CONVERT(nvarchar(16), NULLIF(d.last_checkdb, ''19000101''), 120) AS last_checkdb,
+       CONVERT(nvarchar(16), d.last_log, 120) AS last_log,
        d.status, d.notes, d.database_id AS _dbid
 FROM #db AS d',
-         @Title = N'Databases, backups & CHECKDB', @OrderBy = N'_dbid', @StatusColumn = N'status', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
+         @Title = N'Databases & backups', @OrderBy = N'_dbid', @StatusColumn = N'status', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
     SET @p_hFull += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT ag_name, replica_node, ISNULL(primary_replica, N'''') AS primary_replica, ISNULL(role_desc, N'''') AS role,
        availability_mode_desc AS availability_mode, failover_mode_desc AS failover_mode, ISNULL(connected_state_desc, N'''') AS connected_state,

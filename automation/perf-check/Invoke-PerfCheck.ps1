@@ -7,7 +7,7 @@
 .DESCRIPTION
     Double-click Run-PerfCheck.bat. No menu.
     Health check (once, at the start): instance & build, SQL / Windows uptime, services, vitals,
-      databases (state, recovery, backups, CHECKDB, log use, AG role), Always On replicas /
+      databases (state, recovery, backups, log use, AG role), Always On replicas /
       listeners (IP, DHCP) / databases, cluster & quorum, disks, failed job steps (24 h), severe
       error log entries, sp_configure, trace flags, linked servers, endpoints, certificates,
       XE sessions, SSIS catalog / projects / environments / failures, SSRS content /
@@ -766,7 +766,7 @@ function Open-SqlConnection([string]$Instance) {
 
 # ---- Health check report: order + titles (sections with no rows are skipped) ----
 $ReportSections = [ordered]@{
-    issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases, backups & CHECKDB'
+    issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases & backups'
     ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
     job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
     traceflags = 'Global trace flags'; config = 'sp_configure'

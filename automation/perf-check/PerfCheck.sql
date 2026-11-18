@@ -10,7 +10,7 @@
            blocks one by one in the SAME query window, e.g. START, a few
            SAMPLEs while you generate load, then END and TEARDOWN.
    HEALTH        : one-time health check (instance, services, vitals, databases,
-                   backups, CHECKDB, Always On, cluster, disks, failed job steps,
+                   backups, Always On, cluster, disks, failed job steps,
                    error log, config, trace flags, linked servers, endpoints,
                    certificates, XE sessions, SSIS catalog, SSRS report server
                    databases) + 'issues'. No data/log file list, Agent job list,
@@ -71,7 +71,6 @@ SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
 DECLARE @LogBackupMaxMin    int = 60,
         @FullBackupMaxDays  int = 7,
         @DiffBackupMaxHours int = 26,
-        @CheckDbMaxDays     int = 7,
         @DiskWarnPct        int = 15,
         @DiskCritPct        int = 10,
         @LogUsedWarnPct     int = 80,
@@ -155,7 +154,7 @@ INSERT #vitals (metric, value, status) VALUES
 INSERT #issues SELECT status, 'Vitals', metric, value FROM #vitals WHERE status <> 'OK';
 
 /*=============================================================================
-  4. DATABASES + BACKUPS + CHECKDB + LOG USE + AG ROLE
+  4. DATABASES + BACKUPS + LOG USE + AG ROLE
 =============================================================================*/
 -- Last full / diff / log backup per database (msdb read access needed; without it backups are not judged)
 IF OBJECT_ID('tempdb..#bk') IS NOT NULL DROP TABLE #bk;
@@ -188,7 +187,6 @@ SELECT d.database_id, d.name, d.state_desc, d.user_access_desc, d.recovery_model
        bf.backup_finish_date AS last_full, bf.physical_device_name AS last_full_path,
        bd.backup_finish_date AS last_diff,
        bl.backup_finish_date AS last_log,  bl.physical_device_name AS last_log_path,
-       CAST(DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS datetime) AS last_checkdb,
        CAST('OK' AS varchar(10)) AS status, CAST(N'' AS nvarchar(1000)) AS notes
 INTO #db
 FROM sys.databases AS d
@@ -211,7 +209,6 @@ UPDATE #db SET
              OR (last_full < DATEADD(DAY, -@FullBackupMaxDays, @now) AND ISNULL(last_diff, '19000101') < DATEADD(HOUR, -@DiffBackupMaxHours, @now))
              OR (recovery_model_desc <> N'SIMPLE' AND database_id > 4 AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now)))
              THEN 'CRITICAL'
-        WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN 'WARNING'
         WHEN log_used_pct >= @LogUsedWarnPct THEN 'WARNING'
         WHEN user_access_desc <> N'MULTI_USER' THEN 'WARNING'
         ELSE 'OK' END,
@@ -223,7 +220,6 @@ UPDATE #db SET
         + CASE WHEN state_desc = N'ONLINE' AND backup_preferred_here = 1 AND recovery_model_desc <> N'SIMPLE' AND database_id > 4
                     AND ISNULL(last_log, '19000101') < DATEADD(MINUTE, -@LogBackupMaxMin, @now) THEN N'Log backup older than ' + CAST(@LogBackupMaxMin AS nvarchar(10)) + N' min. ' ELSE N'' END
         + CASE WHEN backup_preferred_here = 0 AND @bkOk = 1 THEN N'Backups run on another AG replica. ' ELSE N'' END
-        + CASE WHEN name <> N'tempdb' AND state_desc = N'ONLINE' AND ISNULL(last_checkdb, '19000101') < DATEADD(DAY, -@CheckDbMaxDays, @now) THEN N'CHECKDB older than ' + CAST(@CheckDbMaxDays AS nvarchar(10)) + N' days. ' ELSE N'' END
         + CASE WHEN log_used_pct >= @LogUsedWarnPct THEN N'Log ' + CAST(log_used_pct AS nvarchar(10)) + N'% used (' + log_reuse_wait_desc + N'). ' ELSE N'' END
         + CASE WHEN user_access_desc <> N'MULTI_USER' THEN user_access_desc + N'. ' ELSE N'' END);
 
@@ -510,7 +506,6 @@ SELECT N'databases' AS _section, d.name, d.state_desc AS state, d.user_access_de
        CASE WHEN CHARINDEX(N'\', REPLACE(d.last_log_path, N'/', N'\')) > 0
             THEN LEFT(REPLACE(d.last_log_path, N'/', N'\'), LEN(REPLACE(d.last_log_path, N'/', N'\')) - CHARINDEX(N'\', REVERSE(REPLACE(d.last_log_path, N'/', N'\'))))
             ELSE d.last_log_path END AS last_log_folder,
-       CONVERT(nvarchar(16), NULLIF(d.last_checkdb, '19000101'), 120) AS last_checkdb,
        d.status, d.notes
 FROM #db AS d
 JOIN sys.databases AS sd ON sd.database_id = d.database_id
