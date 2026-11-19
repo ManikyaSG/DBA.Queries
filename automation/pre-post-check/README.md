@@ -114,3 +114,28 @@ For other problems (credentials, folder access, `Login failed`, mail stuck as `u
 Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `$Config`.
 
 To clean up without running a check, choose `4` CLEANUP, or schedule `Run-PrePostCheck.bat -Phase CLEANUP` daily in Task Scheduler ("Start in": this folder). Cleanup doesn't ask for credentials or start Secondary Logon.
+
+## AG failover tool (`AG-FailoverTool.ps1`)
+
+A separate, menu-driven tool for Always On AGs during maintenance. Start PowerShell with "Run as different user" (your SQL account) and run `powershell.exe -ExecutionPolicy Bypass -File .\AG-FailoverTool.ps1`.
+
+| Option | What it does |
+|---|---|
+| 1 | Records the primaries on one node and fails its AGs over to the best synchronous secondary. |
+| 2 | Returns the AGs from an option 1 run to their original primaries. |
+| 3 | Read-only AG health check. |
+| 4 | Dry run on/off (prints the T-SQL and reboot commands without running them). |
+| 5 | Rolling reboot of every VM in the cluster (below). |
+
+**Rolling reboot (option 5).** Run it on one of the cluster VMs. The tool:
+1. Finds the cluster nodes, or uses `VMs.txt` if it exists. Then it finds the SQL instances on them and takes a pre-snapshot of every AG primary.
+2. Works through one VM at a time. Before each VM you choose to continue, skip it (for example when the maintenance window is over), run the rest without asking, skip all remaining VMs, or quit.
+3. For each VM:
+   - checks that the other nodes and the quorum witness are up and quorum survives losing this VM
+   - fails over every AG primary on it
+   - runs `shutdown /r /t 0`
+   - waits for SQL to restart and the replicas to re-sync
+   - returns that VM's AGs
+4. Drains the VM it runs on last and stops for you to reboot that VM manually. After the reboot, run option 5 again and choose *Resume*. The tool returns that VM's AGs and rebalances every AG to the pre-snapshot layout.
+
+`VMs.txt` (optional, next to the script) lists one VM per line in reboot order. Lines starting with `#` are ignored, and `VMNAME\INSTANCE` adds a named instance on that VM. The reboot runs `shutdown /r /t 0 /m \\VM` as your account, which must be local admin on the VMs. If it isn't, enter a Windows admin credential at the start and the reboot runs through WinRM. Progress is saved after every step, so a run that stops for any reason resumes with option 5. Output goes to `Logs\` (detailed errors with likely cause), `State\` (snapshots) and `Summary\` (leadership summary).
