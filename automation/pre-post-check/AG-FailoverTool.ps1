@@ -20,6 +20,15 @@
 
       4 - Toggle DRY RUN (shows the T-SQL that would run; changes nothing)
 
+      5 - Rolling reboot of every VM in the cluster
+          Detects the cluster VMs (or reads VMs.txt), takes a pre-snapshot of every
+          AG primary, then one VM at a time: drain -> shutdown /r /t 0 -> wait for
+          SQL to come back and re-sync -> return that VM's AGs. Before each VM you
+          can continue, skip it (e.g. maintenance window over) or stop. The VM the
+          tool runs on is drained last and left for a MANUAL reboot; run option 5
+          again after it is back and the run resumes, returns its AGs and does a
+          final rebalance of every AG to the pre-snapshot layout.
+
     Every action is wrapped in try/catch. Errors are written to a timestamped log
     with the SQL error number/severity/state, the exact T-SQL and server, the
     script line, the full exception chain, a likely root cause with a suggested
@@ -43,6 +52,16 @@
       - No automatic switch of async replicas to synchronous commit.
       - AGs with CLUSTER_TYPE = NONE / EXTERNAL and distributed AGs are reported and skipped.
 
+    VMs.txt (optional, next to the script, used by option 5)
+      One VM per line, in the order to reboot; lines starting with # are ignored.
+      Without it every node of the cluster is rebooted. A line such as
+      SQLVM02\INST2 also tells the tool about a named instance on that VM.
+      The VM running the tool is always handled last, with a manual reboot.
+
+    Reboots (option 5) run "shutdown /r /t 0 /m \\<VM>" as the current account,
+    which must be local admin on the VMs, or "shutdown /r /t 0" through WinRM
+    with a Windows admin credential you enter at the start.
+
     Output folders (created next to the script)
       Logs\     detailed run logs
       State\    JSON state files recording original primaries (drives option 2)
@@ -60,7 +79,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # ----------------------------------------------------------------------------
 $Config = @{
-    ToolVersion             = '1.0'
+    ToolVersion             = '1.1'
     ConnectTimeoutSec       = 15     # SQL connection timeout
     QueryTimeoutSec         = 120    # normal query timeout
     FailoverTimeoutSec      = 600    # ALTER AVAILABILITY GROUP ... FAILOVER timeout
@@ -69,6 +88,10 @@ $Config = @{
     RoleVerifyWaitSec       = 60     # max wait for the new role to show PRIMARY
     PollIntervalSec         = 5
     QueueWarnKB             = 102400 # warn when log send + redo queue exceeds this (100 MB)
+    RebootDownTimeoutSec    = 600    # option 5: time for a VM to go down after the reboot command
+    RebootUpTimeoutSec      = 3600   # option 5: time for SQL to come back after the reboot (patches can be slow)
+    RebootSyncWaitSec       = 1800   # option 5: time for the rebooted VM's replicas to re-sync
+    RebootPollSec           = 15
 }
 
 if ([string]::IsNullOrWhiteSpace($BasePath)) { $BasePath = (Get-Location).Path }
@@ -287,7 +310,9 @@ SELECT  @@SERVERNAME                                   AS ServerName,
         CAST(SERVERPROPERTY('ProductMajorVersion') AS int)          AS MajorVersion,
         CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(50))  AS UpdateLevel,
         CAST(SERVERPROPERTY('IsHadrEnabled') AS int)                AS IsHadrEnabled,
-        CAST(SERVERPROPERTY('HadrManagerStatus') AS int)            AS HadrManagerStatus;
+        CAST(SERVERPROPERTY('HadrManagerStatus') AS int)            AS HadrManagerStatus,
+        CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS nvarchar(128)) AS PhysicalName,
+        (SELECT sqlserver_start_time FROM sys.dm_os_sys_info)       AS SqlStartTime;
 "@
     $r = @(Invoke-Sql -Server $Server -Query $q)
     if ($r.Count -eq 0) { throw "No server information returned from $Server." }
@@ -452,7 +477,7 @@ function Get-ReplicaReadiness {
 function Find-FailoverTarget {
     <#
       Picks the best failover target for an AG, evaluated from the current primary.
-      -ExcludeReplica : the node being drained (option 1)
+      -ExcludeReplica : the instance(s) being drained (option 1 / option 5)
       -OnlyReplica    : a fixed target (option 2, the original primary)
       Waits up to SyncWaitSec when the only blocker is transient sync lag.
       Preference: ready > AUTOMATIC failover partner > smallest log send + redo queue.
@@ -460,7 +485,7 @@ function Find-FailoverTarget {
     param(
         [string]$PrimaryServer,
         [string]$AGName,
-        [string]$ExcludeReplica,
+        [string[]]$ExcludeReplica,
         [string]$OnlyReplica
     )
     $deadline = (Get-Date).AddSeconds($Config.SyncWaitSec)
@@ -470,7 +495,7 @@ function Find-FailoverTarget {
         $dbs  = Get-AGDatabases -Server $PrimaryServer -AGName $AGName
 
         $pool = @($reps | Where-Object { $_.Role -ne 'PRIMARY' })
-        if ($ExcludeReplica) { $pool = @($pool | Where-Object { $_.ReplicaServer -ne $ExcludeReplica }) }
+        if ($ExcludeReplica) { $pool = @($pool | Where-Object { $ExcludeReplica -notcontains $_.ReplicaServer }) }
         if ($OnlyReplica)    { $pool = @($reps | Where-Object { $_.ReplicaServer -eq $OnlyReplica }) }
 
         if ($pool.Count -eq 0) {
@@ -1097,6 +1122,979 @@ function Invoke-HealthCheck {
 }
 
 # ----------------------------------------------------------------------------
+# Option 5 - rolling reboot of every VM in the cluster
+# ----------------------------------------------------------------------------
+$script:OsCredential        = $null
+$script:RollingAutoContinue = $false
+
+function ConvertTo-Stamp([datetime]$Date) { $Date.ToString('yyyy-MM-dd HH:mm:ss') }
+function ConvertFrom-Stamp([string]$Text) { [datetime]::ParseExact($Text, 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) }
+
+function Add-Item {
+    # Appends to an array property; works on objects loaded back from JSON too.
+    param($Object, [string]$Property, $Item)
+    $current = @($Object.$Property | Where-Object { $null -ne $_ })
+    $Object.$Property = @($current + @($Item))
+}
+
+function Read-Choice {
+    param([string]$Prompt, [string[]]$Allowed)
+    while ($true) {
+        $a = (Read-Host $Prompt).Trim().ToUpper()
+        if ($Allowed -contains $a) { return $a }
+        Write-Host "Please enter one of: $($Allowed -join ', ')" -ForegroundColor Yellow
+    }
+}
+
+function Test-TcpPort {
+    param([string]$Computer, [int]$Port, [int]$TimeoutMs = 3000)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($Computer, $Port, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs) -and $client.Connected) { $client.EndConnect($iar); return $true }
+        return $false
+    }
+    catch { return $false }
+    finally { $client.Close() }
+}
+
+function Get-ClusterMembers {
+    param([string]$Server)
+    $q = @"
+SELECT  c.cluster_name                          AS ClusterName,
+        m.member_name                           AS MemberName,
+        m.member_type_desc                      AS MemberType,
+        m.member_state_desc                     AS MemberState,
+        ISNULL(m.number_of_quorum_votes, 0)     AS Votes
+FROM    sys.dm_hadr_cluster_members m
+CROSS JOIN sys.dm_hadr_cluster c;
+"@
+    return @(Invoke-Sql -Server $Server -Query $q)
+}
+
+function Get-AGHealth {
+    param([string]$Server, [string]$AGName)
+    $q = @"
+SELECT ags.synchronization_health_desc AS Health
+FROM   sys.availability_groups ag
+JOIN   sys.dm_hadr_availability_group_states ags ON ags.group_id = ag.group_id
+WHERE  ag.name = @AGName;
+"@
+    $r = @(Invoke-Sql -Server $Server -Query $q -Parameters @{ AGName = $AGName })
+    if ($r.Count -gt 0) { return $r[0].Health }
+    return 'UNKNOWN'
+}
+
+function Get-LocalSqlInstances {
+    $list = @()
+    foreach ($svc in @(Get-Service -Name 'MSSQLSERVER', 'MSSQL$*' -ErrorAction SilentlyContinue)) {
+        if ($svc.Status -ne 'Running') { Write-Log -Level WARN -Message "Local SQL service $($svc.Name) is $($svc.Status) - ignored."; continue }
+        if ($svc.Name -eq 'MSSQLSERVER') { $list += $env:COMPUTERNAME }
+        else { $list += "$env:COMPUTERNAME\$($svc.Name.Substring(6))" }
+    }
+    return $list
+}
+
+function Get-RollingTopology {
+    <#
+      Walks the AGs: connects to each seed instance, reads its AGs and replicas,
+      then connects to every replica found, until no new instance turns up.
+      Probes (VM names) are tried as default instances; failures there are quiet.
+    #>
+    param([string[]]$Seeds, [string[]]$Probes)
+    $todo = New-Object System.Collections.Generic.Queue[object]
+    foreach ($s in $Seeds)  { if ($s) { $todo.Enqueue([pscustomobject]@{ Name = $s; Probe = $false }) } }
+    foreach ($p in $Probes) { if ($p) { $todo.Enqueue([pscustomobject]@{ Name = $p; Probe = $true }) } }
+
+    $tried = @{}; $instances = @{}; $ags = @{}
+    while ($todo.Count -gt 0) {
+        $item = $todo.Dequeue()
+        if ($tried.ContainsKey($item.Name)) { continue }
+        $tried[$item.Name] = $true
+        try { $info = Get-ServerInfo -Server $item.Name }
+        catch {
+            if ($item.Probe) { Write-Log -Level DETAIL -Message "No default SQL instance answered on $($item.Name) ($($_.Exception.Message))" -NoConsole }
+            else { Write-Log -Level WARN -Message "Could not connect to $($item.Name): $($_.Exception.Message)" }
+            continue
+        }
+        $name = $info.ServerName
+        $tried[$name] = $true
+        if ($instances.ContainsKey($name)) { continue }
+        $instances[$name] = [pscustomobject]@{
+            Instance     = $name
+            VM           = $info.PhysicalName
+            Version      = $info.ProductVersion
+            MajorVersion = $info.MajorVersion
+            HadrEnabled  = $info.IsHadrEnabled
+        }
+        Write-Log -Message "Found instance $name on VM $($info.PhysicalName) ($($info.ProductVersion))."
+        if ($info.IsHadrEnabled -ne 1) { continue }
+
+        try { $list = Get-AGList -Server $name -MajorVersion $info.MajorVersion }
+        catch { Write-ErrorDetail -ErrorRecord $_ -Step 'Discover AGs' -Server $name; continue }
+
+        foreach ($ag in $list) {
+            if (-not $ags.ContainsKey($ag.AGName)) {
+                $ags[$ag.AGName] = [pscustomobject]@{ AGName = $ag.AGName; ClusterType = $ag.ClusterType; IsDistributed = [bool]$ag.IsDistributed; Primary = $ag.PrimaryReplica; Replicas = @() }
+            }
+            elseif (-not $ags[$ag.AGName].Primary -and $ag.PrimaryReplica) { $ags[$ag.AGName].Primary = $ag.PrimaryReplica }
+            if ($ag.IsDistributed) { continue }   # members of a distributed AG are AGs, not instances
+            try {
+                $reps = @(Get-AGReplicas -Server $name -AGName $ag.AGName)
+                $ags[$ag.AGName].Replicas = @(@($ags[$ag.AGName].Replicas) + @($reps | ForEach-Object { $_.ReplicaServer }) | Select-Object -Unique)
+                foreach ($r in $reps) { $todo.Enqueue([pscustomobject]@{ Name = $r.ReplicaServer; Probe = $false }) }
+            }
+            catch { Write-Log -Level WARN -Message "Could not read replicas of [$($ag.AGName)] from $name : $($_.Exception.Message)" }
+        }
+    }
+    return [pscustomobject]@{ Instances = @($instances.Values); AGs = @($ags.Values) }
+}
+
+function Get-CurrentPrimary {
+    param($AG)
+    $candidates = @(@($AG.OriginalPrimary) + @($AG.Replicas) | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($c in $candidates) {
+        try {
+            $p = Get-AGPrimary -Server $c -AGName $AG.AGName
+            if ($p) { return $p }
+        }
+        catch { Write-Log -Level DETAIL -Message "[$($AG.AGName)] $c not reachable for primary lookup: $($_.Exception.Message)" -NoConsole }
+    }
+    return $null
+}
+
+function Invoke-ReturnAG {
+    # Planned failover of one AG back to its original primary, with all safety checks.
+    param([string]$AGName, [string]$OriginalPrimary, [string]$CurrentPrimary)
+    $res = [pscustomobject]@{ AGName = $AGName; From = $CurrentPrimary; To = $OriginalPrimary; Result = $null; Note = $null; Time = $null }
+    try {
+        if (-not $CurrentPrimary) { $res.Result = 'BLOCKED'; $res.Note = 'Current primary could not be determined'; return $res }
+        if ($CurrentPrimary -eq $OriginalPrimary) { $res.Result = 'ALREADY_PRIMARY'; return $res }
+
+        $verOrig = (Get-ServerInfo -Server $OriginalPrimary).ProductVersion
+        $verCurr = (Get-ServerInfo -Server $CurrentPrimary).ProductVersion
+        if ([version]$verOrig -lt [version]$verCurr) {
+            $res.Result = 'BLOCKED'
+            $res.Note   = "Version mismatch: $OriginalPrimary is on $verOrig, current primary $CurrentPrimary is on $verCurr. Cannot move back to a lower build - patch $OriginalPrimary first."
+            Write-Log -Level ERROR -Message "[$AGName] $($res.Note)"
+            return $res
+        }
+        $pick = Find-FailoverTarget -PrimaryServer $CurrentPrimary -AGName $AGName -OnlyReplica $OriginalPrimary
+        if (-not $pick.Target) {
+            $res.Result = 'BLOCKED'; $res.Note = $pick.Reason
+            Write-Log -Level ERROR -Message "[$AGName] not returned to $OriginalPrimary : $($pick.Reason)"
+            return $res
+        }
+        $r = Invoke-AGFailover -AGName $AGName -Target $OriginalPrimary
+        $res.Result = if ($r -eq 'FAILED_OVER') { 'RETURNED' } else { $r }
+        $res.Time   = ConvertTo-Stamp (Get-Date)
+        if ($r -eq 'FAILED_OVER') { $res.Note = Wait-AGResync -PrimaryServer $OriginalPrimary -AGName $AGName }
+    }
+    catch {
+        $res.Result = 'FAILED'; $res.Note = $_.Exception.Message
+        Write-ErrorDetail -ErrorRecord $_ -Step 'Return AG to original primary' -Server $OriginalPrimary -AGName $AGName
+        Write-AGSnapshot -Server $(if ($CurrentPrimary) { $CurrentPrimary } else { $OriginalPrimary }) -AGName $AGName
+    }
+    return $res
+}
+
+function Invoke-VMReboot {
+    param([string]$Computer)
+    $ErrorActionPreference = 'Continue'   # native stderr must not become a terminating error
+    $script:LastSql = $null
+    $comment = 'AGFailoverTool rolling reboot'
+    if ($script:DryRun) { Write-Log -Level WARN -Message "[DRY RUN] Would run: shutdown /r /t 0 /m \\$Computer"; return }
+
+    if ($script:OsCredential) {
+        Write-Log -Level STEP -Message "Rebooting $Computer through WinRM as $($script:OsCredential.UserName): shutdown /r /t 0"
+        $rc = Invoke-Command -ComputerName $Computer -Credential $script:OsCredential -ErrorAction Stop -ArgumentList $comment -ScriptBlock {
+            param($c)
+            & shutdown.exe /r /t 0 /d p:4:1 /c $c 2>&1 | Out-Null
+            $LASTEXITCODE
+        }
+        if ($rc -is [int] -and $rc -ne 0) { throw "shutdown /r /t 0 on $Computer exited with code $rc. 1190/1115 = a shutdown is already scheduled or in progress; 5 = the credential is not local admin on $Computer." }
+        return
+    }
+
+    Write-Log -Level STEP -Message "Rebooting $Computer : shutdown /r /t 0 /m \\$Computer (as $($script:RunAs))"
+    $out = & shutdown.exe /r /t 0 /m "\\$Computer" /d p:4:1 /c $comment 2>&1
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        $hint = switch ($code) {
+            5    { "Access denied: $($script:RunAs) is not local admin on $Computer (or lacks 'Force shutdown from a remote system'). Restart option 5 and choose C to enter an admin credential (uses WinRM)." }
+            53   { "Network path not found: $Computer did not resolve, or the firewall blocks remote shutdown (allow the 'Remote Shutdown' / 'Windows Management Instrumentation' rules or SMB/RPC from this VM)." }
+            1115 { 'A shutdown is already in progress on that VM.' }
+            1190 { 'A shutdown is already scheduled on that VM.' }
+            default { 'See "net helpmsg <code>" for the meaning of the exit code.' }
+        }
+        throw "shutdown /r /t 0 /m \\$Computer failed with exit code $code. Output: $(($out | Out-String).Trim()). $hint"
+    }
+}
+
+function Test-RollingGates {
+    # Returns GO, SKIP or STOP.
+    param($Run, $VM, [string[]]$InstOnVM)
+    $issues = New-Object System.Collections.Generic.List[string]
+
+    $members = $null
+    $probeOrder = @(@($Run.Instances | Where-Object { $_.VM -ne $VM.VM }) + @($Run.Instances | Where-Object { $_.VM -eq $VM.VM }))
+    foreach ($i in $probeOrder) {
+        try { $members = @(Get-ClusterMembers -Server $i.Instance); if ($members.Count -gt 0) { break } }
+        catch { Write-Log -Level DETAIL -Message "Cluster membership not readable from $($i.Instance): $($_.Exception.Message)" -NoConsole }
+    }
+    if ($members -and $members.Count -gt 0) {
+        $nodes = @($members | Where-Object { $_.MemberType -eq 'CLUSTER_NODE' })
+        $down  = @($nodes | Where-Object { $_.MemberName -ne $VM.VM -and $_.MemberState -ne 'UP' })
+        if ($down.Count -gt 0) { $issues.Add("Other cluster node(s) not UP: $(($down | ForEach-Object { "$($_.MemberName)=$($_.MemberState)" }) -join ', '). Rebooting $($VM.VM) now could take the cluster down.") }
+        $witnessDown = @($members | Where-Object { $_.MemberType -ne 'CLUSTER_NODE' -and $_.MemberState -ne 'UP' })
+        if ($witnessDown.Count -gt 0) { $issues.Add("Quorum witness not UP: $(($witnessDown | ForEach-Object { "$($_.MemberName) ($($_.MemberType))=$($_.MemberState)" }) -join ', ').") }
+
+        $me = @($nodes | Where-Object { $_.MemberName -eq $VM.VM })
+        if ($me.Count -gt 0) {
+            $total = [double](($members | Measure-Object -Property Votes -Sum).Sum)
+            $up    = [double](($members | Where-Object { $_.MemberState -eq 'UP' } | Measure-Object -Property Votes -Sum).Sum)
+            $mine  = [double](($me | Measure-Object -Property Votes -Sum).Sum)
+            if ($total -gt 0 -and ($up - $mine) -le ($total / 2)) {
+                $issues.Add("Quorum risk: $($up - $mine) of $total votes would remain while $($VM.VM) is down (more than half needed). Check node votes and the cloud witness.")
+            }
+        }
+    }
+    else { $issues.Add('Could not read cluster membership / quorum from any instance.') }
+
+    foreach ($ag in @($Run.AGs | Where-Object { -not $_.Handled -and -not $_.IsDistributed })) {
+        $p = Get-CurrentPrimary -AG $ag
+        if ($p -and $InstOnVM -contains $p) { $issues.Add("AG [$($ag.AGName)] ($($ag.Note)) has its primary on $($VM.VM) and cannot be failed over by this tool - its databases will be offline during the reboot.") }
+    }
+    foreach ($inst in $InstOnVM) {
+        try { [void](Get-ServerInfo -Server $inst) }
+        catch { $issues.Add("Instance $inst on $($VM.VM) is not reachable before the reboot: $($_.Exception.Message)") }
+    }
+
+    if ($issues.Count -eq 0) { Write-Log -Level SUCCESS -Message "Pre-reboot checks passed for $($VM.VM)."; return 'GO' }
+
+    Write-Log -Level ERROR -Message "Pre-reboot checks for $($VM.VM) found problems:`n  - $($issues -join "`n  - ")"
+    $a = Read-Choice "[S]kip $($VM.VM) / [O]verride and continue anyway / [Q]uit (resume later with option 5)" @('S', 'O', 'Q')
+    if ($a -eq 'O') { Write-Log -Level WARN -Message "Operator overrode the pre-reboot checks for $($VM.VM)."; Add-VMNote -VM $VM -Note 'Pre-reboot checks overridden by operator'; return 'GO' }
+    if ($a -eq 'S') { return 'SKIP' }
+    return 'STOP'
+}
+
+function Add-VMNote {
+    param($VM, [string]$Note)
+    if ($VM.Notes) { $VM.Notes = "$($VM.Notes); $Note" } else { $VM.Notes = $Note }
+}
+
+function Invoke-RollingDrain {
+    # Fails over every AG whose primary is on the VM. Returns $true when nothing is left on it.
+    param($Run, $VM, [string[]]$InstOnVM)
+    $complete = $true
+    foreach ($inst in $InstOnVM) {
+        try {
+            $info = Get-ServerInfo -Server $inst
+            $ags  = @(Get-AGList -Server $inst -MajorVersion $info.MajorVersion | Where-Object { $_.LocalRole -eq 'PRIMARY' -and -not $_.IsDistributed })
+        }
+        catch {
+            Write-ErrorDetail -ErrorRecord $_ -Step 'List primaries to drain' -Server $inst
+            $complete = $false; continue
+        }
+        foreach ($ag in $ags) {
+            $move = [pscustomobject]@{ AGName = $ag.AGName; From = $inst; To = $null; Result = $null; Note = $null; Time = $null }
+            $pick = $null
+            try {
+                if ($ag.ClusterType -ne 'WSFC') { throw "CLUSTER_TYPE $($ag.ClusterType) - planned failover not supported by this tool." }
+                $pick = Find-FailoverTarget -PrimaryServer $inst -AGName $ag.AGName -ExcludeReplica $InstOnVM
+                if (-not $pick.Target) {
+                    $move.Result = 'SKIPPED'; $move.Note = $pick.Reason; $complete = $false
+                    Write-Log -Level ERROR -Message "[$($ag.AGName)] cannot be moved off $($VM.VM): $($pick.Reason)"
+                }
+                else {
+                    $move.To     = $pick.Target
+                    $move.Result = Invoke-AGFailover -AGName $ag.AGName -Target $pick.Target
+                    $move.Time   = ConvertTo-Stamp (Get-Date)
+                    if ($move.Result -eq 'FAILED_OVER') { $move.Note = Wait-AGResync -PrimaryServer $pick.Target -AGName $ag.AGName }
+                }
+            }
+            catch {
+                $move.Result = 'FAILED'; $move.Note = $_.Exception.Message; $complete = $false
+                Write-ErrorDetail -ErrorRecord $_ -Step "Drain $($VM.VM)" -Server $(if ($pick -and $pick.Target) { $pick.Target } else { $inst }) -AGName $ag.AGName
+                Write-AGSnapshot -Server $inst -AGName $ag.AGName
+            }
+            Add-Item -Object $VM -Property 'Moves' -Item $move
+            Save-Rolling -Run $Run
+        }
+    }
+    return $complete
+}
+
+function Wait-VMOnline {
+    # Returns OK, NOT_REBOOTED (operator chose to continue), SKIP_RETURN or STOP.
+    param($Run, $VM)
+    if ($script:DryRun) { Write-Log -Level WARN -Message "[DRY RUN] Would wait for $($VM.VM) to reboot and SQL to start."; return 'OK' }
+
+    $before   = @($VM.SqlStartBefore | Where-Object { $_ })
+    $start    = Get-Date
+    $upBy     = $start.AddSeconds($Config.RebootUpTimeoutSec)
+    $downBy   = $start.AddSeconds($Config.RebootDownTimeoutSec)
+    $wentDown = [bool]$VM.IsLocal   # for the local VM the tool was not running during the reboot
+    $lastLog  = [datetime]::MinValue
+    Write-Log -Message "Waiting for $($VM.VM) to come back (up to $([int]($Config.RebootUpTimeoutSec/60)) min)..."
+
+    while ($true) {
+        $states = @(); $upCount = 0; $notRestarted = 0
+        if ($before.Count -eq 0) {
+            $rdp = Test-TcpPort -Computer $VM.VM -Port 3389
+            if (-not $rdp) { $wentDown = $true }
+            elseif ($wentDown) { Write-Log -Level SUCCESS -Message "$($VM.VM) is back (RDP port answering)."; return 'OK' }
+            $states += "RDP port 3389 $(if ($rdp) { 'open' } else { 'closed' })"
+        }
+        else {
+            foreach ($b in $before) {
+                try {
+                    $i = Get-ServerInfo -Server $b.Instance
+                    $nowStart = ConvertFrom-Stamp (ConvertTo-Stamp ([datetime]$i.SqlStartTime))
+                    if ($nowStart -gt (ConvertFrom-Stamp $b.StartTime)) { $upCount++; $wentDown = $true; $states += "$($b.Instance): SQL started $(ConvertTo-Stamp $nowStart)" }
+                    else { $notRestarted++; $states += "$($b.Instance): still running since $($b.StartTime) (not restarted)" }
+                }
+                catch { $wentDown = $true; $states += "$($b.Instance): not reachable yet" }
+            }
+            if ($upCount -eq $before.Count) {
+                Write-Log -Level SUCCESS -Message "$($VM.VM) is back: $($states -join '; ')"
+                return 'OK'
+            }
+        }
+
+        if ($VM.IsLocal -and $before.Count -gt 0 -and $notRestarted -eq $before.Count) {
+            Write-Log -Level WARN -Message "$($VM.VM) (this VM) has not been rebooted since it was drained: $($states -join '; ')"
+            $a = Read-Choice '[W]ait and re-check / [C]ontinue without the reboot (return its AGs anyway) / [Q]uit (reboot this VM, then run option 5 again)' @('W', 'C', 'Q')
+            if ($a -eq 'C') { return 'NOT_REBOOTED' }
+            if ($a -eq 'Q') { return 'STOP' }
+            Start-Sleep -Seconds $Config.RebootPollSec
+            continue
+        }
+
+        if (-not $wentDown -and (Get-Date) -gt $downBy) {
+            Write-Log -Level ERROR -Message "$($VM.VM) did not go down within $([int]($Config.RebootDownTimeoutSec/60)) min of the reboot command: $($states -join '; ')"
+            $a = Read-Choice '[R]esend the reboot command / [W]ait longer / [B]ring its AGs back and skip this VM / [Q]uit' @('R', 'W', 'B', 'Q')
+            if ($a -eq 'R') {
+                try { Invoke-VMReboot -Computer $VM.VM; $VM.RebootSentAt = ConvertTo-Stamp (Get-Date) }
+                catch { Write-ErrorDetail -ErrorRecord $_ -Step "Resend reboot to $($VM.VM)" -Server $VM.VM }
+            }
+            elseif ($a -eq 'B') { return 'SKIP_RETURN' }
+            elseif ($a -eq 'Q') { return 'STOP' }
+            $downBy = (Get-Date).AddSeconds($Config.RebootDownTimeoutSec)
+            continue
+        }
+
+        if ((Get-Date) -gt $upBy) {
+            Write-Log -Level ERROR -Message "$($VM.VM) is not fully back after $([int](((Get-Date) - $start).TotalMinutes)) min: $($states -join '; '). Check the VM in the Azure portal (boot diagnostics / serial console) - Windows updates may still be applying."
+            $a = Read-Choice "[W]ait $([int]($Config.RebootUpTimeoutSec/60)) more minutes / [C]ontinue anyway / [Q]uit (resume later with option 5)" @('W', 'C', 'Q')
+            if ($a -eq 'C') { return 'NOT_REBOOTED' }
+            if ($a -eq 'Q') { return 'STOP' }
+            $upBy = (Get-Date).AddSeconds($Config.RebootUpTimeoutSec)
+            continue
+        }
+
+        if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
+            Write-Log -Message "  ...$($VM.VM) after $([int](((Get-Date) - $start).TotalMinutes)) min: $($states -join '; ')"
+            $lastLog = Get-Date
+        }
+        Start-Sleep -Seconds $Config.RebootPollSec
+    }
+}
+
+function Wait-VMReplicasSynced {
+    # Waits until every replica on the VM is connected and caught up.
+    # Returns @{ Stop = bool; NotReady = AG names that are still not synchronized }.
+    param($Run, $VM, [string[]]$InstOnVM)
+    $result = [pscustomobject]@{ Stop = $false; NotReady = @() }
+    if ($script:DryRun) { return $result }
+
+    $ags = @($Run.AGs | Where-Object { $agR = @($_.Replicas); $_.Handled -and @($InstOnVM | Where-Object { $agR -contains $_ }).Count -gt 0 })
+    if ($ags.Count -eq 0) { return $result }
+
+    Write-Log -Message "Waiting for replicas on $($VM.VM) to re-sync (up to $([int]($Config.RebootSyncWaitSec/60)) min)..."
+    $start = Get-Date; $deadline = $start.AddSeconds($Config.RebootSyncWaitSec); $lastLog = [datetime]::MinValue
+    $resumeAsked = $false; $declined = @()
+
+    while ($true) {
+        $notReady = [ordered]@{}; $suspended = @()
+        foreach ($ag in $ags) {
+            if ($declined -contains $ag.AGName) { $notReady[$ag.AGName] = 'data movement suspended (resume declined)'; continue }
+            try {
+                $p = Get-CurrentPrimary -AG $ag
+                if (-not $p) { $notReady[$ag.AGName] = 'primary not known yet'; continue }
+                $reps = @(Get-AGReplicas  -Server $p -AGName $ag.AGName)
+                $dbs  = @(Get-AGDatabases -Server $p -AGName $ag.AGName)
+                foreach ($inst in $InstOnVM) {
+                    if ($inst -eq $p) { continue }
+                    $rep = $reps | Where-Object { $_.ReplicaServer -eq $inst } | Select-Object -First 1
+                    if (-not $rep) { continue }
+                    if ($rep.ConnectedState -ne 'CONNECTED') { $notReady[$ag.AGName] = "$inst is $($rep.ConnectedState)"; continue }
+                    foreach ($d in @($dbs | Where-Object { $_.ReplicaServer -eq $inst })) {
+                        if ($d.IsSuspended) {
+                            $suspended += [pscustomobject]@{ AGName = $ag.AGName; Instance = $inst; DatabaseName = $d.DatabaseName; SuspendReason = $d.SuspendReason }
+                            $notReady[$ag.AGName] = "$inst/$($d.DatabaseName) SUSPENDED ($($d.SuspendReason))"
+                        }
+                        elseif ($rep.AvailabilityMode -eq 'SYNCHRONOUS_COMMIT' -and $d.SyncState -ne 'SYNCHRONIZED') {
+                            $notReady[$ag.AGName] = "$inst/$($d.DatabaseName) is $($d.SyncState) (redo queue $($d.RedoQueueKB) KB)"
+                        }
+                        elseif ($rep.AvailabilityMode -ne 'SYNCHRONOUS_COMMIT' -and $d.SyncState -notin @('SYNCHRONIZING', 'SYNCHRONIZED')) {
+                            $notReady[$ag.AGName] = "$inst/$($d.DatabaseName) is $($d.SyncState)"
+                        }
+                    }
+                }
+            }
+            catch { $notReady[$ag.AGName] = "check failed: $($_.Exception.Message)" }
+        }
+
+        if ($suspended.Count -gt 0 -and -not $resumeAsked) {
+            $resumeAsked = $true
+            Write-Log -Level WARN -Message "Suspended data movement on $($VM.VM) after the reboot:`n$(Format-Rows ($suspended | Select-Object AGName, Instance, DatabaseName, SuspendReason))"
+            $ans = Read-Host 'Resume data movement on these databases? (Y/N)'
+            if ($ans -match '^[Yy]') {
+                foreach ($s in $suspended) {
+                    $sql = "ALTER DATABASE $(Get-QuotedName $s.DatabaseName) SET HADR RESUME;"
+                    try { Write-Log -Level STEP -Message "Running on $($s.Instance) : $sql"; Invoke-Sql -Server $s.Instance -Query $sql -NonQuery }
+                    catch { Write-ErrorDetail -ErrorRecord $_ -Step 'Resume data movement' -Server $s.Instance -AGName $s.AGName }
+                }
+            }
+            else { $declined += @($suspended | ForEach-Object { $_.AGName } | Select-Object -Unique) }
+            continue
+        }
+
+        if ($notReady.Count -eq 0) {
+            Write-Log -Level SUCCESS -Message "All replicas on $($VM.VM) are connected and synchronized."
+            return $result
+        }
+
+        if ((Get-Date) -gt $deadline) {
+            Write-Log -Level WARN -Message "Replicas on $($VM.VM) still not synchronized:`n  - $(($notReady.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join "`n  - ")"
+            $a = Read-Choice "[W]ait $([int]($Config.RebootSyncWaitSec/60)) more minutes / [C]ontinue (these AGs are not returned now; the final rebalance retries them) / [Q]uit (resume later with option 5)" @('W', 'C', 'Q')
+            if ($a -eq 'C') { $result.NotReady = @($notReady.Keys); return $result }
+            if ($a -eq 'Q') { $result.Stop = $true; return $result }
+            $deadline = (Get-Date).AddSeconds($Config.RebootSyncWaitSec)
+            continue
+        }
+
+        if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
+            Write-Log -Message "  ...re-sync after $([int](((Get-Date) - $start).TotalMinutes)) min: $(($notReady.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join '; ')"
+            $lastLog = Get-Date
+        }
+        Start-Sleep -Seconds $Config.RebootPollSec
+    }
+}
+
+function Invoke-RollingReturnStep {
+    # Returns the AGs whose pre-snapshot primary is on this VM. Returns the number of problems.
+    param($Run, $VM, [string[]]$NotReady = @())
+    $problems = 0
+    foreach ($ag in @($Run.AGs | Where-Object { $_.Handled -and $_.OriginalPrimaryVM -eq $VM.VM })) {
+        $wasMoved = @($VM.Moves | Where-Object { $_ -and $_.AGName -eq $ag.AGName }).Count -gt 0
+        if ($script:DryRun) {
+            if ($wasMoved) {
+                Write-Log -Level WARN -Message "[DRY RUN] Would return [$($ag.AGName)] to $($ag.OriginalPrimary)."
+                Add-Item -Object $VM -Property 'Returns' -Item ([pscustomobject]@{ AGName = $ag.AGName; From = $null; To = $ag.OriginalPrimary; Result = 'DRYRUN'; Note = $null; Time = $null })
+            }
+            continue
+        }
+        if ($NotReady -contains $ag.AGName) {
+            $problems++
+            Add-Item -Object $VM -Property 'Returns' -Item ([pscustomobject]@{ AGName = $ag.AGName; From = $null; To = $ag.OriginalPrimary; Result = 'NOT_SYNCED'; Note = 'Not synchronized after the reboot - final rebalance will retry'; Time = $null })
+            continue
+        }
+        $r = Invoke-ReturnAG -AGName $ag.AGName -OriginalPrimary $ag.OriginalPrimary -CurrentPrimary (Get-CurrentPrimary -AG $ag)
+        if ($r.Result -ne 'ALREADY_PRIMARY' -or $wasMoved) { Add-Item -Object $VM -Property 'Returns' -Item $r }
+        if ($r.Result -notin @('RETURNED', 'ALREADY_PRIMARY')) { $problems++ }
+        Save-Rolling -Run $Run
+    }
+    return $problems
+}
+
+function Invoke-RollingVM {
+    # Runs (or resumes) one VM. Returns NEXT, STOP or LOCAL_PENDING.
+    param($Run, $VM)
+    $instOnVM = @($VM.Instances | Where-Object { $_ })
+    Write-Log -Level STEP -Message "========== VM $($VM.Order) of $(@($Run.VMs).Count): $($VM.VM)$(if ($VM.IsLocal) { ' (this VM - manual reboot)' }) | instances: $(if ($instOnVM.Count) { $instOnVM -join ', ' } else { 'none found' }) =========="
+
+    if ($VM.Status -eq 'PENDING') { $VM.Status = 'IN_PROGRESS'; $VM.Step = 'DRAIN'; Save-Rolling -Run $Run }
+    if ($VM.Status -eq 'AWAITING_MANUAL_REBOOT') { $VM.Status = 'IN_PROGRESS' }
+
+    # ---- 1. checks + drain -------------------------------------------------------
+    if ($VM.Step -eq 'DRAIN') {
+        $gate = Test-RollingGates -Run $Run -VM $VM -InstOnVM $instOnVM
+        if ($gate -eq 'STOP') { $VM.Status = 'PENDING'; $VM.Step = $null; return 'STOP' }
+        if ($gate -eq 'SKIP') { $VM.Status = 'SKIPPED'; Add-VMNote -VM $VM -Note 'Skipped: pre-reboot checks failed'; return 'NEXT' }
+
+        $VM.SqlStartBefore = @(foreach ($inst in $instOnVM) {
+                try { [pscustomobject]@{ Instance = $inst; StartTime = ConvertTo-Stamp ([datetime](Get-ServerInfo -Server $inst).SqlStartTime) } }
+                catch { Write-Log -Level WARN -Message "Could not read SQL start time of $inst : $($_.Exception.Message)" }
+            })
+
+        $complete = Invoke-RollingDrain -Run $Run -VM $VM -InstOnVM $instOnVM
+        if (-not $complete) {
+            Write-Log -Level ERROR -Message "Not every AG could be moved off $($VM.VM). It will NOT be rebooted while it still hosts primaries."
+            $a = Read-Choice "[B]ring the moved AGs back and skip $($VM.VM) / [Q]uit and leave things as they are (resume later with option 5)" @('B', 'Q')
+            if ($a -eq 'Q') { return 'STOP' }
+            [void](Invoke-RollingReturnStep -Run $Run -VM $VM)
+            $VM.Status = 'SKIPPED'; Add-VMNote -VM $VM -Note 'Skipped: drain incomplete, moved AGs returned'
+            return 'NEXT'
+        }
+        $VM.DrainedAt = ConvertTo-Stamp (Get-Date)
+        Write-Log -Level SUCCESS -Message "$($VM.VM) holds no primaries now."
+
+        if ($VM.IsLocal) {
+            if ($script:DryRun) {
+                Write-Log -Level WARN -Message '[DRY RUN] This VM would now stop for a manual reboot.'
+                $VM.Step = 'WAIT_ONLINE'
+            }
+            else {
+                $VM.Status = 'AWAITING_MANUAL_REBOOT'; $VM.Step = 'WAIT_ONLINE'
+                Save-Rolling -Run $Run
+                return 'LOCAL_PENDING'
+            }
+        }
+        else { $VM.Step = 'REBOOT' }
+        Save-Rolling -Run $Run
+    }
+
+    # ---- 2. reboot --------------------------------------------------------------
+    if ($VM.Step -eq 'REBOOT') {
+        while ($true) {
+            try {
+                Invoke-VMReboot -Computer $VM.VM
+                $VM.RebootSentAt = ConvertTo-Stamp (Get-Date)
+                break
+            }
+            catch {
+                Write-ErrorDetail -ErrorRecord $_ -Step "Reboot $($VM.VM)" -Server $VM.VM
+                $a = Read-Choice "[R]etry the reboot / [W]ait anyway (the VM is rebooting) / [B]ring its AGs back and skip $($VM.VM) / [Q]uit" @('R', 'W', 'B', 'Q')
+                if ($a -eq 'W') { $VM.RebootSentAt = ConvertTo-Stamp (Get-Date); break }
+                if ($a -eq 'Q') { Save-Rolling -Run $Run; return 'STOP' }
+                if ($a -eq 'B') {
+                    [void](Invoke-RollingReturnStep -Run $Run -VM $VM)
+                    $VM.Status = 'SKIPPED'; Add-VMNote -VM $VM -Note 'Skipped: reboot command failed, AGs returned'
+                    return 'NEXT'
+                }
+            }
+        }
+        $VM.Step = 'WAIT_ONLINE'
+        Save-Rolling -Run $Run
+    }
+
+    # ---- 3. wait for the VM and SQL ------------------------------------------------
+    if ($VM.Step -eq 'WAIT_ONLINE') {
+        $w = Wait-VMOnline -Run $Run -VM $VM
+        if ($w -eq 'STOP') {
+            if ($VM.IsLocal) { $VM.Status = 'AWAITING_MANUAL_REBOOT' }
+            Save-Rolling -Run $Run; return 'STOP'
+        }
+        if ($w -eq 'SKIP_RETURN') {
+            [void](Invoke-RollingReturnStep -Run $Run -VM $VM)
+            $VM.Status = 'SKIPPED'; Add-VMNote -VM $VM -Note 'Skipped: VM did not reboot, AGs returned'
+            return 'NEXT'
+        }
+        if ($w -eq 'NOT_REBOOTED') { Add-VMNote -VM $VM -Note 'Continued without a confirmed reboot' }
+        $VM.BackOnlineAt = ConvertTo-Stamp (Get-Date)
+        $from = if ($VM.RebootSentAt) { $VM.RebootSentAt } else { $VM.DrainedAt }
+        if ($from) { $VM.DownMinutes = [math]::Round(((Get-Date) - (ConvertFrom-Stamp $from)).TotalMinutes, 1) }
+        $VM.Step = 'WAIT_SYNC'
+        Save-Rolling -Run $Run
+    }
+
+    # ---- 4. wait for re-sync, 5. return the VM's AGs ------------------------------
+    $notReady = @()
+    if ($VM.Step -eq 'WAIT_SYNC') {
+        $s = Wait-VMReplicasSynced -Run $Run -VM $VM -InstOnVM $instOnVM
+        if ($s.Stop) { Save-Rolling -Run $Run; return 'STOP' }
+        $notReady = @($s.NotReady)
+        $VM.Step = 'RETURN'
+        Save-Rolling -Run $Run
+    }
+    if ($VM.Step -eq 'RETURN') {
+        $problems = Invoke-RollingReturnStep -Run $Run -VM $VM -NotReady $notReady
+        $VM.ReturnedAt = ConvertTo-Stamp (Get-Date)
+        $VM.Step   = 'DONE'
+        $VM.Status = if ($problems -eq 0 -and -not $VM.Notes) { 'COMPLETED' } else { 'COMPLETED_WITH_ISSUES' }
+        Save-Rolling -Run $Run
+        Write-Log -Level $(if ($VM.Status -eq 'COMPLETED') { 'SUCCESS' } else { 'WARN' }) -Message "$($VM.VM): $($VM.Status)$(if ($VM.DownMinutes) { " (down $($VM.DownMinutes) min)" })."
+    }
+    return 'NEXT'
+}
+
+function Read-RollingDecision {
+    # Asks the operator what to do with the next VM. Returns GO, SKIP, SKIPALL or QUIT.
+    param($Run, $VM)
+    $expired = $false; $windowMsg = 'no maintenance window set'
+    if ($Run.WindowEnd) {
+        $left = ((ConvertFrom-Stamp $Run.WindowEnd) - (Get-Date)).TotalMinutes
+        if ($left -le 0) { $expired = $true; $windowMsg = "MAINTENANCE WINDOW ENDED $([int][math]::Abs($left)) min ago ($($Run.WindowEnd))" }
+        else { $windowMsg = "maintenance window ends $($Run.WindowEnd) ($([int]$left) min left)" }
+    }
+    $done = @($Run.VMs | Where-Object { $_.DrainedAt -and $_.ReturnedAt })
+    $avg = $null
+    if ($done.Count -gt 0) { $avg = [math]::Round((($done | ForEach-Object { ((ConvertFrom-Stamp $_.ReturnedAt) - (ConvertFrom-Stamp $_.DrainedAt)).TotalMinutes }) | Measure-Object -Average).Average, 0) }
+
+    if ($script:RollingAutoContinue -and -not $expired) {
+        Write-Log -Message "Continuing with $($VM.VM) without asking ($windowMsg)."
+        return 'GO'
+    }
+    if ($script:RollingAutoContinue -and $expired) {
+        Write-Log -Level WARN -Message 'Run-all mode paused because the maintenance window has ended.'
+        $script:RollingAutoContinue = $false
+    }
+
+    $primaries = @($Run.AGs | Where-Object { $_.Handled -and $_.OriginalPrimaryVM -eq $VM.VM } | ForEach-Object { $_.AGName })
+    $remaining = @($Run.VMs | Where-Object { $_.Status -eq 'PENDING' }).Count
+    Write-Host ''
+    Write-Host "---- Next: VM $($VM.Order) of $(@($Run.VMs).Count) - $($VM.VM)$(if ($VM.IsLocal) { ' (THIS VM: drain only, you reboot it manually)' }) ----" -ForegroundColor Cyan
+    Write-Host "  AG primaries (pre-snapshot): $(if ($primaries.Count) { $primaries -join ', ' } else { 'none' })"
+    Write-Host "  VMs still to do            : $remaining"
+    if ($avg) { Write-Host "  Average time per VM so far : $avg min" }
+    Write-Host "  $windowMsg" -ForegroundColor $(if ($expired) { 'Red' } else { 'White' })
+    Write-Host '  C = continue with this VM        S = skip this VM (not rebooted)'
+    Write-Host '  R = continue with this and all remaining VMs without asking (pauses if the window ends)'
+    Write-Host '  A = skip ALL remaining VMs and go to the final rebalance'
+    Write-Host '  Q = quit now (resume later with option 5)'
+    $a = Read-Choice 'Choice' @('C', 'S', 'R', 'A', 'Q')
+    switch ($a) {
+        'C' { return 'GO' }
+        'R' { $script:RollingAutoContinue = $true; return 'GO' }
+        'S' { return 'SKIP' }
+        'A' { return 'SKIPALL' }
+        default { return 'QUIT' }
+    }
+}
+
+function Invoke-RollingFinal {
+    param($Run)
+    Write-Log -Level STEP -Message '===== Final rebalance against the pre-snapshot ====='
+    foreach ($ag in @($Run.AGs | Where-Object { $_.Handled })) {
+        if ($script:DryRun) { $ag.FinalPrimary = $ag.OriginalPrimary; $ag.FinalResult = 'DRYRUN'; continue }
+        $cur = Get-CurrentPrimary -AG $ag
+        $ag.FinalNote = $null
+        if ($cur -ne $ag.OriginalPrimary) {
+            Write-Log -Message "[$($ag.AGName)] is on $cur, pre-snapshot primary is $($ag.OriginalPrimary) - returning it."
+            $r = Invoke-ReturnAG -AGName $ag.AGName -OriginalPrimary $ag.OriginalPrimary -CurrentPrimary $cur
+            $ag.FinalNote = "$($r.Result)$(if ($r.Note) { ': ' + $r.Note })"
+            $cur = Get-CurrentPrimary -AG $ag
+        }
+        $ag.FinalPrimary = $cur
+        $ag.FinalResult  = if ($cur -and $cur -eq $ag.OriginalPrimary) { 'BALANCED' } else { 'NOT_BALANCED' }
+        try { $ag.FinalHealth = if ($cur) { Get-AGHealth -Server $cur -AGName $ag.AGName } else { 'UNKNOWN' } } catch { $ag.FinalHealth = 'UNKNOWN' }
+        Save-Rolling -Run $Run
+    }
+    foreach ($i in @($Run.Instances)) {
+        try { $i.VersionAfter = (Get-ServerInfo -Server $i.Instance).ProductVersion } catch { $i.VersionAfter = 'unreachable' }
+    }
+    $badVM = @($Run.VMs | Where-Object { $_.Status -ne 'COMPLETED' })
+    $badAG = @($Run.AGs | Where-Object { $_.Handled -and $_.FinalResult -notin @('BALANCED', 'DRYRUN') })
+    $Run.Status      = if ($badVM.Count -eq 0 -and $badAG.Count -eq 0) { 'COMPLETED' } else { 'COMPLETED_WITH_ISSUES' }
+    $Run.CompletedAt = ConvertTo-Stamp (Get-Date)
+    Save-Rolling -Run $Run
+    Write-Log -Level STEP -Message "Final AG layout:`n$(Format-Rows ($Run.AGs | Where-Object { $_.Handled } | Select-Object AGName, OriginalPrimary, FinalPrimary, FinalResult, FinalHealth, FinalNote))"
+}
+
+function Save-Rolling {
+    param($Run)
+    try {
+        Save-State -State $Run -Path $Run.StateFile
+        Write-RollingSummary -Run $Run
+    }
+    catch { Write-Log -Level WARN -Message "Could not update rolling state/summary: $($_.Exception.Message)" }
+}
+
+function Write-RollingSummary {
+    param($Run)
+    $mode = if ($Run.Mode -eq 'DRYRUN') { 'DRY RUN (no changes were made)' } else { 'LIVE' }
+    $vms  = @($Run.VMs | Sort-Object Order)
+    $handled = @($Run.AGs | Where-Object { $_.Handled })
+    $ok   = @($vms | Where-Object { $_.Status -eq 'COMPLETED' }).Count
+    $warn = @($vms | Where-Object { $_.Status -eq 'COMPLETED_WITH_ISSUES' }).Count
+    $skip = @($vms | Where-Object { $_.Status -eq 'SKIPPED' }).Count
+    $open = $vms.Count - $ok - $warn - $skip
+    $balanced = @($handled | Where-Object { $_.FinalResult -in @('BALANCED', 'DRYRUN') }).Count
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('=====================================================================================')
+    [void]$sb.AppendLine(' SQL SERVER ALWAYS ON - ROLLING VM REBOOT SUMMARY')
+    [void]$sb.AppendLine('=====================================================================================')
+    [void]$sb.AppendLine(" Cluster          : $($Run.Cluster)")
+    [void]$sb.AppendLine(" Started          : $($Run.StartedAt)")
+    [void]$sb.AppendLine(" Completed        : $(if ($Run.CompletedAt) { $Run.CompletedAt } else { '-' })")
+    [void]$sb.AppendLine(" Executed by      : $($Run.StartedBy) (from $($Run.Machine))")
+    [void]$sb.AppendLine(" Mode             : $mode")
+    [void]$sb.AppendLine(" Maintenance end  : $(if ($Run.WindowEnd) { $Run.WindowEnd } else { 'not set' })")
+    [void]$sb.AppendLine(" Run status       : $($Run.Status)")
+    [void]$sb.AppendLine(" VMs              : $($vms.Count) total | $ok rebooted OK | $warn with issues | $skip skipped | $open not finished")
+    if ($Run.CompletedAt) { [void]$sb.AppendLine(" AG balance       : $balanced of $($handled.Count) AGs on their original primary") }
+    [void]$sb.AppendLine('-------------------------------------------------------------------------------------')
+    [void]$sb.AppendLine(' 1. AG layout before the activity (pre-snapshot)')
+    [void]$sb.AppendLine((Format-Rows ($Run.AGs | Select-Object @{n = 'AG Name'; e = { $_.AGName } }, @{n = 'Primary'; e = { $_.OriginalPrimary } }, @{n = 'Primary VM'; e = { $_.OriginalPrimaryVM } }, @{n = 'Replicas'; e = { @($_.Replicas) -join ', ' } }, @{n = 'Note'; e = { $_.Note } })))
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine(' 2. VM progress')
+    [void]$sb.AppendLine((Format-Rows ($vms | Select-Object @{n = '#'; e = { $_.Order } }, @{n = 'VM'; e = { "$($_.VM)$(if ($_.IsLocal) { ' (manual)' })" } }, @{n = 'Status'; e = { $_.Status } },
+                @{n = 'Drained'; e = { $_.DrainedAt } }, @{n = 'Back online'; e = { $_.BackOnlineAt } }, @{n = 'Down (min)'; e = { $_.DownMinutes } },
+                @{n = 'AGs moved'; e = { @($_.Moves | Where-Object { $_ }).Count } }, @{n = 'AGs returned'; e = { @($_.Returns | Where-Object { $_ -and $_.Result -in @('RETURNED', 'DRYRUN') }).Count } }, @{n = 'Notes'; e = { $_.Notes } })))
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine(' 3. AG movements')
+    $moves = foreach ($v in $vms) {
+        foreach ($m in @($v.Moves | Where-Object { $_ })) {
+            $ret = @($v.Returns | Where-Object { $_ -and $_.AGName -eq $m.AGName }) | Select-Object -Last 1
+            [pscustomobject]@{ 'VM' = $v.VM; 'AG Name' = $m.AGName; 'Moved from' = $m.From; 'Moved to' = $(if ($m.To) { $m.To } else { '-' }); 'Move result' = $m.Result; 'Moved at' = $m.Time
+                'Return result' = $(if ($ret) { $ret.Result } else { '-' }); 'Returned at' = $(if ($ret) { $ret.Time } else { '-' }) }
+        }
+    }
+    [void]$sb.AppendLine((Format-Rows $moves))
+    if ($Run.CompletedAt) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine(' 4. AG layout after the activity')
+        [void]$sb.AppendLine((Format-Rows ($handled | Select-Object @{n = 'AG Name'; e = { $_.AGName } }, @{n = 'Original primary'; e = { $_.OriginalPrimary } }, @{n = 'Final primary'; e = { $_.FinalPrimary } }, @{n = 'Result'; e = { $_.FinalResult } }, @{n = 'AG health'; e = { $_.FinalHealth } })))
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine(' 5. SQL builds')
+        [void]$sb.AppendLine((Format-Rows ($Run.Instances | Select-Object @{n = 'Instance'; e = { $_.Instance } }, @{n = 'VM'; e = { $_.VM } }, @{n = 'Before'; e = { $_.Version } }, @{n = 'After'; e = { $_.VersionAfter } })))
+    }
+
+    $issues = New-Object System.Collections.Generic.List[string]
+    foreach ($v in $vms) {
+        if ($v.Status -in @('SKIPPED', 'COMPLETED_WITH_ISSUES') -and $v.Notes) { $issues.Add("$($v.VM): $($v.Notes)") }
+        foreach ($m in @($v.Moves | Where-Object { $_ -and $_.Result -notin @('FAILED_OVER', 'DRYRUN') })) { $issues.Add("$($v.VM) / $($m.AGName): move $($m.Result) - $($m.Note)") }
+        foreach ($r in @($v.Returns | Where-Object { $_ -and $_.Result -notin @('RETURNED', 'ALREADY_PRIMARY', 'DRYRUN') })) { $issues.Add("$($v.VM) / $($r.AGName): return $($r.Result) - $($r.Note)") }
+    }
+    foreach ($a in @($handled | Where-Object { $_.FinalResult -eq 'NOT_BALANCED' })) { $issues.Add("$($a.AGName): still on $($a.FinalPrimary), expected $($a.OriginalPrimary) - $($a.FinalNote)") }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine(' Issues / notes')
+    if ($issues.Count -eq 0) { [void]$sb.AppendLine('  - None') }
+    foreach ($i in $issues) { [void]$sb.AppendLine("  - $i") }
+
+    if ($Run.Status -eq 'AWAITING_LOCAL_REBOOT') {
+        $local = $vms | Where-Object { $_.IsLocal } | Select-Object -First 1
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine(" NEXT STEP: $($local.VM) is drained. Reboot it manually, then run option 5 on it again to return its AGs and rebalance.")
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine(" Detail logs: $(@($Run.LogFiles) -join ', ')")
+    [void]$sb.AppendLine(" State file : $($Run.StateFile)")
+    [void]$sb.AppendLine('=====================================================================================')
+    Set-Content -Path $Run.SummaryFile -Value $sb.ToString() -Encoding UTF8
+}
+
+function New-RollingRun {
+    # Discovers the VMs, instances and AGs, takes the pre-snapshot. Returns the run object or $null.
+    $localInst = @(Get-LocalSqlInstances)
+    $vmFile    = Join-Path $BasePath 'VMs.txt'
+    $fileVMs = @(); $fileInst = @()
+    if (Test-Path $vmFile) {
+        foreach ($line in (Get-Content -Path $vmFile)) {
+            $t = $line.Trim()
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            if ($t.Contains('\')) { $fileInst += $t; $v = $t.Split('\')[0] } else { $v = $t }
+            if ($fileVMs -notcontains $v) { $fileVMs += $v }
+        }
+        if ($fileVMs.Count -eq 0) { Write-Log -Level ERROR -Message "$vmFile has no VM names."; return $null }
+        Write-Log -Message "VM list taken from $vmFile : $($fileVMs -join ', ')"
+    }
+
+    $members = @()
+    foreach ($s in @($localInst + $fileInst + $fileVMs)) {
+        try { $members = @(Get-ClusterMembers -Server $s); if ($members.Count -gt 0) { break } }
+        catch { Write-Log -Level DETAIL -Message "Cluster membership not readable from $s : $($_.Exception.Message)" -NoConsole }
+    }
+    if ($members.Count -eq 0 -and $fileVMs.Count -eq 0) {
+        Write-Log -Level ERROR -Message "Could not read the cluster from any SQL instance on $env:COMPUTERNAME (found: $(if ($localInst.Count) { $localInst -join ', ' } else { 'no running SQL service' })). Run this on a cluster VM with Always On enabled, or list the VMs in $vmFile."
+        return $null
+    }
+    $clusterName = if ($members.Count -gt 0) { $members[0].ClusterName } else { 'UNKNOWN_CLUSTER' }
+    $nodes = @($members | Where-Object { $_.MemberType -eq 'CLUSTER_NODE' } | ForEach-Object { $_.MemberName })
+    if ($members.Count -gt 0) { Write-Log -Message "Cluster $clusterName nodes: $($nodes -join ', ')" }
+
+    $vmList = if ($fileVMs.Count -gt 0) { $fileVMs } else { $nodes }
+    foreach ($v in $vmList) { if ($nodes.Count -gt 0 -and $nodes -notcontains $v) { Write-Log -Level WARN -Message "$v (from VMs.txt) is not a node of cluster $clusterName - it will still be rebooted." } }
+
+    $localVM  = $env:COMPUTERNAME
+    $ordered  = @($vmList | Where-Object { $_ -ne $localVM })
+    if ($vmList -contains $localVM) { $ordered += $localVM }
+    else { Write-Log -Level WARN -Message "This VM ($localVM) is not in the list - every listed VM will be rebooted by the tool." }
+
+    Write-Log -Message 'Discovering SQL instances and AGs (this can take a minute)...'
+    $topo  = Get-RollingTopology -Seeds @($localInst + $fileInst) -Probes $vmList
+    $insts = @($topo.Instances)
+
+    $agSnap = @(foreach ($ag in ($topo.AGs | Sort-Object AGName)) {
+            $handled = ($ag.ClusterType -eq 'WSFC') -and -not $ag.IsDistributed
+            $note = if ($ag.IsDistributed) { 'Distributed AG - its member AGs are handled individually' }
+                    elseif (-not $handled) { "CLUSTER_TYPE $($ag.ClusterType) - not failed over by this tool" }
+                    else { '' }
+            if ($handled -and -not $ag.Primary) { $handled = $false; $note = 'Primary unknown at snapshot time - not managed' }
+            $pVM = ($insts | Where-Object { $_.Instance -eq $ag.Primary } | Select-Object -First 1).VM
+            [pscustomobject]@{
+                AGName = $ag.AGName; ClusterType = $ag.ClusterType; IsDistributed = $ag.IsDistributed; Handled = $handled; Note = $note
+                OriginalPrimary = $ag.Primary; OriginalPrimaryVM = $pVM; Replicas = @($ag.Replicas)
+                FinalPrimary = $null; FinalResult = $null; FinalNote = $null; FinalHealth = $null
+            }
+        })
+
+    $order = 0
+    $vmObjs = @(foreach ($v in $ordered) {
+            $order++
+            [pscustomobject]@{
+                Order = $order; VM = $v; IsLocal = ($v -eq $localVM)
+                Instances = @($insts | Where-Object { $_.VM -eq $v } | ForEach-Object { $_.Instance })
+                Status = 'PENDING'; Step = $null; Notes = $null
+                DrainedAt = $null; RebootSentAt = $null; BackOnlineAt = $null; ReturnedAt = $null; DownMinutes = $null
+                SqlStartBefore = @(); Moves = @(); Returns = @()
+            }
+        })
+
+    Write-Log -Level STEP -Message "Reboot order:`n$(Format-Rows ($vmObjs | Select-Object Order, VM, @{n='Reboot';e={ if ($_.IsLocal) { 'MANUAL (last)' } else { 'by tool' } }}, @{n='Instances';e={ @($_.Instances) -join ', ' }}, @{n='AG primaries';e={ $vmName = $_.VM; @($agSnap | Where-Object { $_.Handled -and $_.OriginalPrimaryVM -eq $vmName }).Count }}))"
+    Write-Log -Level STEP -Message "AG pre-snapshot:`n$(Format-Rows ($agSnap | Select-Object AGName, OriginalPrimary, OriginalPrimaryVM, @{n='Replicas';e={ @($_.Replicas) -join ', ' }}, Note))"
+    foreach ($v in $vmObjs) { if (@($v.Instances).Count -eq 0) { Write-Log -Level WARN -Message "No SQL instance found on $($v.VM). It will be rebooted without AG handling. If it has a named instance, add a line '$($v.VM)\<instance>' to VMs.txt." } }
+    foreach ($a in @($agSnap | Where-Object { -not $_.Handled -and -not $_.IsDistributed })) { Write-Log -Level WARN -Message "AG [$($a.AGName)] is not managed by the tool: $($a.Note)" }
+
+    $windowEnd = $null
+    $we = (Read-Host 'Maintenance window end time (HH:mm, 24h; blank = no limit)').Trim()
+    if ($we) {
+        $t = [datetime]::MinValue
+        if ([datetime]::TryParseExact($we, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$t)) {
+            $end = (Get-Date).Date.Add($t.TimeOfDay)
+            if ($end -lt (Get-Date)) { $end = $end.AddDays(1) }
+            $windowEnd = ConvertTo-Stamp $end
+            Write-Log -Message "Maintenance window ends $windowEnd."
+        }
+        else { Write-Log -Level WARN -Message "'$we' is not HH:mm - no maintenance window set." }
+    }
+
+    if (-not (Confirm-Action "About to start a rolling reboot of $($vmObjs.Count) VM(s) in cluster $clusterName$(if ($script:DryRun) { ' [DRY RUN]' }).")) {
+        Write-Log -Level WARN -Message 'Cancelled by user. No changes made.'
+        return $null
+    }
+
+    $tag  = if ($script:DryRun) { '_DRYRUN' } else { '' }
+    $safe = Get-SafeName $clusterName
+    $run = [pscustomobject]@{
+        Tool        = 'AGFailoverTool'
+        ToolVersion = $Config.ToolVersion
+        Kind        = 'ROLLING_REBOOT'
+        Mode        = $(if ($script:DryRun) { 'DRYRUN' } else { 'LIVE' })
+        Cluster     = $clusterName
+        LocalVM     = $localVM
+        StartedAt   = ConvertTo-Stamp (Get-Date)
+        StartedBy   = $script:RunAs
+        Machine     = $env:COMPUTERNAME
+        WindowEnd   = $windowEnd
+        Status      = 'IN_PROGRESS'
+        CompletedAt = $null
+        LastUpdated = $null
+        LogFiles    = @($script:LogFile)
+        StateFile   = Join-Path $script:StateDir   "Rolling_$($safe)_$($script:RunStamp)$tag.json"
+        SummaryFile = Join-Path $script:SummaryDir "Rolling_Reboot_Summary_$($safe)_$($script:RunStamp)$tag.txt"
+        Instances   = @($insts | ForEach-Object { [pscustomobject]@{ Instance = $_.Instance; VM = $_.VM; Version = $_.Version; VersionAfter = $null } })
+        AGs         = $agSnap
+        VMs         = $vmObjs
+    }
+    Save-Rolling -Run $run
+    Write-Log -Level SUCCESS -Message "Pre-snapshot saved to $($run.StateFile)"
+    return $run
+}
+
+function Invoke-RollingReboot {
+    Write-Log -Level STEP -Message '===== OPTION 5: Rolling reboot of the cluster VMs ====='
+    $run = $null
+    $savedDryRun = $script:DryRun
+
+    # ---- resume an unfinished run? ---------------------------------------------------
+    $pending = $null
+    foreach ($f in @(Get-ChildItem -Path $script:StateDir -Filter 'Rolling_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)) {
+        try {
+            $s = Get-Content -Path $f.FullName -Raw | ConvertFrom-Json
+            if ($s.Status -in @('IN_PROGRESS', 'AWAITING_LOCAL_REBOOT')) { $pending = $s; break }
+        }
+        catch { Write-Log -Level WARN -Message "Unreadable rolling state file skipped: $($f.Name)" }
+    }
+    if ($pending) {
+        $doneCount = @($pending.VMs | Where-Object { $_.Status -notin @('PENDING', 'IN_PROGRESS', 'AWAITING_MANUAL_REBOOT') }).Count
+        Write-Host ''
+        Write-Host "Unfinished rolling reboot found: cluster $($pending.Cluster), started $($pending.StartedAt) by $($pending.StartedBy), $($pending.Mode), status $($pending.Status), $doneCount of $(@($pending.VMs).Count) VMs done." -ForegroundColor Yellow
+        $a = Read-Choice '[R]esume it / [N]ew run (the old one is marked ABANDONED) / [C]ancel' @('R', 'N', 'C')
+        if ($a -eq 'C') { return }
+        if ($a -eq 'R') {
+            $run = $pending
+            $script:DryRun = ($run.Mode -eq 'DRYRUN')
+            if (@($run.LogFiles) -notcontains $script:LogFile) { Add-Item -Object $run -Property 'LogFiles' -Item $script:LogFile }
+            Write-Log -Message "Resuming rolling run from $($run.StateFile) (dry run: $($script:DryRun))."
+        }
+        else {
+            $pending.Status = 'ABANDONED'
+            try { Save-State -State $pending -Path $pending.StateFile } catch { Write-Log -Level WARN -Message "Could not mark the old run abandoned: $($_.Exception.Message)" }
+        }
+    }
+
+    try {
+        if (-not $run) { $run = New-RollingRun }
+        if (-not $run) { return }
+
+        # ---- reboot account ----------------------------------------------------------
+        $autoVMs = @($run.VMs | Where-Object { -not $_.IsLocal -and $_.Status -in @('PENDING', 'IN_PROGRESS') })
+        if ($autoVMs.Count -gt 0 -and -not $script:DryRun) {
+            Write-Host ''
+            Write-Host "Reboots run 'shutdown /r /t 0 /m \\<VM>' as $($script:RunAs); that account must be local admin on the VMs."
+            $a = Read-Choice "[U]se $($script:RunAs) / [C]redential: enter a different Windows admin account (reboot via WinRM)" @('U', 'C')
+            if ($a -eq 'C') { $script:OsCredential = Get-Credential -Message 'Windows admin account used to reboot the VMs' }
+            else { $script:OsCredential = $null }
+        }
+
+        if ($run.Status -eq 'AWAITING_LOCAL_REBOOT') { $run.Status = 'IN_PROGRESS' }
+        $script:RollingAutoContinue = $false
+        $skipAll = $false
+
+        foreach ($vm in @($run.VMs | Sort-Object Order)) {
+            if ($vm.Status -in @('COMPLETED', 'COMPLETED_WITH_ISSUES', 'SKIPPED')) { continue }
+            if ($vm.Status -eq 'PENDING') {
+                if ($skipAll) { $vm.Status = 'SKIPPED'; Add-VMNote -VM $vm -Note 'Skipped by operator (remaining VMs skipped)'; continue }
+                $d = Read-RollingDecision -Run $run -VM $vm
+                if ($d -eq 'QUIT') { Save-Rolling -Run $run; Write-Log -Level WARN -Message "Stopped by operator. Run option 5 again to resume. Summary: $($run.SummaryFile)"; return }
+                if ($d -eq 'SKIP') { $vm.Status = 'SKIPPED'; Add-VMNote -VM $vm -Note 'Skipped by operator'; Save-Rolling -Run $run; Write-Log -Level WARN -Message "$($vm.VM) skipped."; continue }
+                if ($d -eq 'SKIPALL') {
+                    $skipAll = $true
+                    $vm.Status = 'SKIPPED'; Add-VMNote -VM $vm -Note 'Skipped by operator (remaining VMs skipped)'
+                    Write-Log -Level WARN -Message 'All remaining VMs skipped by operator.'
+                    continue
+                }
+            }
+
+            $r = Invoke-RollingVM -Run $run -VM $vm
+            Save-Rolling -Run $run
+            if ($r -eq 'STOP') {
+                Write-Log -Level WARN -Message "Rolling reboot paused at $($vm.VM). Run option 5 again to resume from here. Summary: $($run.SummaryFile)"
+                return
+            }
+            if ($r -eq 'LOCAL_PENDING') {
+                $run.Status = 'AWAITING_LOCAL_REBOOT'
+                Save-Rolling -Run $run
+                Write-Host ''
+                Write-Host '=====================================================================' -ForegroundColor Yellow
+                Write-Host " $($vm.VM) (this VM) is drained and holds no AG primaries." -ForegroundColor Yellow
+                Write-Host ' 1. Reboot it now:  shutdown /r /t 0' -ForegroundColor Yellow
+                Write-Host ' 2. Log back in, start this tool again and choose option 5 -> Resume.' -ForegroundColor Yellow
+                Write-Host '    It will wait for re-sync, return this VM''s AGs and rebalance all AGs.' -ForegroundColor Yellow
+                Write-Host '=====================================================================' -ForegroundColor Yellow
+                Write-Log -Level WARN -Message "Waiting for manual reboot of $($vm.VM). Summary: $($run.SummaryFile)"
+                return
+            }
+        }
+
+        Invoke-RollingFinal -Run $run
+        Write-Log -Level $(if ($run.Status -eq 'COMPLETED') { 'SUCCESS' } else { 'WARN' }) -Message "Rolling reboot $($run.Status). Summary: $($run.SummaryFile)"
+    }
+    catch {
+        Write-ErrorDetail -ErrorRecord $_ -Step 'Rolling reboot'
+        if ($run) { Save-Rolling -Run $run; Write-Log -Level WARN -Message 'Progress is saved. Fix the problem and run option 5 again to resume.' }
+    }
+    finally {
+        $script:DryRun = $savedDryRun
+    }
+}
+
+# ----------------------------------------------------------------------------
 # Main menu
 # ----------------------------------------------------------------------------
 Write-Log -Message "AGFailoverTool v$($Config.ToolVersion) started by $($script:RunAs) on $env:COMPUTERNAME (PowerShell $($PSVersionTable.PSVersion)). Log: $($script:LogFile)"
@@ -1111,6 +2109,7 @@ while ($true) {
     Write-Host '  2. After activity   - fail AGs back to original primaries'
     Write-Host '  3. AG health check  (read-only)'
     Write-Host "  4. Toggle dry run   (currently: $(if($script:DryRun){'ON'}else{'OFF'}))"
+    Write-Host '  5. Rolling reboot   - drain, reboot and return every VM in the cluster, one at a time'
     Write-Host '  0. Exit'
     $choice = (Read-Host 'Select an option').Trim()
 
@@ -1119,6 +2118,7 @@ while ($true) {
             '1' { Invoke-DrainNode }
             '2' { Invoke-Failback }
             '3' { Invoke-HealthCheck }
+            '5' { Invoke-RollingReboot }
             '4' { $script:DryRun = -not $script:DryRun; Write-Log -Level WARN -Message "Dry run is now $(if($script:DryRun){'ON'}else{'OFF'})." }
             '0' { Write-Log -Message 'Exiting.'; return }
             default { Write-Host "Invalid option '$choice'." -ForegroundColor Yellow }
