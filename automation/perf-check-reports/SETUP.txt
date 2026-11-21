@@ -5,25 +5,29 @@
  Files: automation/perf-check-reports/powershell  (+ database_mail_setup.sql)
 ===============================================================================
 
-Accounts:
-  - SQL login dba_perfcheck .... ONLY for connecting to the instances (collecting data)
-  - EMEA\Admin.partner.db ...... everything else: runs PowerShell / the Agent job,
-                                 writes the files, reads the other VMs' services,
-                                 sends the email
-The dba_perfcheck password is saved encrypted (Windows DPAPI) so that ONLY
-EMEA\Admin.partner.db, on the coordinator, can decrypt it.
+Accounts - no account password is needed anywhere:
+  - SQL login dba_perfcheck ...... ONLY for connecting to the instances (collecting data)
+  - SQL Agent service account .... runs the job: PowerShell, files, the email
+                                   (CmdExec step without a proxy, so nobody has to
+                                    know a Windows password)
+  - Your admin account ........... one-time setup only: RDP with CyberArk, then
+                                   "Run as different user" (secondary logon), the same
+                                   way as for the pre/post check
+The dba_perfcheck password ends up encrypted (Windows DPAPI) so that ONLY the
+SQL Agent service account, on the coordinator, can decrypt it.
 
 -------------------------------------------------------------------------------
  1. CHOOSE THE COORDINATOR AND COPY THE FILES
 -------------------------------------------------------------------------------
-Pick ONE SQL instance with SQL Agent to run the job (the coordinator).
+Pick ONE SQL instance with SQL Agent to run the job (the coordinator), e.g.
+SQLVM1\INST1.
 
 From the repo folder automation/perf-check-reports/powershell, copy to e.g.
-C:\DBA\PerfCheck on the coordinator:
+C:\DBA\PerfCheck on the coordinator VM:
 
     Invoke-PerfCheck.ps1
     PerfCheck.sql
-    Run-PerfCheck.bat              (to save the password, step 4)
+    Run-PerfCheck.bat              (test run + password hand-over)
     Run-PerfCheck-Agent.bat        (used by the job)
     servers.example.txt        ->  save as servers.txt
 
@@ -51,28 +55,34 @@ ALTER ANY EVENT SESSION, msdb read + DatabaseMailUserRole, EXECUTE on xp_readerr
   - Never make it sysadmin.
 
 -------------------------------------------------------------------------------
- 3. EMEA\Admin.partner.db ON THE COORDINATOR
+ 3. THE SQL AGENT SERVICE ACCOUNT ON THE COORDINATOR
 -------------------------------------------------------------------------------
-a) Folder: MODIFY rights on C:\DBA\PerfCheck (it writes Reports\, Logs\ and the
-   saved password file).
-b) Windows right "Log on as a batch job" - probably needed to run as an Agent
-   proxy (not confirmed - check this if the job step doesn't start).
-c) Windows login on the COORDINATOR instance only, to send the email with the
-   files attached (Database Mail doesn't allow attachments for SQL logins):
+a) Its name - on the coordinator instance:
 
-    USE master;
-    IF SUSER_ID(N'EMEA\Admin.partner.db') IS NULL CREATE LOGIN [EMEA\Admin.partner.db] FROM WINDOWS;
-    USE msdb;
-    IF USER_ID(N'EMEA\Admin.partner.db') IS NULL CREATE USER [EMEA\Admin.partner.db] FOR LOGIN [EMEA\Admin.partner.db];
-    ALTER ROLE DatabaseMailUserRole ADD MEMBER [EMEA\Admin.partner.db];
+    SELECT servicename, service_account FROM sys.dm_server_services;
 
-   (No SQL Server rights are needed on the other 8 instances: data is collected
-    with dba_perfcheck.)
-   No Windows login at all? Set SmtpServer in step 5 instead and
-   MailWindowsAuth = $false.
-d) SSIS / SSRS / SSAS service state of the other 2 VMs is read over CIM / WinRM
-   as this account (remote management rights on those VMs). Not allowed? Set
-   RemoteBiServices = $false in step 5.
+   Usually NT SERVICE\SQLSERVERAGENT (default instance) or
+   NT SERVICE\SQLAgent$INST1 (named instance INST1). Used in steps 3b, 7.
+
+b) Folder: give it MODIFY rights on C:\DBA\PerfCheck (it writes Reports\, Logs\
+   and its saved password file, and deletes the hand-over file):
+
+    icacls "C:\DBA\PerfCheck" /grant "NT SERVICE\SQLAgent$INST1:(OI)(CI)M"
+
+c) Email: the job sends it through Database Mail on the coordinator instance as
+   the Agent service account (Database Mail allows file attachments only for
+   Windows logins). That account normally already has a login there (SQL Server
+   setup adds it as sysadmin). Check:
+
+    SELECT name, IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+    FROM sys.server_principals WHERE name LIKE N'NT SERVICE\SQL%Agent%';
+
+   No login / not sysadmin? Give it msdb DatabaseMailUserRole.
+
+d) SSIS / SSRS / SSAS service state of the other 2 VMs is read over CIM / WinRM.
+   On the network the Agent service account appears as the coordinator's
+   computer account (DOMAIN\SQLVM1$), which usually has no rights there:
+   set RemoteBiServices = $false in step 5 (this VM's services are still read).
 
 -------------------------------------------------------------------------------
  4. DATABASE MAIL ON THE COORDINATOR
@@ -101,34 +111,26 @@ $Config at the top of Invoke-PerfCheck.ps1:
     PrimaryOnly           = $true      (or pass -PrimaryOnly)
     SqlLogin              = 'dba_perfcheck'
     SqlAuthOnly           = $true      instances ONLY with the SQL login, never Windows
-    CredentialScope       = 'CurrentUser'   only the saving account can decrypt it
-    MailWindowsAuth       = $true      email as EMEA\Admin.partner.db (attachments)
-    MailInstance          = 'SQLVM1\INST1'  the coordinator instance (example)
+    CredentialScope       = 'CurrentUser'   only the account running the job can decrypt it
+    MailWindowsAuth       = $true      email as the account running the job (attachments)
+    MailInstance          = 'SQLVM1\INST1'  the coordinator instance (the one running the job)
+    RemoteBiServices      = $false     see step 3d
     Encrypt               = $true      optional: encrypt the connections
-    RemoteBiServices      = $false     only if WinRM to the other VMs isn't allowed
-    SmtpServer            = only if Database Mail can't be used
 
 -------------------------------------------------------------------------------
- 6. SAVE THE dba_perfcheck PASSWORD - AS EMEA\Admin.partner.db
+ 6. TEST BY HAND (your admin account, secondary logon)
 -------------------------------------------------------------------------------
-On the coordinator, open a command prompt AS the account that runs the job:
+RDP to the coordinator with CyberArk, then open a command prompt with
+"Run as different user" and your admin account:
 
-    runas /user:EMEA\Admin.partner.db cmd
     cd /d C:\DBA\PerfCheck
     Run-PerfCheck.bat -PrimaryOnly -NoPerf -Label TEST
 
-It asks for the dba_perfcheck password -> enter it -> answer Y to save it.
-It is saved as C:\DBA\PerfCheck\PerfCheck.EMEA_Admin.partner.db.cred:
-  - encrypted with Windows DPAPI for EMEA\Admin.partner.db on this VM only
-    (no other account can decrypt it; a copy of the file is useless elsewhere)
-  - NTFS: only Administrators, SYSTEM and EMEA\Admin.partner.db
-  - decrypted only into memory (SecureString) when the check runs; never written
-    to a connection string, the log or job history
-  - change it later: Run-PerfCheck.bat -ResetCredential (as the same account)
-What it can't prevent: an administrator on the coordinator, or anything running
-as EMEA\Admin.partner.db, can recover it. Hence the minimal rights in step 2.
+It asks for the dba_perfcheck password (SqlAuthOnly) -> enter it.
+"Save it ...?" -> N  (the job gets its own copy in step 7; no need to keep one
+for your account).
 
-That same run is the first test. Check:
+Check:
   - ONE email arrives with 3 attachments (one .html per VM)
   - ConnectedAs shows "SQL: dba_perfcheck" for every instance
   - secondary-only instances are listed as skipped
@@ -144,24 +146,44 @@ On every instance, nothing left behind:
     SELECT name FROM sys.dm_xe_sessions WHERE name = 'DBA_PerfWindow';   -- no rows
 
 -------------------------------------------------------------------------------
- 7. PROXY AND JOB (ON THE COORDINATOR)
+ 7. HAND THE PASSWORD OVER TO THE JOB'S ACCOUNT (one-time)
 -------------------------------------------------------------------------------
-    USE master;
-    CREATE CREDENTIAL [PerfCheckCred] WITH IDENTITY = N'EMEA\Admin.partner.db', SECRET = N'<its Windows password>';
-    USE msdb;
-    EXEC dbo.sp_add_proxy @proxy_name = N'PerfCheckProxy', @credential_name = N'PerfCheckCred', @enabled = 1;
-    EXEC dbo.sp_grant_proxy_to_subsystem @proxy_name = N'PerfCheckProxy', @subsystem_name = N'CmdExec';
+Same command prompt (your admin account), with the name from step 3a:
 
+    Run-PerfCheck.bat -SaveCredentialFor "NT SERVICE\SQLAgent$INST1"
+
+It asks for the dba_perfcheck password once and writes
+C:\DBA\PerfCheck\PerfCheck.NT_SERVICE_SQLAgent$INST1.handoff
+  - encrypted with Windows DPAPI, readable (NTFS) only by Administrators, SYSTEM
+    and the Agent service account
+  - on the job's FIRST run it is re-encrypted for the Agent service account only
+    (PerfCheck.NT_SERVICE_SQLAgent$INST1.cred - no other account can decrypt it,
+    a copy of the file is useless elsewhere) and the .handoff file is deleted
+  - the password is only decrypted into memory (SecureString) when the check
+    runs; never written to a connection string, the log or job history
+  - change the password later: run this step again, then delete the .cred file
+What it can't prevent: an administrator on the coordinator, or anything running
+as the Agent service account (e.g. any CmdExec job step without a proxy), can
+recover it. Hence the minimal rights in step 2.
+
+-------------------------------------------------------------------------------
+ 8. CREATE THE JOB (ON THE COORDINATOR)
+-------------------------------------------------------------------------------
 Open CreateAgentJob_PerfCheck.sql, set the values at the top and run it:
 
     @ScriptFolder = N'C:\DBA\PerfCheck'
     @Arguments    = N'-PrimaryOnly -Label SCHEDULED'
-    @ProxyName    = N'PerfCheckProxy'
+    @ProxyName    = NULL                 -- runs as the Agent service account
+    @JobOwner     = NULL                 -- sa (a CmdExec step without a proxy needs a sysadmin owner)
     @Schedule, @StartTime, and optionally @NotifyOperator
 
 Start it once:
 
     EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check (all VMs)';
+
+The first run's log shows "handed over by ... - saving it for NT SERVICE\..."
+and "hand-over file deleted". To run it on demand later, start the job (not the
+.bat), so it runs as the same account.
 
 With the defaults the job runs about 31-35 minutes. Where to look:
   - SQL Agent job history
@@ -172,19 +194,17 @@ With the defaults the job runs about 31-35 minutes. Where to look:
 -------------------------------------------------------------------------------
  IF SOMETHING GOES WRONG
 -------------------------------------------------------------------------------
-Job fails at once: "No saved SQL login for EMEA\Admin.partner.db"
-    -> step 6 wasn't done as EMEA\Admin.partner.db (the file name shows the account).
-Job log: "Saved SQL login ... could not be read"
-    -> under the Agent proxy the account's user profile may not be loaded, which
-       DPAPI CurrentUser needs. Fallback: CredentialScope = 'LocalMachine',
-       CredentialReaders = @('EMEA\Admin.partner.db'), then save it again with
-       Run-PerfCheck.bat -ResetCredential (as EMEA\Admin.partner.db). Then any
-       account on this VM that can read PerfCheck.cred could decrypt it; the NTFS
-       permissions are the guard.
+Job fails at once: "No saved SQL login for NT SERVICE\..."
+    -> step 7 wasn't done, or for a different account name than the one the job
+       runs as (the log's first lines show the account; the file name must match).
+"could not re-save it ... the hand-over file is kept and used"
+    -> DPAPI for the Agent service account didn't work; the job still runs with the
+       hand-over file (readable only by Administrators, SYSTEM and that account).
+       Usually the folder rights from step 3b are missing.
 Email has only a summary, no attachments
-    -> the step output says why: usually EMEA\Admin.partner.db has no login /
-       DatabaseMailUserRole on the coordinator (step 3c), or a file is above
-       MaxFileSize (step 4).
+    -> the step output says why: usually the Agent service account has no login /
+       DatabaseMailUserRole on the coordinator (step 3c), MailInstance isn't the
+       coordinator instance, or a file is above MaxFileSize (step 4).
 An instance shows FAILED
     -> dba_perfcheck missing / wrong password / mixed mode off on that instance,
        or firewall / named-instance port between the coordinator and that VM.

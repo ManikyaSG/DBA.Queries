@@ -74,6 +74,11 @@
     .\Invoke-PerfCheck.ps1 -Unattended -Label SCHEDULED      # Task Scheduler (no prompts, no pauses)
 .EXAMPLE
     .\Invoke-PerfCheck.ps1 -ResetCredential                  # re-enter / re-save the SQL login password
+.EXAMPLE
+    .\Invoke-PerfCheck.ps1 -SaveCredentialFor 'NT SERVICE\SQLSERVERAGENT'
+        # one-time, run by an admin (e.g. via secondary logon): hands the SQL login password over to
+        # the account that runs the job (no password of that account needed). The job's first run
+        # re-encrypts it so that only that account can decrypt it, and deletes the hand-over file.
 #>
 [CmdletBinding()]
 param(
@@ -87,6 +92,7 @@ param(
     [switch]   $NoPerf,               # health check only (no performance window)
     [switch]   $NoHealth,             # performance window only (no health check)
     [switch]   $PrimaryOnly,          # check only instances that are primary for an AG (or have no AG)
+    [string]   $SaveCredentialFor,    # one-time: hand the SQL login password over to this Windows account (the job's), then exit
     [string]   $SqlFile
 )
 
@@ -756,8 +762,52 @@ function Save-SqlCredential([pscredential]$Credential) {
     finally { [Array]::Clear($plain, 0, $plain.Length) }
 }
 
+function Get-HandoffPath([string]$Account) { return (Join-Path $PSScriptRoot ('PerfCheck.{0}.handoff' -f (Get-SafeFileName ($Account -replace '\\', '_')))) }
+
+function Save-SqlHandoff([pscredential]$Credential, [string]$Account) {
+    # Hand-over file for another account (e.g. the SQL Agent service account, whose password nobody knows):
+    # LocalMachine DPAPI, NTFS Administrators + SYSTEM + that account only. That account's first run re-saves it
+    # with the CurrentUser scope (only that account can decrypt it) and deletes this file.
+    try { $sid = (New-Object System.Security.Principal.NTAccount $Account).Translate([System.Security.Principal.SecurityIdentifier]).Value }
+    catch { throw "Windows account '$Account' not found on this VM ($($_.Exception.Message)). For the SQL Agent service account see: SELECT servicename, service_account FROM sys.dm_server_services;" }
+    $path = Get-HandoffPath $Account
+    $plain = [System.Text.Encoding]::UTF8.GetBytes($Credential.GetNetworkCredential().Password)
+    try {
+        $enc = [System.Security.Cryptography.ProtectedData]::Protect($plain, $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+        $obj = @{ user = $Credential.UserName; pwd = [Convert]::ToBase64String($enc); scope = 'LocalMachine'; for_account = $Account; saved_by = $script:RunAs; saved_at = (Get-Date -Format 'yyyy-MM-dd HH:mm') }
+        [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $obj -Compress))
+        $ErrorActionPreference = 'Continue'
+        $out = & icacls.exe "$path" /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' "*$($sid):M" 2>&1
+        $ok = ($LASTEXITCODE -eq 0); $ErrorActionPreference = 'Stop'
+        if (-not $ok) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue; throw "Could not restrict the file permissions: $out" }
+        Write-Step "SQL login '$($Credential.UserName)' handed over to $Account : $path" 'Green'
+        Write-Step "Only Administrators, SYSTEM and $Account can read it. The first run as $Account re-encrypts it for that account only and deletes this file." 'Green'
+    }
+    finally { [Array]::Clear($plain, 0, $plain.Length) }
+}
+
 function Read-SqlCredential {
-    # The CurrentUser file of the account running the script first, then the LocalMachine file
+    # 1. the CurrentUser file of the account running the script
+    # 2. a hand-over file for this account (-SaveCredentialFor): re-saved as CurrentUser, then deleted
+    # 3. the LocalMachine file
+    $handoff = Get-HandoffPath $script:RunAs
+    if (-not (Test-Path -LiteralPath (Get-CredentialPath 'CurrentUser')) -and (Test-Path -LiteralPath $handoff)) {
+        try {
+            $obj = Get-Content -LiteralPath $handoff -Raw | ConvertFrom-Json
+            $dec = [System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($obj.pwd), $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+            $ss = New-Object System.Security.SecureString
+            foreach ($ch in [System.Text.Encoding]::UTF8.GetString($dec).ToCharArray()) { $ss.AppendChar($ch) }
+            [Array]::Clear($dec, 0, $dec.Length); $ss.MakeReadOnly()
+            $cred = New-Object System.Management.Automation.PSCredential ([string]$obj.user, $ss)
+            Write-Step "SQL login  : $($obj.user) handed over by $($obj.saved_by) on $($obj.saved_at) - saving it for $($script:RunAs)" 'DarkGray'
+            try {
+                Save-SqlCredential $cred
+                if (Test-Path -LiteralPath (Get-CredentialPath $(if ($Config.CredentialScope -eq 'LocalMachine') { 'LocalMachine' } else { 'CurrentUser' }))) { Remove-Item -LiteralPath $handoff -Force; Write-Step "  hand-over file deleted: $handoff" 'DarkGray' }
+            } catch { Write-Step "  could not re-save it for $($script:RunAs) ($($_.Exception.Message)) - the hand-over file is kept and used." 'Yellow' }
+            return $cred
+        }
+        catch { Write-Step "Hand-over file $handoff could not be read ($($_.Exception.Message))." 'Yellow' }
+    }
     foreach ($path in @((Get-CredentialPath 'CurrentUser'), $Config.CredentialFile) | Select-Object -Unique) {
         if (-not (Test-Path -LiteralPath $path)) { continue }
         $obj = $null
@@ -1144,6 +1194,18 @@ function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$Bod
 foreach ($f in @($Config.ReportsFolder, $Config.LogsFolder)) { if (-not (Test-Path $f)) { New-Item -ItemType Directory -Path $f -Force | Out-Null } }
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $logFile = Join-Path $Config.LogsFolder ("PerfCheck_{0}_{1}.log" -f $Label, $stamp)
+# ---- one-time: hand the SQL login password over to the account that runs the job ----
+if ($SaveCredentialFor) {
+    Write-Step "Hand over the password of SQL login '$($Config.SqlLogin)' to $SaveCredentialFor (run by $($script:RunAs))" 'Cyan'
+    $hc = $null
+    try { $hc = Get-Credential -UserName $Config.SqlLogin -Message "Password of SQL login '$($Config.SqlLogin)' for $SaveCredentialFor" } catch { }
+    $rc = 3
+    if (-not $hc) { Write-Step 'Cancelled - nothing saved.' 'Yellow' }
+    else { try { Save-SqlHandoff $hc $SaveCredentialFor; $rc = 0 } catch { Write-Step "NOT SAVED: $($_.Exception.Message)" 'Red' } }
+    if (-not $Unattended) { Read-Host "`nPress Enter to close" }
+    exit $rc
+}
+
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { }
 
 $me = "$env:USERDOMAIN\$env:USERNAME"

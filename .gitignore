@@ -19,3 +19,4 @@ automation/perf-check-reports/powershell/Reports/
 automation/perf-check-reports/powershell/Logs/
 automation/perf-check-reports/powershell/servers.txt
 automation/perf-check-reports/powershell/*.cred
+automation/perf-check-reports/powershell/*.handoff
