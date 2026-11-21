@@ -18,6 +18,13 @@ Accounts - no Windows password is needed anywhere:
   - your admin account ........... one-time setup only (CyberArk RDP, then
                                    "Run as different user" / secondary logon)
 
+Registered Servers: steps 1-3 and 6 can each be run as ONE query on a group with
+all 9 instances (right-click the group > New Query). HealthPerfCheck_AgentJob.sql
+PART 3 and Create_PerfCheck_Logins.sql SECTION B check @Coordinator and do
+nothing on the other 8 instances - set @Coordinator before running.
+Use "Merge results = False" (Tools > Options > Query Results > SQL Server >
+Multiserver Results) to see each instance's messages separately.
+
 -------------------------------------------------------------------------------
  1. ON ALL 9 INSTANCES - PART 1 (procedure + table in DBAdmin)
 -------------------------------------------------------------------------------

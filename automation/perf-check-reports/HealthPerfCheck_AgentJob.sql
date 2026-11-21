@@ -1689,6 +1689,8 @@ GO
 
 /*=============================================================================
   PART 3 - THE COLLECTOR JOB  (ONE instance only: the coordinator, e.g. MARSDBW1\MARS01)
+  Set @Coordinator: on every other instance this part does nothing, so the whole
+  file can be run on a Registered Servers group (all 9 instances at once).
   Runs Collect-PerfCheckReports.ps1 (CmdExec, no proxy: as the SQL Agent service
   account, so no Windows password is needed). Schedule it about 10 minutes after
   the check job; it also waits for runs that are still going. Before the first run,
@@ -1699,6 +1701,7 @@ GO
 USE [msdb];
 GO
 DECLARE
+    @Coordinator     sysname        = N'MARSDBW1\MARS01',              -- the ONLY instance that gets this job (safe to run on a server group)
     @JobName         sysname        = N'DBA - Perf Check Reports (collector)',
     @ScriptPath      nvarchar(260)  = N'C:\DBA\PerfCheck\Collect-PerfCheckReports.ps1',
     @Arguments       nvarchar(1000) = N'',                         -- e.g. N'-Label SCHEDULED'
@@ -1714,6 +1717,11 @@ DECLARE
 DECLARE @jobId uniqueidentifier, @cmd nvarchar(2000), @outFile nvarchar(400), @freqType int, @freqInterval int = 0, @recur int = 0,
         @startTimeInt int, @startDate int = CONVERT(int, CONVERT(char(8), GETDATE(), 112)), @schedName sysname,
         @desc nvarchar(512) = N'Collects the latest DBA_PerfCheck_Report row of every instance, one HTML report per VM, one email (Collect-PerfCheckReports.ps1).';
+IF UPPER(@@SERVERNAME) <> UPPER(@Coordinator)
+BEGIN
+    PRINT N'PART 3 skipped on ' + @@SERVERNAME + N': the collector job belongs on ' + @Coordinator + N' only.';
+    RETURN;
+END;
 IF @StartTime NOT LIKE '[0-2][0-9]:[0-5][0-9]'
 BEGIN RAISERROR(N'@StartTime must be HH:mm.', 16, 1); RETURN; END;
 SET @startTimeInt = CAST(REPLACE(@StartTime, ':', '') AS int) * 100;

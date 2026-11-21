@@ -10,7 +10,8 @@
                already can - sysadmin by default).
    SECTION C - reference: change the password, remove old rights, remove the login.
  Run     : in SSMS as sysadmin. Run HealthPerfCheck_AgentJob.sql PART 1 first
-           (the table must exist). Safe to re-run.
+           (the table must exist). Safe to re-run. The whole file can be run on a
+           Registered Servers group: SECTION B acts only on @Coordinator.
  Password: type it in @Password, run, then REMOVE it from the file - never save or
            commit it. Use the same password on all instances. An existing login
            keeps its password (nothing is changed on it).
@@ -79,8 +80,11 @@ GO
 =============================================================================*/
 USE [master];
 GO
-DECLARE @AgentAccount sysname = NULL,   -- NULL = read from sys.dm_server_services, e.g. N'NT SERVICE\SQLAgent$MARS01'
+DECLARE @Coordinator  sysname = N'MARSDBW1\MARS01',   -- only this instance (safe to run on a server group)
+        @AgentAccount sysname = NULL,   -- NULL = read from sys.dm_server_services, e.g. N'NT SERVICE\SQLAgent$MARS01'
         @sql nvarchar(max), @isSysadmin int;
+IF UPPER(@@SERVERNAME) <> UPPER(@Coordinator)
+BEGIN PRINT N'SECTION B skipped on ' + @@SERVERNAME + N' (coordinator only: ' + @Coordinator + N').'; RETURN; END;
 
 IF @AgentAccount IS NULL
     SELECT TOP (1) @AgentAccount = service_account FROM sys.dm_server_services WHERE servicename LIKE N'SQL Server Agent%';
