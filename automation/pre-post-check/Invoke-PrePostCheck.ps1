@@ -781,13 +781,21 @@ if (-not $Inner) {
             if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
             if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
             Write-Step "Starting the check as $($cred.UserName) in a new window..." 'Green'
+            # No -Wait: with -Credential, Windows PowerShell's -Wait can fail with "Access is denied" AFTER the new
+            # window has started. This window then ran the whole check too (two runs, two emails). Wait on the process instead.
+            $proc = $null
             try {
-                Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -Wait -ErrorAction Stop
-                $launched = $true
+                $proc = Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -PassThru -ErrorAction Stop
             }
             catch {
                 Write-Step "Could not start as $($cred.UserName): $($_.Exception.Message)" 'Red'
                 Write-Step '  (wrong password / locked account, no "log on locally" right, or the account cannot read this folder)' 'DarkGray'
+            }
+            if ($proc) {
+                $launched = $true
+                Write-Step "Running in the other window (PID $($proc.Id)) - this window waits for it to finish..." 'DarkGray'
+                try { $proc.WaitForExit() }
+                catch { while (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 } }
             }
         }
         if ($launched) {
