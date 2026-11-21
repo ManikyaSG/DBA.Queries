@@ -23,7 +23,8 @@
       endpoints, certificates, XE sessions, and the SSIS / SSRS / SSAS services
       on this server (state). NOT included: data/log file list, Agent jobs and
       job history, logins, server role members, SSAS databases. DBAdmin
-      (@HideDatabase) is shown in the database list only.
+      (@HideDatabase) is shown in the database list only. Availability groups
+      without databases are ignored (@IgnoreEmptyAgs).
    2. Performance window: Batch Requests/sec, Transactions/sec (@PerfDatabases),
       compilations, user connections + connection pool usage, lock waits / wait
       time / timeouts / deadlocks / blocking, PLE, buffer cache hit ratio, memory
@@ -205,8 +206,10 @@ ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @PrimaryOnly         bit            = 0,          -- 1 = SECONDARY for every AG: save a SKIPPED row and stop;
                                                       --     otherwise show only the AGs / databases this instance is primary for
     @KeepDays            int            = 30,         -- rows older than this are deleted from dbo.DBA_PerfCheck_Report
-    @HideDatabase        sysname        = NULL        -- NULL = this procedure's database (DBAdmin): shown in the database list only,
+    @HideDatabase        sysname        = NULL,       -- NULL = this procedure's database (DBAdmin): shown in the database list only,
                                                       --        no warnings, left out of every other section (sessions, I/O, top queries)
+    @IgnoreEmptyAgs      bit            = 1           -- 1 = availability groups with no databases are left out (their replicas
+                                                      --     report NOT_HEALTHY because there is nothing to synchronize)
 AS
 BEGIN
 SET NOCOUNT ON;
@@ -239,7 +242,8 @@ BEGIN
     INSERT #rp_ag SELECT ag.name, ISNULL(ars.role_desc, N'UNKNOWN')
     FROM sys.availability_groups AS ag
     LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.group_id = ag.group_id AND ars.is_local = 1
-    WHERE ag.is_distributed = 0;
+    WHERE ag.is_distributed = 0
+      AND (@IgnoreEmptyAgs = 0 OR EXISTS (SELECT 1 FROM sys.availability_databases_cluster AS adc WHERE adc.group_id = ag.group_id));
     INSERT #rp_sdb SELECT adc.database_name FROM sys.availability_databases_cluster AS adc
     JOIN sys.availability_groups AS ag ON ag.group_id = adc.group_id JOIN #rp_ag AS r ON r.ag_name = ag.name AND r.role_desc = N'SECONDARY';
     INSERT #rp_sls SELECT l.dns_name FROM sys.availability_group_listeners AS l
@@ -455,7 +459,8 @@ BEGIN
     FROM sys.availability_groups AS ag
     JOIN sys.dm_hadr_availability_group_states AS ags ON ags.group_id = ag.group_id
     JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id
-    LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id;
+    LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id
+    WHERE @IgnoreEmptyAgs = 0 OR EXISTS (SELECT 1 FROM sys.availability_databases_cluster AS adc WHERE adc.group_id = ag.group_id);   -- no databases = nothing to report
     IF @PrimaryOnly = 1 DELETE #agr WHERE ag_name IN (SELECT ag_name FROM #rp_ag WHERE role_desc = N'SECONDARY');
 
     INSERT #issues SELECT status, 'AlwaysOn replica', ag_name + N' / ' + replica_node,
@@ -966,6 +971,7 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
                 FROM sys.availability_group_listeners AS l
                 JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id = l.listener_id
                 LEFT JOIN sys.dm_exec_connections AS c ON c.local_net_address = ip.ip_address AND c.local_tcp_port = l.port
+                WHERE @IgnoreEmptyAgs = 0 OR EXISTS (SELECT 1 FROM sys.availability_databases_cluster AS adc WHERE adc.group_id = l.group_id)
                 GROUP BY l.dns_name, ip.ip_address;
             END;
 
