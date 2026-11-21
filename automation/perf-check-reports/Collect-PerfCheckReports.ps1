@@ -287,7 +287,7 @@ if ($SaveCredentialFor) {
         if (-not $hc) { throw 'cancelled' }
         $path = Get-HandoffPath $sid
         Protect-ToFile $hc $path 'LocalMachine' @('*S-1-5-32-544:F', '*S-1-5-18:F', "*$($sid):M") @{ for_account = $SaveCredentialFor; for_sid = $sid }
-        Write-Step "Handed over to $SaveCredentialFor : $path" 'Green'
+        Write-Step "Handed over to $SaveCredentialFor (SID $sid) : $path" 'Green'
         Write-Step "Only Administrators, SYSTEM and $SaveCredentialFor can read it. Its first run re-encrypts it for that account only and deletes this file." 'Green'
         $rc = 0
     }
@@ -307,6 +307,7 @@ try {
     $runLabel = if ($Label) { $Label } else { [string]$Config.RunLabel }
     $list = if ($Instances) { $Instances } else { @($Config.Instances) }
     Write-Step "Collector  : $($script:RunAs) on $env:COMPUTERNAME - $($list.Count) instance(s), label '$runLabel', runs of the last $($Config.MaxAgeMinutes) min"
+    Write-Step "Script     : $PSCommandPath"
 
     # ---- SQL login ----
     if ($ResetCredential) { $rp = Get-CredentialPath $Config.CredentialScope; if (Test-Path -LiteralPath $rp) { Remove-Item -LiteralPath $rp -Force; Write-Step "Saved SQL login removed: $rp" 'Yellow' } }
@@ -315,7 +316,26 @@ try {
         $cred = Get-Credential -UserName $Config.SqlLogin -Message "SQL login that reads DBAdmin.dbo.DBA_PerfCheck_Report"
         if ($cred -and (Read-Host "Save it encrypted for $($script:RunAs) on this machine? (Y/N)") -match '^[Yy]') { Save-SqlCredential $cred }
     }
-    if (-not $cred) { throw "No saved SQL login for $($script:RunAs). Hand it over once: Collect-PerfCheckReports.ps1 -SaveCredentialFor '$($script:RunAs)' (from an admin prompt)." }
+    if (-not $cred) {
+        # say exactly what was looked for and what is there, so a name / SID / folder mismatch is obvious
+        $mySid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        Write-Step "No saved SQL login for $($script:RunAs) (SID $mySid). Looked for:" 'Red'
+        Write-Step "  $(Get-HandoffPath $mySid)" 'Red'
+        Write-Step "  $(Get-CredentialPath 'CurrentUser')" 'Red'
+        Write-Step "  $($Config.CredentialFile)" 'Red'
+        $found = @(Get-ChildItem -LiteralPath $PSScriptRoot -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'PerfCheck.*.handoff' -or $_.Name -like 'PerfCheck*.cred' })
+        if ($found.Count) {
+            Write-Step "Credential files in $PSScriptRoot :" 'Yellow'
+            foreach ($f in $found) {
+                $who = ''
+                if ($f.Name -match '^PerfCheck\.(S-1-[\d-]+)\.handoff$') {
+                    try { $who = ' = ' + (New-Object System.Security.Principal.SecurityIdentifier $Matches[1]).Translate([System.Security.Principal.NTAccount]).Value } catch { $who = ' = (SID not resolvable)' }
+                }
+                Write-Step "  $($f.Name)$who  ($($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))" 'Yellow'
+            }
+        } else { Write-Step "No credential files at all in $PSScriptRoot - the hand-over was saved next to another copy of the script?" 'Yellow' }
+        throw "No saved SQL login for $($script:RunAs). From an admin prompt, with THIS copy of the script: Collect-PerfCheckReports.ps1 -SaveCredentialFor '$($script:RunAs)'"
+    }
 
     # ---- read the latest run of every instance; wait for runs still going ----
     $res = [ordered]@{}
