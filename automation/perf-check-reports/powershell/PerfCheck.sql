@@ -1,5 +1,5 @@
 /*******************************************************************************
- File    : PerfCheck.sql   (automation/perf-check)
+ File    : PerfCheck.sql   (automation/perf-check-reports/powershell)
  Purpose : Health check + performance window for every SQL Server instance on a VM. Run by
            Invoke-PerfCheck.ps1 (double-click Run-PerfCheck.bat): each --##PERF_*
            block below is run separately; the script sets the @p_ parameter
