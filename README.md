@@ -93,7 +93,7 @@ Version minimums (e.g. *2016 SP2+*, *2019+*) are noted in the section header whe
 
 **One-click runner:** [`automation/pre-post-check`](automation/pre-post-check/README.md) is 3 files (`Run-PrePostCheck.bat`, `Invoke-PrePostCheck.ps1`, `HC_Snapshot.sql`). Double-click from the generic admin RDP session, choose PRE / POST / HEALTH, enter your own Windows account, and it checks **every instance on the VM** and sends one combined report via Database Mail.
 
-**Health & performance check reports:** [`automation/perf-check-reports`](automation/perf-check-reports/README.md) holds everything for it: the PowerShell version (one report per VM, primary instances only, one email, run by a SQL Agent job) and, for servers without PowerShell, the same check in pure T-SQL: one script installs a stored procedure and creates a SQL Agent job that runs it on a schedule and emails the report (attached) through Database Mail.
+**Health & performance check reports:** [`automation/perf-check-reports`](automation/perf-check-reports/README.md): a SQL Agent job on every instance saves a health check + short performance window in DBAdmin; one collector job builds one HTML report per VM and sends one email.
 
 **One-click PRE/POST comparison:** [`automation/pre-post-check`](automation/pre-post-check/README.md). PRE stores a snapshot of every instance on the VM; POST compares against it and emails **SUCCESS** (no differences) or **DIFFERENCES FOUND** with a before → after table. Expected changes such as build/CU are listed but not flagged, and size drift is only flagged above set tolerances.
 

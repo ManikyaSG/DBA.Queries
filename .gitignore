@@ -15,8 +15,7 @@ automation/pre-post-check/Snapshots/
 automation/pre-post-check/Reports/
 automation/pre-post-check/Logs/
 automation/pre-post-check/servers.txt
-automation/perf-check-reports/powershell/Reports/
-automation/perf-check-reports/powershell/Logs/
-automation/perf-check-reports/powershell/servers.txt
-automation/perf-check-reports/powershell/*.cred
-automation/perf-check-reports/powershell/*.handoff
+automation/perf-check-reports/Reports/
+automation/perf-check-reports/Logs/
+automation/perf-check-reports/*.cred
+automation/perf-check-reports/*.handoff

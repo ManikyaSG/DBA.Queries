@@ -1,21 +1,42 @@
 # Perf check reports
 
-Everything for the SQL Server **health & performance check reports** lives in this folder and nowhere else in the repo.
+Daily health & performance check of every SQL Server instance, **one email** with **one HTML report per VM**. Everything for it lives in this folder.
 
-| Folder / file | What it is | Use it when |
+| File | What it is |
+|---|---|
+| [`HealthPerfCheck_AgentJob.sql`](HealthPerfCheck_AgentJob.sql) | Everything on the SQL Server side. **PART 1** (every instance): the procedure `usp_DBA_HealthPerfCheck` and the results table `DBA_PerfCheck_Report` in **DBAdmin**. **PART 2** (every instance): the check job. **PART 3** (every instance): the read-only SQL login for the collector. **PART 4** (one instance): the collector job. |
+| [`Collect-PerfCheckReports.ps1`](Collect-PerfCheckReports.ps1) | The collector: reads the latest result of every instance, writes one HTML file per VM, sends one email with all files attached. |
+| [`database_mail_setup.sql`](database_mail_setup.sql) | Database Mail setup / repair (only needed on the instance that sends the email). |
+| [`SETUP.txt`](SETUP.txt) | Step-by-step setup. |
+
+## How it works
+
+```
+06:00  every instance   SQL Agent job "DBA - Health & Performance Check"
+                        health check + performance window (every 30 s for 5 min)
+                        -> one row in DBAdmin.dbo.DBA_PerfCheck_Report (finished HTML + status)
+06:10  one instance     SQL Agent job "DBA - Perf Check Reports (collector)"
+                        Collect-PerfCheckReports.ps1: reads the 9 rows, one HTML file per VM,
+                        one email with all files attached
+```
+
+- **Primary only:** an instance that is SECONDARY for every availability group saves a *SKIPPED* row and does no work. The others report the full instance health check, but the AG, database and listener tables show **only the AGs the instance is primary for**. Instances without an AG are always reported.
+- **Nothing missed silently:** the collector waits (up to 15 min) for runs still going. An instance with no result, a failed run or no connection is shown in red in the email.
+- **History:** every run stays in `DBA_PerfCheck_Report` for 30 days (`@KeepDays`). `DBAdmin` must not be in an availability group (secondaries can't write to it).
+- **Top lists:** top 5 queries of the window by duration, CPU and logical reads (plan cache, no Query Store), top 5 databases by transactions/s.
+- **Not included:** global trace flags, SSIS catalog / SSRS content tables, deadlock graphs, long-query capture, data / log file list, Agent job list, logins.
+
+## Accounts
+
+| Who | Used for | Rights |
 |---|---|---|
-| [`powershell/`](powershell/README.md) | `Invoke-PerfCheck.ps1` + `PerfCheck.sql`. Health check + performance window for many instances. **One report file per VM, one email**. `-PrimaryOnly` checks only instances that are primary for an AG (or standalone). Run by double-click (`Run-PerfCheck.bat`), Task Scheduler, or a **SQL Agent job** (`Run-PerfCheck-Agent.bat` + `CreateAgentJob_PerfCheck.sql`). | PowerShell is allowed. Several VMs / instances in one email. |
-| [`tsql/`](tsql/README.md) | `HealthPerfCheck_AgentJob.sql`. The same check in **pure T-SQL**: a stored procedure plus a SQL Agent job on each instance, report emailed through Database Mail. | PowerShell is not allowed on the server. One report per instance. |
-| [`SETUP.txt`](SETUP.txt) | Step-by-step setup for several VMs, primary instances only, one email, one SQL Agent job: SQL login, Agent service account, Database Mail, config, test, password hand-over and job. | Setting it up on a new set of servers. |
-| [`database_mail_setup.sql`](database_mail_setup.sql) | Database Mail setup / repair, safe to re-run (account, profile, public/default, `MaxFileSize`, test email). Both versions send their email through Database Mail. | Before the first run, or when the email doesn't go out. |
+| Job owner (`sa`) | the check on each instance (runs locally) | sysadmin (the job owner) |
+| SQL login `dba_perfcheck` | the collector reading the results | `SELECT` on `DBAdmin.dbo.DBA_PerfCheck_Report` only |
+| SQL Agent service account of the coordinator | running the collector, writing files, sending the email | Modify on the script folder; its normal Database Mail access on that instance |
+| Your admin account (secondary logon) | one-time setup | - |
 
-## Several VMs, primary instances only, one email
+No Windows password is needed anywhere. The `dba_perfcheck` password is handed to the Agent service account once (`-SaveCredentialFor`) and stored with Windows DPAPI so that only that account, on that machine, can decrypt it.
 
-Example: 3 VMs with 3 instances each, in Always On AGs.
+## Collector exit codes
 
-1. Copy `powershell/` to the server that runs the job, e.g. `C:\DBA\PerfCheck`.
-2. `servers.example.txt` → `servers.txt`: list all 9 instances (instance names, not listeners). In `$Config`: `IncludeLocalInstances = $false`, `Recipients`.
-3. Run `CreateAgentJob_PerfCheck.sql` on that instance (`@Arguments = N'-PrimaryOnly -Label SCHEDULED'`, no proxy, schedule), after handing the SQL login password to the Agent service account with `Run-PerfCheck.bat -SaveCredentialFor`.
-4. Result: one email, with one `.html` report per VM attached; secondary-only instances are listed as skipped.
-
-Details, accounts and how the email is sent: [powershell/README.md](powershell/README.md#several-vms-primary-only-one-email-sql-agent-job).
+`0` email sent (findings are in the email), `3` script error, `4` no email sent - the Agent job fails only on 3 and 4. Log per run in `Logs\`, reports in `Reports\` (both next to the script, kept 30 days), last job output in `CollectorJob_output.txt`.

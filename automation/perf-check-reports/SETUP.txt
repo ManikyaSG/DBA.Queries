@@ -1,213 +1,149 @@
 ===============================================================================
  PERF CHECK REPORTS - SETUP
- Several VMs (e.g. 3 VMs x 3 instances, Always On AGs), primary instances only,
- one email with one report file per VM, run by ONE SQL Agent job.
- Files: automation/perf-check-reports/powershell  (+ database_mail_setup.sql)
+ 3 VMs x 3 instances (MARSDBW1-3 \ MARS01-03), Always On AGs.
+ Every instance saves its own check in DBAdmin; ONE collector job on
+ MARSDBW1\MARS01 sends one email with one HTML report per VM.
+ Files: automation/perf-check-reports
+   HealthPerfCheck_AgentJob.sql   (SQL side: PART 1-4)
+   Collect-PerfCheckReports.ps1   (collector)
+   database_mail_setup.sql        (Database Mail on the coordinator)
 ===============================================================================
 
-Accounts - no account password is needed anywhere:
-  - SQL login dba_perfcheck ...... ONLY for connecting to the instances (collecting data)
-  - SQL Agent service account .... runs the job: PowerShell, files, the email
-                                   (CmdExec step without a proxy, so nobody has to
-                                    know a Windows password)
-  - Your admin account ........... one-time setup only: RDP with CyberArk, then
-                                   "Run as different user" (secondary logon), the same
-                                   way as for the pre/post check
-The dba_perfcheck password ends up encrypted (Windows DPAPI) so that ONLY the
-SQL Agent service account, on the coordinator, can decrypt it.
+Accounts - no Windows password is needed anywhere:
+  - job owner (sa) ............... runs the check on each instance, locally
+  - SQL login dba_perfcheck ...... ONLY reads DBAdmin.dbo.DBA_PerfCheck_Report
+  - SQL Agent service account .... of MARSDBW1\MARS01: runs the collector,
+                                   writes the files, sends the email
+  - your admin account ........... one-time setup only (CyberArk RDP, then
+                                   "Run as different user" / secondary logon)
 
 -------------------------------------------------------------------------------
- 1. CHOOSE THE COORDINATOR AND COPY THE FILES
+ 1. ON ALL 9 INSTANCES - PART 1 (procedure + table in DBAdmin)
 -------------------------------------------------------------------------------
-Pick ONE SQL instance with SQL Agent to run the job (the coordinator), e.g.
-SQLVM1\INST1.
+DBAdmin exists on every instance and is NOT in an availability group.
+Open HealthPerfCheck_AgentJob.sql, run PART 1 (down to the "PART 1 done" check).
+Test it once by hand on one instance:
 
-From the repo folder automation/perf-check-reports/powershell, copy to e.g.
-C:\DBA\PerfCheck on the coordinator VM:
-
-    Invoke-PerfCheck.ps1
-    PerfCheck.sql
-    Run-PerfCheck.bat              (test run + password hand-over)
-    Run-PerfCheck-Agent.bat        (used by the job)
-    servers.example.txt        ->  save as servers.txt
-
-CreateAgentJob_PerfCheck.sql and database_mail_setup.sql are only opened in
-SSMS; they don't have to be on that disk.
+    EXEC DBAdmin.dbo.usp_DBA_HealthPerfCheck @SampleSec = 10, @DurationMin = 1,
+         @SendEmail = 0, @SaveToTable = 1, @PrimaryOnly = 1;
+    SELECT TOP (5) run_id, run_start, run_end, status, ag_roles, error_message
+    FROM DBAdmin.dbo.DBA_PerfCheck_Report ORDER BY run_id DESC;
 
 -------------------------------------------------------------------------------
- 2. SQL LOGIN dba_perfcheck ON ALL 9 INSTANCES
+ 2. ON ALL 9 INSTANCES - PART 2 (the check job)
 -------------------------------------------------------------------------------
-Every instance must allow SQL authentication (mixed mode):
+Set at the top of PART 2 and run it - the SAME @StartTime everywhere:
+    @SampleSec   = 30
+    @DurationMin = 5
+    @StartTime   = '06:00'
+It creates "DBA - Health & Performance Check" (owner sa). It saves to the table
+and sends no email. Secondary-only instances save a SKIPPED row and stop.
+
+-------------------------------------------------------------------------------
+ 3. ON ALL 9 INSTANCES - PART 3 (the reader login)
+-------------------------------------------------------------------------------
+The instances must allow SQL authentication:
 
     SELECT SERVERPROPERTY('IsIntegratedSecurityOnly');   -- 0 = mixed mode
 
-Run the SETUP block at the top of PerfCheck.sql on EVERY instance, including
-secondaries, as sysadmin, with a strong password (CHECK_POLICY = ON).
-On AG replicas create it with the SAME SID everywhere (shown in the block), so it
-keeps working after a failover.
-
-The login gets only: VIEW SERVER STATE, VIEW ANY DEFINITION, ALTER SETTINGS,
-ALTER ANY EVENT SESSION, msdb read + DatabaseMailUserRole, EXECUTE on xp_readerrorlog.
-  - ALTER SETTINGS is the broadest one (it allows changing any server setting).
-    It's only used to lower 'blocked process threshold' during the window and put
-    it back. Leave it out to be safer: the check still runs, but blocking is then
-    captured only if the threshold is already set on that instance.
-  - Never make it sysadmin.
+Type the password in @ReaderPassword, run PART 3, then REMOVE the password from
+the file (don't save it). Use the same password on all 9 instances.
+dba_perfcheck gets SELECT on DBAdmin.dbo.DBA_PerfCheck_Report and nothing else.
+(Existing dba_perfcheck login from the older version: PART 3 shows the REVOKE
+ lines to remove the rights it no longer needs.)
 
 -------------------------------------------------------------------------------
- 3. THE SQL AGENT SERVICE ACCOUNT ON THE COORDINATOR
+ 4. ON MARSDBW1 ONLY - files, folder rights, Database Mail
 -------------------------------------------------------------------------------
-a) Its name - on the coordinator instance:
+a) Copy Collect-PerfCheckReports.ps1 to C:\DBA\PerfCheck on MARSDBW1.
+b) In its $Config (top of the file) check:
+       Instances    = the 9 instances (already filled in)
+       Recipients   = 'dba-team@yourcompany.com'   (and CopyRecipients)
+       MailInstance = 'MARSDBW1\MARS01'
+       MailProfile  = ''   (default public profile) or the profile name
+c) The Agent service account of MARSDBW1\MARS01:
 
-    SELECT servicename, service_account FROM sys.dm_server_services;
+       SELECT servicename, service_account FROM sys.dm_server_services;
 
-   Usually NT SERVICE\SQLSERVERAGENT (default instance) or
-   NT SERVICE\SQLAgent$INST1 (named instance INST1). Used in steps 3b, 7.
+   usually NT SERVICE\SQLAgent$MARS01. Give it Modify on the folder:
 
-b) Folder: give it MODIFY rights on C:\DBA\PerfCheck (it writes Reports\, Logs\
-   and its saved password file, and deletes the hand-over file):
+       icacls "C:\DBA\PerfCheck" /grant "NT SERVICE\SQLAgent$MARS01:(OI)(CI)M"
 
-    icacls "C:\DBA\PerfCheck" /grant "NT SERVICE\SQLAgent$INST1:(OI)(CI)M"
+d) Database Mail on MARSDBW1\MARS01: run database_mail_setup.sql with
+   @MaxFileSizeMB = 10 (a report with 3 instances can be bigger than the default
+   limit of about 1 MB). The Agent service account normally already has a login
+   there (sysadmin). Check:
 
-c) Email: the job sends it through Database Mail on the coordinator instance as
-   the Agent service account (Database Mail allows file attachments only for
-   Windows logins). That account normally already has a login there (SQL Server
-   setup adds it as sysadmin). Check:
-
-    SELECT name, IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
-    FROM sys.server_principals WHERE name LIKE N'NT SERVICE\SQL%Agent%';
+       SELECT name, IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+       FROM sys.server_principals WHERE name LIKE N'NT SERVICE\SQL%Agent%';
 
    No login / not sysadmin? Give it msdb DatabaseMailUserRole.
 
-d) SSIS / SSRS / SSAS service state of the other 2 VMs is read over CIM / WinRM.
-   On the network the Agent service account appears as the coordinator's
-   computer account (DOMAIN\SQLVM1$), which usually has no rights there:
-   set RemoteBiServices = $false in step 5 (this VM's services are still read).
-
 -------------------------------------------------------------------------------
- 4. DATABASE MAIL ON THE COORDINATOR
+ 5. ON MARSDBW1 - HAND THE dba_perfcheck PASSWORD TO THE COLLECTOR (one-time)
 -------------------------------------------------------------------------------
-Run database_mail_setup.sql on the coordinator instance with @MaxFileSizeMB = 10
-(a report covering 3 instances can be bigger than the default limit of about 1 MB).
-
--------------------------------------------------------------------------------
- 5. CONFIG
--------------------------------------------------------------------------------
-servers.txt - one INSTANCE per line, instance names, not listeners:
-
-    SQLVM1\INST1
-    SQLVM1\INST2
-    SQLVM1\INST3
-    SQLVM2\INST1
-    ...
-    SQLVM3\INST3
-
-If SQL Browser is blocked, add the port, e.g. SQLVM1\INST1,1433
-
-$Config at the top of Invoke-PerfCheck.ps1:
-    Recipients            = 'dba-team@yourcompany.com'   (and CopyRecipients if needed)
-    MailProfile           = the profile from database_mail_setup.sql
-    IncludeLocalInstances = $false
-    PrimaryOnly           = $true      (or pass -PrimaryOnly)
-    SqlLogin              = 'dba_perfcheck'
-    SqlAuthOnly           = $true      instances ONLY with the SQL login, never Windows
-    CredentialScope       = 'CurrentUser'   only the account running the job can decrypt it
-    MailWindowsAuth       = $true      email as the account running the job (attachments)
-    MailInstance          = 'SQLVM1\INST1'  the coordinator instance (the one running the job)
-    RemoteBiServices      = $false     see step 3d
-    Encrypt               = $true      optional: encrypt the connections
-
--------------------------------------------------------------------------------
- 6. TEST BY HAND (your admin account, secondary logon)
--------------------------------------------------------------------------------
-RDP to the coordinator with CyberArk, then open a command prompt with
-"Run as different user" and your admin account:
+Command prompt with secondary logon (your admin account):
 
     cd /d C:\DBA\PerfCheck
-    Run-PerfCheck.bat -PrimaryOnly -NoPerf -Label TEST
+    powershell -ExecutionPolicy Bypass -File .\Collect-PerfCheckReports.ps1 -SaveCredentialFor "NT SERVICE\SQLAgent$MARS01"
 
-It asks for the dba_perfcheck password (SqlAuthOnly) -> enter it.
-"Save it ...?" -> N  (the job gets its own copy in step 7; no need to keep one
-for your account).
+It asks for the dba_perfcheck password once and writes a hand-over file only
+Administrators, SYSTEM and the Agent service account can read. The collector's
+first run re-encrypts it so that ONLY the Agent service account can decrypt it
+(Windows DPAPI, this machine only) and deletes the hand-over file. The password
+is only ever decrypted into memory - never written to a connection string, the
+log or job history.
+Change it later: run this step again and delete PerfCheck.NT_SERVICE_SQLAgent$MARS01.cred.
 
-Check:
-  - ONE email arrives with 3 attachments (one .html per VM)
-  - ConnectedAs shows "SQL: dba_perfcheck" for every instance
-  - secondary-only instances are listed as skipped
-  - AG tables show only the AGs where that instance is primary
+Optional manual test as your own account (asks for the password, answer N to
+"Save it"): after a check job has run on all 9 instances,
 
-Then a short performance window:
+    powershell -ExecutionPolicy Bypass -File .\Collect-PerfCheckReports.ps1
 
-    Run-PerfCheck.bat -PrimaryOnly -SampleSec 10 -DurationMin 2 -Label TEST
+-------------------------------------------------------------------------------
+ 6. ON MARSDBW1\MARS01 ONLY - PART 4 (the collector job)
+-------------------------------------------------------------------------------
+Set at the top of PART 4 and run it:
+    @ScriptPath = N'C:\DBA\PerfCheck\Collect-PerfCheckReports.ps1'
+    @StartTime  = '06:10'      (10 min after the check job)
+It creates "DBA - Perf Check Reports (collector)": CmdExec, no proxy, owner sa.
 
-On every instance, nothing left behind:
+-------------------------------------------------------------------------------
+ 7. FIRST RUN
+-------------------------------------------------------------------------------
+Start the check job on all 9 instances (or wait for 06:00), then about 8
+minutes later the collector:
+
+    EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check';     -- each instance
+    EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Perf Check Reports (collector)'; -- MARSDBW1\MARS01
+
+Expect ONE email with 3 attachments (MARSDBW1_PERF_..., MARSDBW2_..., MARSDBW3_...).
+Secondary-only instances are listed as SKIPPED; AG tables show only primary AGs.
+Where to look on MARSDBW1:
+  - SQL Agent job history
+  - C:\DBA\PerfCheck\CollectorJob_output.txt   (last collector output)
+  - C:\DBA\PerfCheck\Logs\                     (collector log per run)
+  - C:\DBA\PerfCheck\Reports\                  (the .html files)
+On every instance, nothing left behind after a run:
 
     SELECT value_in_use FROM sys.configurations WHERE name = 'blocked process threshold (s)';
-    SELECT name FROM sys.dm_xe_sessions WHERE name = 'DBA_PerfWindow';   -- no rows
-
--------------------------------------------------------------------------------
- 7. HAND THE PASSWORD OVER TO THE JOB'S ACCOUNT (one-time)
--------------------------------------------------------------------------------
-Same command prompt (your admin account), with the name from step 3a:
-
-    Run-PerfCheck.bat -SaveCredentialFor "NT SERVICE\SQLAgent$INST1"
-
-It asks for the dba_perfcheck password once and writes
-C:\DBA\PerfCheck\PerfCheck.NT_SERVICE_SQLAgent$INST1.handoff
-  - encrypted with Windows DPAPI, readable (NTFS) only by Administrators, SYSTEM
-    and the Agent service account
-  - on the job's FIRST run it is re-encrypted for the Agent service account only
-    (PerfCheck.NT_SERVICE_SQLAgent$INST1.cred - no other account can decrypt it,
-    a copy of the file is useless elsewhere) and the .handoff file is deleted
-  - the password is only decrypted into memory (SecureString) when the check
-    runs; never written to a connection string, the log or job history
-  - change the password later: run this step again, then delete the .cred file
-What it can't prevent: an administrator on the coordinator, or anything running
-as the Agent service account (e.g. any CmdExec job step without a proxy), can
-recover it. Hence the minimal rights in step 2.
-
--------------------------------------------------------------------------------
- 8. CREATE THE JOB (ON THE COORDINATOR)
--------------------------------------------------------------------------------
-Open CreateAgentJob_PerfCheck.sql, set the values at the top and run it:
-
-    @ScriptFolder = N'C:\DBA\PerfCheck'
-    @Arguments    = N'-PrimaryOnly -Label SCHEDULED'
-    @ProxyName    = NULL                 -- runs as the Agent service account
-    @JobOwner     = NULL                 -- sa (a CmdExec step without a proxy needs a sysadmin owner)
-    @Schedule, @StartTime, and optionally @NotifyOperator
-
-Start it once:
-
-    EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check (all VMs)';
-
-The first run's log shows "handed over by ... - saving it for NT SERVICE\..."
-and "hand-over file deleted". To run it on demand later, start the job (not the
-.bat), so it runs as the same account.
-
-With the defaults the job runs about 31-35 minutes. Where to look:
-  - SQL Agent job history
-  - C:\DBA\PerfCheck\AgentJobStep_output.txt   (output of the last run)
-  - C:\DBA\PerfCheck\Logs\                     (full log of each run)
-  - C:\DBA\PerfCheck\Reports\                  (the .html reports)
+    SELECT name FROM sys.dm_xe_sessions WHERE name = 'DBA_PerfCheckJob';   -- no rows
 
 -------------------------------------------------------------------------------
  IF SOMETHING GOES WRONG
 -------------------------------------------------------------------------------
-Job fails at once: "No saved SQL login for NT SERVICE\..."
-    -> step 7 wasn't done, or for a different account name than the one the job
-       runs as (the log's first lines show the account; the file name must match).
-"could not re-save it ... the hand-over file is kept and used"
-    -> DPAPI for the Agent service account didn't work; the job still runs with the
-       hand-over file (readable only by Administrators, SYSTEM and that account).
-       Usually the folder rights from step 3b are missing.
-Email has only a summary, no attachments
-    -> the step output says why: usually the Agent service account has no login /
-       DatabaseMailUserRole on the coordinator (step 3c), MailInstance isn't the
-       coordinator instance, or a file is above MaxFileSize (step 4).
+An instance shows NO DATA / RUNNING
+    -> its check job didn't run / is still running: job history on that instance,
+       and @StartTime of both jobs (the collector waits up to 15 min).
 An instance shows FAILED
-    -> dba_perfcheck missing / wrong password / mixed mode off on that instance,
-       or firewall / named-instance port between the coordinator and that VM.
-Job step fails with exit code 3 or 4
-    -> read the newest file in Logs\. (3 = script error, 4 = no email sent.
-       0, 1 and 2 count as success: the email went out.)
+    -> the email shows the error; also job history on that instance and
+       error_message in DBAdmin.dbo.DBA_PerfCheck_Report.
+An instance shows UNREACHABLE
+    -> dba_perfcheck missing / wrong password / mixed mode off, or firewall /
+       SQL Browser (named instances) between MARSDBW1 and that VM.
+Collector fails at once: "No saved SQL login for NT SERVICE\..."
+    -> step 5 not done, or for another account name than the one the job runs as.
+Email has no attachments
+    -> the collector log says why: usually a file above MaxFileSize (step 4d).
+Collector job fails with exit code 3 or 4
+    -> newest file in C:\DBA\PerfCheck\Logs\ (3 = script error, 4 = no email sent).

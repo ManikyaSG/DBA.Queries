@@ -1,20 +1,29 @@
 /*******************************************************************************
- File    : HealthPerfCheck_AgentJob.sql   (automation/perf-check-reports/tsql)
- Purpose : The health & performance check of perf-check-reports/powershell, in pure T-SQL,
-           for servers where PowerShell can't be used. Runs as a SQL Agent job
-           (or by hand) on ONE instance and emails one report via Database Mail.
+ File    : HealthPerfCheck_AgentJob.sql   (automation/perf-check-reports)
+ Purpose : Health & performance check of every SQL Server instance, saved in
+           DBAdmin, then one email with one HTML report per VM.
 
- WHAT IT DOES (dbo.usp_DBA_HealthPerfCheck)
+ HOW IT FITS TOGETHER
+   - On EVERY instance a SQL Agent job runs dbo.usp_DBA_HealthPerfCheck: health
+     check + a short performance window (default every 30 s for 5 min). The
+     result (finished HTML + status) is saved in DBAdmin.dbo.DBA_PerfCheck_Report.
+     An instance that is SECONDARY for every availability group saves a SKIPPED
+     row and does no work; on the others the AG / database tables show only the
+     AGs the instance is primary for (@PrimaryOnly = 1).
+   - On ONE instance (e.g. MARSDBW1\MARS01) a second Agent job runs
+     Collect-PerfCheckReports.ps1 about 10 minutes later: it reads the latest row
+     of every instance (SQL login, SELECT only), writes one HTML file per VM and
+     sends ONE email with all the files attached.
+
+ WHAT THE CHECK COVERS (dbo.usp_DBA_HealthPerfCheck)
    1. Health check: instance & build, SQL / Windows uptime, services, vitals,
       databases (state, recovery, backups, log use, AG role), Always On
       replicas / listeners (IP, DHCP) / databases, cluster & quorum, disks, failed
-      job steps (24 h), severe error log entries, sp_configure, trace flags, linked
-      servers, endpoints, certificates, XE sessions, SSIS catalog / projects /
-      environments / failures, SSRS content / subscriptions, and the SSIS / SSRS /
-      SSAS services on this server (state). NOT included: data/log file list, Agent
-      job list, logins, server role members, SSAS databases (need PowerShell / MSOLAP).
-   2. Performance window: a sample every @SampleSec seconds for @DurationMin
-      minutes (WAITFOR loop): Batch Requests/sec, Transactions/sec (@PerfDatabases),
+      job steps (24 h), severe error log entries, sp_configure, linked servers,
+      endpoints, certificates, XE sessions, and the SSIS / SSRS / SSAS services
+      on this server (state). NOT included: data/log file list, Agent job list,
+      logins, server role members, SSAS databases.
+   2. Performance window: Batch Requests/sec, Transactions/sec (@PerfDatabases),
       compilations, user connections + connection pool usage, lock waits / wait
       time / timeouts / deadlocks / blocking, PLE, buffer cache hit ratio, memory
       grants pending, target vs total memory, wait stats per interval, file latency,
@@ -23,11 +32,8 @@
       Root cause with SPID + statement: head blockers (incl. idle sessions with an
       open transaction), problem sessions (blocked / I/O / log / memory / tempdb
       waits / long running), memory grants, tempdb users, every deadlock process,
-      and the top 20 queries of the window by duration / CPU / reads (plan cache,
+      and the top 5 queries of the window by duration / CPU / reads (plan cache,
       no Query Store).
-   3. One email with the FULL report in the body (no attachment). If Database Mail
-      rejects it, a compact report (no per-interval tables) is sent,
-      then the short summary - an email always goes out.
 
  SERVER CHANGES during the window, always put back: 'blocked process threshold (s)'
  is set to @BlockedThresholdSec and the XE session DBA_PerfCheckJob is created. At
@@ -35,31 +41,51 @@
  kept in dbo.DBA_PerfCheck_State and restored at the start of the next run.
 
  HOW TO USE
-   PART 1 - run once (sysadmin): creates the table, two helper objects and the
-            procedure in the database chosen on the USE line below (master by
-            default; change it to your DBA database if you have one). Re-run
-            it to upgrade: existing objects are ALTERed, nothing is dropped.
-   PART 2 - set the parameters at its top and run it: creates the SQL Agent
-            job + schedule, or updates the existing job in place (history kept).
-   Test by hand first (short window, report returned as a grid instead of mailed):
-       EXEC dbo.usp_DBA_HealthPerfCheck @SampleSec = 10, @DurationMin = 1, @SendEmail = 0;
-   or mailed:
-       EXEC dbo.usp_DBA_HealthPerfCheck @Recipients = N'dba-team@yourcompany.com', @SampleSec = 10, @DurationMin = 2;
+   PART 1 - every instance (sysadmin): table, helper objects and the procedure
+            in DBAdmin (DBAdmin must NOT be in an availability group). Safe to
+            re-run to upgrade: objects are ALTERed, nothing is dropped.
+   PART 2 - every instance: the check job (saves to the table, no email).
+   PART 3 - every instance: the SQL login the collector reads with (SELECT on
+            the report table only).
+   PART 4 - ONE instance only (the coordinator): the collector job.
+   Test by hand first:
+       EXEC DBAdmin.dbo.usp_DBA_HealthPerfCheck @SampleSec = 10, @DurationMin = 1, @SendEmail = 0, @SaveToTable = 1, @PrimaryOnly = 1;
+       SELECT TOP (5) * FROM DBAdmin.dbo.DBA_PerfCheck_Report ORDER BY run_id DESC;
+   The procedure can still email one instance's report itself (@SendEmail = 1,
+   @Recipients = ...), e.g. for a single server.
 
- NEEDS: SQL Server 2016 RTM+ (any edition with Agent), Database Mail with a profile
- (perf-check-reports/database_mail_setup.sql sets it up). The job runs as its owner
- (sa by default) so it has all permissions; run by hand as a non-sysadmin and the
- parts it can't read are skipped with a warning.
+ NEEDS: SQL Server 2016 SP1+ (any edition with Agent). The job runs as its owner
+ (sa by default) so it has all permissions. Database Mail only on the coordinator
+ (database_mail_setup.sql).
  Tags    : [BOX] SQL Server 2016 SP1 - 2025 / Azure VM. Not for Azure SQL Database.
 *******************************************************************************/
 
 /*=============================================================================
   PART 1 - INSTALL (run once per instance; safe to re-run to upgrade)
 =============================================================================*/
-USE [master];   -- <== database for the procedure (master, or your DBA database)
+USE [DBAdmin];   -- <== DBA database on every instance (not in an availability group)
 GO
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
+GO
+IF OBJECT_ID(N'dbo.DBA_PerfCheck_Report', N'U') IS NULL
+    CREATE TABLE dbo.DBA_PerfCheck_Report (
+        run_id        int IDENTITY NOT NULL CONSTRAINT PK_DBA_PerfCheck_Report PRIMARY KEY,
+        instance_name sysname       NOT NULL,
+        vm_name       sysname       NOT NULL,     -- physical host (SERVERPROPERTY('ComputerNamePhysicalNetBIOS'))
+        label         nvarchar(50)  NOT NULL,
+        run_start     datetime      NOT NULL,
+        run_end       datetime      NULL,         -- NULL while running
+        status        varchar(10)   NOT NULL,     -- RUNNING | OK | WARNING | CRITICAL | SKIPPED | FAILED
+        critical      int           NOT NULL CONSTRAINT DF_DBA_PerfCheck_Report_c DEFAULT (0),
+        warnings      int           NOT NULL CONSTRAINT DF_DBA_PerfCheck_Report_w DEFAULT (0),
+        ag_roles      nvarchar(2000) NOT NULL,    -- e.g. 'PRIMARY: AG1, AG3; SECONDARY: AG2' or 'no availability group'
+        summary_html  nvarchar(max) NULL,         -- needs attention + key tables (email body)
+        report_html   nvarchar(max) NULL,         -- the full report (attachment)
+        error_message nvarchar(4000) NULL);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.DBA_PerfCheck_Report') AND name = N'IX_DBA_PerfCheck_Report_start')
+    CREATE INDEX IX_DBA_PerfCheck_Report_start ON dbo.DBA_PerfCheck_Report (run_start DESC) INCLUDE (status, label);
 GO
 IF OBJECT_ID(N'dbo.DBA_PerfCheck_State', N'U') IS NULL
     CREATE TABLE dbo.DBA_PerfCheck_State (
@@ -160,12 +186,12 @@ ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @MailProfile         sysname        = NULL,       -- NULL = default public profile, else the first profile
     @FromAddress         nvarchar(256)  = NULL,       -- NULL = the profile account's address
     @Label               nvarchar(50)   = N'SCHEDULED',
-    @SampleSec           int            = 60,         -- seconds between samples
-    @DurationMin         int            = 30,         -- length of the performance window
+    @SampleSec           int            = 30,         -- seconds between samples
+    @DurationMin         int            = 5,          -- length of the performance window
     @PerfDatabases       nvarchar(max)  = NULL,       -- e.g. N'MARS,CLR' for 'Trans/s'; NULL = all databases
     @BlockedThresholdSec int            = 5,          -- 'blocked process threshold' during the window
     @LongQuerySec        int            = 5,          -- requests running longer than this count as problem sessions
-    @TopQueries          bit            = 1,          -- top 20 queries of the window (plan cache)
+    @TopQueries          bit            = 1,          -- top 5 queries of the window (plan cache)
     @BigGrantMB          int            = 1024,       -- list memory grants of at least this size (waiting ones always)
     @TempdbSessionMB     int            = 500,        -- list sessions using at least this much tempdb
     @PleMin              int            = 300,        -- thresholds for 'needs attention'
@@ -174,7 +200,11 @@ ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @AgSendQueueMB       int            = 100,
     @NoHealth            bit            = 0,          -- 1 = performance window only
     @NoPerf              bit            = 0,          -- 1 = health check only
-    @SendEmail           bit            = 1           -- 0 = return the report as a result set (testing in SSMS)
+    @SendEmail           bit            = 1,          -- 0 = no email (with @SaveToTable = 0: the report as a result set, for testing)
+    @SaveToTable         bit            = 0,          -- 1 = save the result in dbo.DBA_PerfCheck_Report (read by Collect-PerfCheckReports.ps1)
+    @PrimaryOnly         bit            = 0,          -- 1 = SECONDARY for every AG: save a SKIPPED row and stop;
+                                                      --     otherwise show only the AGs / databases this instance is primary for
+    @KeepDays            int            = 30          -- rows older than this are deleted from dbo.DBA_PerfCheck_Report
 AS
 BEGIN
 SET NOCOUNT ON;
@@ -192,6 +222,46 @@ BEGIN
     RETURN;
 END;
 IF @SampleSec < 5 SET @SampleSec = 5;
+
+-- AG roles of this instance at the start (distributed AGs ignored)
+DECLARE @rp_vm sysname = CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS sysname), @rp_roles nvarchar(2000), @rp_include bit, @rp_run int = NULL;
+IF OBJECT_ID('tempdb..#rp_ag')  IS NOT NULL DROP TABLE #rp_ag;
+IF OBJECT_ID('tempdb..#rp_sdb') IS NOT NULL DROP TABLE #rp_sdb;
+IF OBJECT_ID('tempdb..#rp_sls') IS NOT NULL DROP TABLE #rp_sls;
+CREATE TABLE #rp_ag  (ag_name sysname, role_desc nvarchar(60));
+CREATE TABLE #rp_sdb (db sysname);        -- databases of AGs where this instance is SECONDARY
+CREATE TABLE #rp_sls (listener sysname);  -- their listeners
+IF CAST(ISNULL(SERVERPROPERTY('IsHadrEnabled'), 0) AS int) = 1
+BEGIN
+    INSERT #rp_ag SELECT ag.name, ISNULL(ars.role_desc, N'UNKNOWN')
+    FROM sys.availability_groups AS ag
+    LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.group_id = ag.group_id AND ars.is_local = 1
+    WHERE ag.is_distributed = 0;
+    INSERT #rp_sdb SELECT adc.database_name FROM sys.availability_databases_cluster AS adc
+    JOIN sys.availability_groups AS ag ON ag.group_id = adc.group_id JOIN #rp_ag AS r ON r.ag_name = ag.name AND r.role_desc = N'SECONDARY';
+    INSERT #rp_sls SELECT l.dns_name FROM sys.availability_group_listeners AS l
+    JOIN sys.availability_groups AS ag ON ag.group_id = l.group_id JOIN #rp_ag AS r ON r.ag_name = ag.name AND r.role_desc = N'SECONDARY';
+END;
+SET @rp_include = CASE WHEN NOT EXISTS (SELECT 1 FROM #rp_ag) OR EXISTS (SELECT 1 FROM #rp_ag WHERE role_desc <> N'SECONDARY') THEN 1 ELSE 0 END;
+SET @rp_roles = ISNULL(STUFF((SELECT N'; ' + r.role_desc + N': '
+                                   + STUFF((SELECT N', ' + a.ag_name FROM #rp_ag AS a WHERE a.role_desc = r.role_desc ORDER BY a.ag_name FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'')
+                              FROM (SELECT DISTINCT role_desc FROM #rp_ag) AS r ORDER BY r.role_desc FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N''), N'no availability group');
+IF @PrimaryOnly = 0 BEGIN DELETE #rp_sdb; DELETE #rp_sls; END;   -- no filtering
+
+IF @SaveToTable = 1
+BEGIN
+    DELETE dbo.DBA_PerfCheck_Report WHERE run_start < DATEADD(DAY, -@KeepDays, GETDATE());
+    INSERT dbo.DBA_PerfCheck_Report (instance_name, vm_name, label, run_start, status, ag_roles)
+    VALUES (@@SERVERNAME, ISNULL(@rp_vm, CAST(SERVERPROPERTY('MachineName') AS sysname)), @Label, @p_runStart, 'RUNNING', LEFT(@rp_roles, 2000));
+    SET @rp_run = SCOPE_IDENTITY();
+END;
+IF @PrimaryOnly = 1 AND @rp_include = 0
+BEGIN
+    IF @rp_run IS NOT NULL
+        UPDATE dbo.DBA_PerfCheck_Report SET status = 'SKIPPED', run_end = GETDATE() WHERE run_id = @rp_run;
+    PRINT N'Skipped: ' + @@SERVERNAME + N' is SECONDARY for every availability group (' + @rp_roles + N'). The primary replica reports them.';
+    RETURN;
+END;
 
 BEGIN TRY
 
@@ -338,6 +408,7 @@ BEGIN
     LEFT JOIN #bk AS bd ON bd.database_name = d.name AND bd.type = 'I'
     LEFT JOIN #bk AS bl ON bl.database_name = d.name AND bl.type = 'L'
     WHERE d.source_database_id IS NULL;      -- skip DB snapshots
+    DELETE #db WHERE name IN (SELECT db FROM #rp_sdb);   -- @PrimaryOnly: databases of AGs where this instance is SECONDARY
 
     -- Evaluate each database
     UPDATE #db SET
@@ -382,6 +453,7 @@ BEGIN
     JOIN sys.dm_hadr_availability_group_states AS ags ON ags.group_id = ag.group_id
     JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id
     LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id;
+    IF @PrimaryOnly = 1 DELETE #agr WHERE ag_name IN (SELECT ag_name FROM #rp_ag WHERE role_desc = N'SECONDARY');
 
     INSERT #issues SELECT status, 'AlwaysOn replica', ag_name + N' / ' + replica_node,
            ISNULL(role_desc, N'state not visible from this replica') + N', ' + ISNULL(connected_state_desc, N'?') + N', ' + ISNULL(synchronization_health_desc, N'?')
@@ -398,6 +470,7 @@ BEGIN
     FROM sys.dm_hadr_database_replica_states AS drs
     JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id
     JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id;
+    IF @PrimaryOnly = 1 DELETE #agdb WHERE ag_name IN (SELECT ag_name FROM #rp_ag WHERE role_desc = N'SECONDARY');
 
     INSERT #issues SELECT status, 'AlwaysOn database', ag_name + N' / ' + database_name + N' @ ' + replica_node,
            synchronization_state_desc + CASE WHEN is_suspended = 1 THEN N' SUSPENDED (' + ISNULL(suspend_reason_desc, N'') + N')' ELSE N'' END
@@ -458,7 +531,7 @@ BEGIN
         INSERT #el EXEC sys.xp_readerrorlog 0, 1, N'stack dump';
     END TRY
     BEGIN CATCH
-        INSERT #issues SELECT 'WARNING', 'Error log', N'not read', N'No permission to read the error log (' + ERROR_MESSAGE() + N') - see SETUP in PerfCheck.sql';
+        INSERT #issues SELECT 'WARNING', 'Error log', N'not read', N'No permission to read the error log (' + ERROR_MESSAGE() + N') - needs sysadmin or EXECUTE on xp_readerrorlog';
     END CATCH;
 
     SELECT DISTINCT e.LogDate, e.ProcessInfo, LEFT(e.[Text], 1000) AS message
@@ -1019,7 +1092,7 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
         INSERT #qtop
         SELECT query_hash, ec, CAST(el / 1000.0 AS decimal(19, 1)), CAST(el / 1000.0 / ec AS decimal(19, 1)), CAST(cpu / 1000.0 AS decimal(19, 1)), rd,
                sh, ph, so, eo, rn_d, rn_c, rn_r
-        FROM r WHERE rn_d <= 20 OR rn_c <= 20 OR rn_r <= 20;
+        FROM r WHERE rn_d <= 5 OR rn_c <= 5 OR rn_r <= 5;
     END;
     IF OBJECT_ID('tempdb..#qtx') IS NOT NULL DROP TABLE #qtx;
     SELECT q.*, ISNULL(DB_NAME(COALESCE(t.dbid, CONVERT(int, pa.value))), N'') AS db,
@@ -1030,6 +1103,15 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
     FROM #qtop AS q
     OUTER APPLY sys.dm_exec_sql_text(q.sql_handle) AS t
     OUTER APPLY (SELECT value FROM sys.dm_exec_plan_attributes(q.plan_handle) WHERE attribute = N'dbid') AS pa;
+
+    -- @PrimaryOnly: drop the samples of AGs where this instance is SECONDARY (their databases and listeners)
+    IF @PrimaryOnly = 1
+    BEGIN
+        DELETE #s_ag  WHERE ag_name IN (SELECT ag_name FROM #rp_ag WHERE role_desc = N'SECONDARY');
+        DELETE #s_lsn WHERE listener IN (SELECT listener FROM #rp_sls);
+        DELETE #s_io  WHERE db IN (SELECT db FROM #rp_sdb);
+        DELETE #s_pc  WHERE obj = N'Databases' AND inst IN (SELECT db FROM #rp_sdb);
+    END;
 
     -- 9. per-interval metrics
     IF OBJECT_ID('tempdb..#iv0') IS NOT NULL DROP TABLE #iv0;
@@ -1262,7 +1344,7 @@ FROM #iv',
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT * FROM #pwaits',
          @Title = N'Wait stats per interval (ms waited)', @OrderBy = N'_n', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (20) p.inst AS [database], CAST(AVG(p.d / i.dt) AS decimal(18, 1)) AS [avg trans/s], CAST(MAX(p.d / i.dt) AS decimal(18, 1)) AS [peak trans/s]
+    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (5) p.inst AS [database], CAST(AVG(p.d / i.dt) AS decimal(18, 1)) AS [avg trans/s], CAST(MAX(p.d / i.dt) AS decimal(18, 1)) AS [peak trans/s]
 FROM #pcd AS p JOIN #iv0 AS i ON i.n = p.n
 WHERE p.obj = N''Databases'' AND p.ctr = N''Transactions/sec'' AND p.inst NOT IN (N''_Total'', N''mssqlsystemresource'')
   AND (NOT EXISTS (SELECT 1 FROM #pdb) OR p.inst IN (SELECT name FROM #pdb))
@@ -1317,18 +1399,18 @@ FROM #s_lsn GROUP BY listener, ip',
     SET @p_pFull += N'<div style="color:#555;margin-top:12px">Top queries = plan cache (sys.dm_exec_query_stats) at the end of the window minus the start, grouped by query_hash ('
                   + CAST(@pf_cached AS nvarchar(20)) + N' cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted.</div>';
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, executions, total_duration_ms, avg_duration_ms, total_cpu_ms, total_logical_reads, query_text, rn_d AS _r
-FROM #qtx WHERE rn_d <= 20',
-         @Title = N'Top 20 queries in the window by duration', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
+FROM #qtx WHERE rn_d <= 5',
+         @Title = N'Top 5 queries in the window by duration', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
     SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, executions, total_cpu_ms, total_duration_ms, total_logical_reads, query_text, rn_c AS _r
-FROM #qtx WHERE rn_c <= 20',
-         @Title = N'Top 20 queries in the window by CPU', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
+FROM #qtx WHERE rn_c <= 5',
+         @Title = N'Top 5 queries in the window by CPU', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
     SET @p_pMid += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, executions, total_logical_reads, total_duration_ms, total_cpu_ms, query_text, rn_r AS _r
-FROM #qtx WHERE rn_r <= 20',
-         @Title = N'Top 20 queries in the window by logical reads', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
+FROM #qtx WHERE rn_r <= 5',
+         @Title = N'Top 5 queries in the window by logical reads', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
     SET @p_pMid += @p_part;
 END;
@@ -1374,6 +1456,16 @@ td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
                + N'<p style="color:#555">Compact report: the per-interval tables were left out because the full report could not be sent. Run the procedure with @SendEmail = 0 to see them.</p></body></html>';
 SET @r_subject = N'[' + @r_tag + N'] SQL Server Health & Performance Check [' + @Label + N'] - ' + @@SERVERNAME;
 
+IF @rp_run IS NOT NULL
+    UPDATE dbo.DBA_PerfCheck_Report
+    SET run_end = GETDATE(), status = @r_tag, critical = @r_crit, warnings = @r_warn,
+        summary_html = @r_head + @p_hShort + @p_pShort, report_html = @r_head + @p_hFull + @p_pFull
+    WHERE run_id = @rp_run;
+IF @SendEmail = 0 AND @SaveToTable = 1
+BEGIN
+    PRINT N'Saved in ' + DB_NAME() + N'.dbo.DBA_PerfCheck_Report, run_id ' + CAST(@rp_run AS nvarchar(20)) + N' (' + @r_tag + N').';
+    RETURN;
+END;
 IF @SendEmail = 0
 BEGIN
     -- testing: click the XML cell in SSMS to see the full HTML; save it as .html to view it in a browser
@@ -1430,6 +1522,8 @@ PRINT N'Report ' + @r_tag + N' queued as Database Mail item ' + CAST(@r_mailId A
 END TRY
 BEGIN CATCH
     SET @p_err = ERROR_MESSAGE() + N' (line ' + CAST(ERROR_LINE() AS nvarchar(10)) + N')';
+    IF @rp_run IS NOT NULL
+        BEGIN TRY UPDATE dbo.DBA_PerfCheck_Report SET status = 'FAILED', run_end = GETDATE(), error_message = LEFT(@p_err, 4000) WHERE run_id = @rp_run; END TRY BEGIN CATCH END CATCH;
     -- make sure the server is put back even when the check fails
     BEGIN TRY
         IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'DBA_PerfCheckJob') DROP EVENT SESSION DBA_PerfCheckJob ON SERVER;
@@ -1480,35 +1574,27 @@ ELSE
 GO
 
 /*=============================================================================
-  PART 2 - CREATE THE SQL AGENT JOB  (set the parameters, then run this part)
-  Creates or replaces the job and a schedule. Steps:
-    1. AG role check (when @PrimaryOnly = 1): continues if this instance has no
-       availability group, is PRIMARY for at least one, or an AG is RESOLVING (no
-       primary); if it is SECONDARY for every AG it stops - the job ends as
-       succeeded, no email. After a failover the new primary takes over by itself.
-    2. The health & performance check (dbo.usp_DBA_HealthPerfCheck).
-  The job runs as its owner (sa by default), so it has all permissions.
+  PART 2 - THE CHECK JOB  (EVERY instance; set the parameters, then run this part)
+  Creates the job + schedule, or updates the existing job in place (history kept).
+  The job saves its result in DBAdmin.dbo.DBA_PerfCheck_Report and sends no email.
+  An instance that is SECONDARY for every AG saves a SKIPPED row and stops; the
+  others report only the AGs they are primary for. Use the SAME @StartTime on
+  every instance. The job runs as its owner (sa by default).
   Run it now:  EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check';
 =============================================================================*/
 USE [msdb];
 GO
 DECLARE
     @JobName         sysname       = N'DBA - Health & Performance Check',
-    @ProcDatabase    sysname       = N'master',                    -- database used on the USE line of PART 1
-    @Recipients      nvarchar(max) = N'dba-team@yourcompany.com',  -- ; separated
-    @CopyRecipients  nvarchar(max) = NULL,
-    @MailProfile     sysname       = NULL,                         -- NULL = default public profile
-    @FromAddress     nvarchar(256) = NULL,
+    @ProcDatabase    sysname       = N'DBAdmin',                   -- database used on the USE line of PART 1
     @Label           nvarchar(50)  = N'SCHEDULED',
-    @SampleSec       int           = 60,                           -- performance window: seconds between samples
-    @DurationMin     int           = 30,                           -- performance window: minutes (job runs about this long)
+    @SampleSec       int           = 30,                           -- performance window: seconds between samples
+    @DurationMin     int           = 5,                            -- performance window: minutes (the job runs about 1-2 min longer)
     @PerfDatabases   nvarchar(max) = NULL,                         -- e.g. N'MARS,CLR' for Trans/s; NULL = all
-    @NoPerf          bit           = 0,                            -- 1 = health check only (job takes ~1 min)
-    @PrimaryOnly     bit           = 1,                            -- 1 = step 1 checks the AG role: run only where this instance is primary
-                                                                   --     for at least one AG (or has no AG); on a secondary-only instance
-                                                                   --     the job ends as succeeded without running. Install on every replica.
+    @NoPerf          bit           = 0,                            -- 1 = health check only
+    @KeepDays        int           = 30,                           -- rows kept in DBA_PerfCheck_Report
     @Schedule        varchar(10)   = 'DAILY',                      -- DAILY | WEEKLY | ONCE | NONE (no schedule, run on demand)
-    @StartTime       char(5)       = '06:00',                      -- HH:mm, server local time
+    @StartTime       char(5)       = '06:00',                      -- HH:mm, server local time - the same on every instance
     @WeekDays        varchar(60)   = 'Mon,Wed,Fri',                -- WEEKLY only
     @OnceDate        date          = NULL,                         -- ONCE only, e.g. '2026-11-25'
     @JobOwner        sysname       = NULL,                         -- NULL = sa (found by SID, works when sa is renamed or disabled)
@@ -1517,7 +1603,8 @@ DECLARE
 
 /*---------------------------------------------------------------------------*/
 DECLARE @jobId uniqueidentifier, @cmd nvarchar(max), @freqType int, @freqInterval int = 0, @recur int = 0,
-        @startTimeInt int, @startDate int = CONVERT(int, CONVERT(char(8), GETDATE(), 112)), @schedName sysname;
+        @startTimeInt int, @startDate int = CONVERT(int, CONVERT(char(8), GETDATE(), 112)), @schedName sysname,
+        @desc nvarchar(512) = N'Health check + performance window, saved in DBA_PerfCheck_Report for Collect-PerfCheckReports.ps1 (automation/perf-check-reports).';
 
 IF OBJECT_ID(QUOTENAME(@ProcDatabase) + N'.dbo.usp_DBA_HealthPerfCheck', N'P') IS NULL
 BEGIN RAISERROR(N'dbo.usp_DBA_HealthPerfCheck not found in %s - run PART 1 first (or fix @ProcDatabase).', 16, 1, @ProcDatabase); RETURN; END;
@@ -1531,13 +1618,10 @@ IF @Schedule = 'ONCE' AND @OnceDate IS NULL
 BEGIN RAISERROR(N'@OnceDate is required for @Schedule = ONCE.', 16, 1); RETURN; END;
 
 SET @cmd = N'SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ARITHABORT ON; SET ANSI_WARNINGS ON;' + NCHAR(13) + NCHAR(10)
-    + N'EXEC dbo.usp_DBA_HealthPerfCheck' + NCHAR(13) + NCHAR(10)
-    + N'     @Recipients = N''' + REPLACE(@Recipients, N'''', N'''''') + N''''
-    + CASE WHEN @CopyRecipients IS NOT NULL THEN N', @CopyRecipients = N''' + REPLACE(@CopyRecipients, N'''', N'''''') + N'''' ELSE N'' END
-    + CASE WHEN @MailProfile IS NOT NULL THEN N', @MailProfile = N''' + REPLACE(@MailProfile, N'''', N'''''') + N'''' ELSE N'' END
-    + CASE WHEN @FromAddress IS NOT NULL THEN N', @FromAddress = N''' + REPLACE(@FromAddress, N'''', N'''''') + N'''' ELSE N'' END + NCHAR(13) + NCHAR(10)
+    + N'EXEC dbo.usp_DBA_HealthPerfCheck @SendEmail = 0, @SaveToTable = 1, @PrimaryOnly = 1' + NCHAR(13) + NCHAR(10)
     + N'   , @Label = N''' + REPLACE(@Label, N'''', N'''''') + N''', @SampleSec = ' + CAST(@SampleSec AS nvarchar(10))
     + N', @DurationMin = ' + CAST(@DurationMin AS nvarchar(10)) + N', @NoPerf = ' + CAST(@NoPerf AS nvarchar(1))
+    + N', @KeepDays = ' + CAST(@KeepDays AS nvarchar(10))
     + CASE WHEN @PerfDatabases IS NOT NULL THEN N', @PerfDatabases = N''' + REPLACE(@PerfDatabases, N'''', N'''''') + N'''' ELSE N'' END + N';';
 
 IF NOT EXISTS (SELECT 1 FROM dbo.syscategories WHERE name = N'Database Maintenance' AND category_class = 1)
@@ -1550,8 +1634,7 @@ BEGIN
     -- update in place: job history is kept; steps and schedules are rebuilt from the parameters above
     IF @UpdateExisting = 0 BEGIN RAISERROR(N'Job %s already exists (set @UpdateExisting = 1 to update it).', 16, 1, @JobName); RETURN; END;
     SET @existed = 1;
-    EXEC dbo.sp_update_job @job_id = @jobId, @enabled = 1, @category_name = N'Database Maintenance',
-         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-reports/tsql).',
+    EXEC dbo.sp_update_job @job_id = @jobId, @enabled = 1, @category_name = N'Database Maintenance', @description = @desc,
          @notify_level_eventlog = 2, @notify_level_email = 0, @start_step_id = 1;
     WHILE EXISTS (SELECT 1 FROM dbo.sysjobsteps WHERE job_id = @jobId)
     BEGIN
@@ -1565,51 +1648,15 @@ BEGIN
     END;
 END
 ELSE
-    EXEC dbo.sp_add_job
-         @job_name = @JobName, @enabled = 1, @category_name = N'Database Maintenance',
-         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-reports/tsql).',
-         @owner_login_name = @JobOwner, @notify_level_eventlog = 2,
-         @notify_level_email = 0, @job_id = @jobId OUTPUT;
+    EXEC dbo.sp_add_job @job_name = @JobName, @enabled = 1, @category_name = N'Database Maintenance', @description = @desc,
+         @owner_login_name = @JobOwner, @notify_level_eventlog = 2, @notify_level_email = 0, @job_id = @jobId OUTPUT;
 DECLARE @owner sysname = ISNULL(@JobOwner, SUSER_SNAME(0x01));
 EXEC dbo.sp_update_job @job_id = @jobId, @owner_login_name = @owner;
 IF @NotifyOperator IS NOT NULL
     EXEC dbo.sp_update_job @job_id = @jobId, @notify_level_email = 2, @notify_email_operator_name = @NotifyOperator;
 
-IF @PrimaryOnly = 1
-BEGIN
-    DECLARE @agCmd nvarchar(max) = N'SET NOCOUNT ON; SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
--- Step 1: run the check only on the primary replica (or when there is no AG / no primary)
-DECLARE @inAg bit = 0, @allSecondary bit = 0, @ags nvarchar(2000) = N'''', @m nvarchar(2000);
-IF CAST(SERVERPROPERTY(''IsHadrEnabled'') AS int) = 1
-BEGIN
-    IF EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1)
-        SET @inAg = 1;
-    IF @inAg = 1 AND NOT EXISTS (SELECT 1 FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1 AND role_desc <> N''SECONDARY'')
-        SET @allSecondary = 1;
-    SET @ags = ISNULL(STUFF((SELECT N'', '' + ag.name FROM sys.availability_groups AS ag ORDER BY ag.name FOR XML PATH('''')), 1, 2, N''''), N'''');
-END;
-IF @allSecondary = 1
-BEGIN
-    SET @m = N''Skipped: '' + @@SERVERNAME + N'' is a SECONDARY replica for every availability group ('' + @ags
-           + N''). The primary replica runs the check. The job ends as succeeded.'';
-    RAISERROR(N''%s'', 16, 1, @m);   -- step 1 "fails" on purpose -> the job quits reporting success
-END
-ELSE
-BEGIN
-    SET @m = N''Proceeding: '' + @@SERVERNAME + CASE WHEN @inAg = 1 THEN N'' is PRIMARY (or RESOLVING) for at least one availability group ('' + @ags + N'').''
-                                                     ELSE N'' has no availability group (Always On not configured).'' END;
-    PRINT @m;
-END;';
-    EXEC dbo.sp_add_jobstep
-         @job_id = @jobId, @step_id = 1, @step_name = N'AG role check - continue only on the primary', @subsystem = N'TSQL',
-         @database_name = N'master', @command = @agCmd,
-         @on_success_action = 3,   -- go to the next step
-         @on_fail_action = 1,      -- secondary: quit the job reporting success
-         @retry_attempts = 0;
-END;
-
 EXEC dbo.sp_add_jobstep
-     @job_id = @jobId, @step_name = N'Health & performance check', @subsystem = N'TSQL',
+     @job_id = @jobId, @step_id = 1, @step_name = N'Health & performance check (save to table)', @subsystem = N'TSQL',
      @database_name = @ProcDatabase, @command = @cmd, @on_success_action = 1, @on_fail_action = 2, @retry_attempts = 0;
 
 IF @Schedule <> 'NONE'
@@ -1637,6 +1684,144 @@ IF NOT EXISTS (SELECT 1 FROM dbo.sysjobservers WHERE job_id = @jobId)
 
 PRINT CASE WHEN @existed = 1 THEN N'Job updated (history kept): ' ELSE N'Job created: ' END + @JobName + N' (' + CASE WHEN @Schedule = 'NONE' THEN N'no schedule' ELSE @Schedule + N' at ' + @StartTime
       + CASE WHEN @Schedule = 'WEEKLY' THEN N' on ' + @WeekDays WHEN @Schedule = 'ONCE' THEN N' on ' + CONVERT(nvarchar(10), @OnceDate, 120) ELSE N'' END END + N').';
-PRINT CASE WHEN @PrimaryOnly = 1 THEN N'Step 1: AG role check (runs step 2 only on the primary). ' ELSE N'' END + N'Check step command:' + NCHAR(13) + NCHAR(10) + @cmd;
+PRINT N'Step command:' + NCHAR(13) + NCHAR(10) + @cmd;
 PRINT N'Run it now: EXEC msdb.dbo.sp_start_job @job_name = N''' + @JobName + N''';';
+GO
+
+/*=============================================================================
+  PART 3 - THE READER LOGIN  (EVERY instance)
+  The SQL login Collect-PerfCheckReports.ps1 connects with. It needs NO server
+  permissions: only SELECT on DBAdmin.dbo.DBA_PerfCheck_Report (the check itself
+  runs locally as the job owner). Instances must allow SQL authentication:
+  SELECT SERVERPROPERTY('IsIntegratedSecurityOnly');  -- 0 = mixed mode
+  Type the password here, run, then remove it from the file - don't save it.
+  An existing login keeps its password (nothing is changed on it).
+=============================================================================*/
+USE [master];
+GO
+DECLARE @ReaderLogin    sysname       = N'dba_perfcheck',
+        @ReaderPassword nvarchar(128) = N'<strong password here>',
+        @ProcDatabase   sysname       = N'DBAdmin',
+        @sql            nvarchar(max);
+
+IF SUSER_ID(@ReaderLogin) IS NULL
+BEGIN
+    IF @ReaderPassword LIKE N'<%>' BEGIN RAISERROR(N'Set @ReaderPassword first (and remove it from the file afterwards).', 16, 1); RETURN; END;
+    SET @sql = N'CREATE LOGIN ' + QUOTENAME(@ReaderLogin) + N' WITH PASSWORD = N''' + REPLACE(@ReaderPassword, N'''', N'''''')
+             + N''', CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = ' + QUOTENAME(@ProcDatabase) + N';';
+    EXEC (@sql);
+    PRINT N'Login created: ' + @ReaderLogin;
+END
+ELSE PRINT N'Login exists (password not changed): ' + @ReaderLogin;
+
+SET @sql = N'USE ' + QUOTENAME(@ProcDatabase) + N';
+IF USER_ID(N''' + REPLACE(@ReaderLogin, N'''', N'''''') + N''') IS NULL CREATE USER ' + QUOTENAME(@ReaderLogin) + N' FOR LOGIN ' + QUOTENAME(@ReaderLogin) + N';
+GRANT SELECT ON dbo.DBA_PerfCheck_Report TO ' + QUOTENAME(@ReaderLogin) + N';';
+EXEC (@sql);
+PRINT N'SELECT on ' + @ProcDatabase + N'.dbo.DBA_PerfCheck_Report granted to ' + @ReaderLogin + N'.';
+-- Used the login for the older version of this check? It no longer needs these - remove them:
+--   REVOKE VIEW SERVER STATE, ALTER SETTINGS, ALTER ANY EVENT SESSION, VIEW ANY DEFINITION FROM [dba_perfcheck];
+--   USE msdb; DROP USER [dba_perfcheck];   USE master; DROP USER [dba_perfcheck];
+GO
+
+/*=============================================================================
+  PART 4 - THE COLLECTOR JOB  (ONE instance only: the coordinator, e.g. MARSDBW1\MARS01)
+  Runs Collect-PerfCheckReports.ps1 (CmdExec, no proxy: as the SQL Agent service
+  account, so no Windows password is needed). Schedule it about 10 minutes after
+  the check job; it also waits for runs that are still going. Before the first run,
+  hand it the reader login's password once (from a secondary-logon prompt):
+      Collect-PerfCheckReports.ps1 -SaveCredentialFor "NT SERVICE\SQLAgent$MARS01"
+  (the Agent service account: SELECT servicename, service_account FROM sys.dm_server_services;)
+=============================================================================*/
+USE [msdb];
+GO
+DECLARE
+    @JobName         sysname        = N'DBA - Perf Check Reports (collector)',
+    @ScriptPath      nvarchar(260)  = N'C:\DBA\PerfCheck\Collect-PerfCheckReports.ps1',
+    @Arguments       nvarchar(1000) = N'',                         -- e.g. N'-Label SCHEDULED'
+    @Schedule        varchar(10)    = 'DAILY',                     -- DAILY | WEEKLY | ONCE | NONE
+    @StartTime       char(5)        = '06:10',                     -- ~10 min after PART 2's @StartTime
+    @WeekDays        varchar(60)    = 'Mon,Wed,Fri',
+    @OnceDate        date           = NULL,
+    @JobOwner        sysname        = NULL,                        -- NULL = sa (a CmdExec step without a proxy needs a sysadmin owner)
+    @NotifyOperator  sysname        = NULL,
+    @UpdateExisting  bit            = 1;
+
+/*---------------------------------------------------------------------------*/
+DECLARE @jobId uniqueidentifier, @cmd nvarchar(2000), @outFile nvarchar(400), @freqType int, @freqInterval int = 0, @recur int = 0,
+        @startTimeInt int, @startDate int = CONVERT(int, CONVERT(char(8), GETDATE(), 112)), @schedName sysname,
+        @desc nvarchar(512) = N'Collects the latest DBA_PerfCheck_Report row of every instance, one HTML report per VM, one email (Collect-PerfCheckReports.ps1).';
+IF @StartTime NOT LIKE '[0-2][0-9]:[0-5][0-9]'
+BEGIN RAISERROR(N'@StartTime must be HH:mm.', 16, 1); RETURN; END;
+SET @startTimeInt = CAST(REPLACE(@StartTime, ':', '') AS int) * 100;
+SET @Schedule = UPPER(@Schedule);
+IF @Schedule NOT IN ('DAILY', 'WEEKLY', 'ONCE', 'NONE')
+BEGIN RAISERROR(N'@Schedule must be DAILY, WEEKLY, ONCE or NONE.', 16, 1); RETURN; END;
+IF @Schedule = 'ONCE' AND @OnceDate IS NULL
+BEGIN RAISERROR(N'@OnceDate is required for @Schedule = ONCE.', 16, 1); RETURN; END;
+
+SET @cmd = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + @ScriptPath + N'" ' + ISNULL(@Arguments, N'');
+SET @outFile = LEFT(@ScriptPath, LEN(@ScriptPath) - CHARINDEX(N'\', REVERSE(@ScriptPath))) + N'\CollectorJob_output.txt';
+
+IF NOT EXISTS (SELECT 1 FROM dbo.syscategories WHERE name = N'Database Maintenance' AND category_class = 1)
+    EXEC dbo.sp_add_category @class = N'JOB', @type = N'LOCAL', @name = N'Database Maintenance';
+
+DECLARE @existed bit = 0, @stepId int, @schedId int;
+SELECT @jobId = job_id FROM dbo.sysjobs WHERE name = @JobName;
+IF @jobId IS NOT NULL
+BEGIN
+    IF @UpdateExisting = 0 BEGIN RAISERROR(N'Job %s already exists (set @UpdateExisting = 1 to update it).', 16, 1, @JobName); RETURN; END;
+    SET @existed = 1;
+    EXEC dbo.sp_update_job @job_id = @jobId, @enabled = 1, @category_name = N'Database Maintenance', @description = @desc,
+         @notify_level_eventlog = 2, @notify_level_email = 0, @start_step_id = 1;
+    WHILE EXISTS (SELECT 1 FROM dbo.sysjobsteps WHERE job_id = @jobId)
+    BEGIN
+        SELECT @stepId = MAX(step_id) FROM dbo.sysjobsteps WHERE job_id = @jobId;
+        EXEC dbo.sp_delete_jobstep @job_id = @jobId, @step_id = @stepId;
+    END;
+    WHILE EXISTS (SELECT 1 FROM dbo.sysjobschedules WHERE job_id = @jobId)
+    BEGIN
+        SELECT @schedId = MIN(schedule_id) FROM dbo.sysjobschedules WHERE job_id = @jobId;
+        EXEC dbo.sp_detach_schedule @job_id = @jobId, @schedule_id = @schedId, @delete_unused_schedule = 1;
+    END;
+END
+ELSE
+    EXEC dbo.sp_add_job @job_name = @JobName, @enabled = 1, @category_name = N'Database Maintenance', @description = @desc,
+         @owner_login_name = @JobOwner, @notify_level_eventlog = 2, @notify_level_email = 0, @job_id = @jobId OUTPUT;
+DECLARE @owner sysname = ISNULL(@JobOwner, SUSER_SNAME(0x01));
+EXEC dbo.sp_update_job @job_id = @jobId, @owner_login_name = @owner;
+IF @NotifyOperator IS NOT NULL
+    EXEC dbo.sp_update_job @job_id = @jobId, @notify_level_email = 2, @notify_email_operator_name = @NotifyOperator;
+
+EXEC dbo.sp_add_jobstep
+     @job_id = @jobId, @step_id = 1, @step_name = N'Collect reports and send the email (PowerShell)', @subsystem = N'CmdExec',
+     @command = @cmd, @cmdexec_success_code = 0, @output_file_name = @outFile, @flags = 0,
+     @on_success_action = 1, @on_fail_action = 2, @retry_attempts = 0;
+
+IF @Schedule <> 'NONE'
+BEGIN
+    SET @freqType = CASE @Schedule WHEN 'DAILY' THEN 4 WHEN 'WEEKLY' THEN 8 ELSE 1 END;
+    IF @Schedule = 'DAILY' SET @freqInterval = 1;
+    IF @Schedule = 'WEEKLY'
+    BEGIN
+        SET @freqInterval = CASE WHEN @WeekDays LIKE '%Sun%' THEN 1 ELSE 0 END + CASE WHEN @WeekDays LIKE '%Mon%' THEN 2 ELSE 0 END
+                          + CASE WHEN @WeekDays LIKE '%Tue%' THEN 4 ELSE 0 END + CASE WHEN @WeekDays LIKE '%Wed%' THEN 8 ELSE 0 END
+                          + CASE WHEN @WeekDays LIKE '%Thu%' THEN 16 ELSE 0 END + CASE WHEN @WeekDays LIKE '%Fri%' THEN 32 ELSE 0 END
+                          + CASE WHEN @WeekDays LIKE '%Sat%' THEN 64 ELSE 0 END;
+        SET @recur = 1;
+        IF @freqInterval = 0 BEGIN RAISERROR(N'@WeekDays has no valid day (Mon,Tue,Wed,Thu,Fri,Sat,Sun).', 16, 1); RETURN; END;
+    END;
+    IF @Schedule = 'ONCE' SET @startDate = CONVERT(int, CONVERT(char(8), @OnceDate, 112));
+    SET @schedName = @JobName + N' - ' + @Schedule + N' ' + @StartTime;
+    EXEC dbo.sp_add_jobschedule
+         @job_id = @jobId, @name = @schedName, @enabled = 1, @freq_type = @freqType, @freq_interval = @freqInterval,
+         @freq_recurrence_factor = @recur, @active_start_date = @startDate, @active_start_time = @startTimeInt;
+END;
+
+IF NOT EXISTS (SELECT 1 FROM dbo.sysjobservers WHERE job_id = @jobId)
+    EXEC dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)';
+
+PRINT CASE WHEN @existed = 1 THEN N'Job updated (history kept): ' ELSE N'Job created: ' END + @JobName + N' (' + CASE WHEN @Schedule = 'NONE' THEN N'no schedule' ELSE @Schedule + N' at ' + @StartTime END + N').';
+PRINT N'Command : ' + @cmd;
+PRINT N'Output  : ' + @outFile;
 GO
