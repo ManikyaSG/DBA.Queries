@@ -53,7 +53,7 @@ SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to
 
 1. **The report is attached.** Database Mail doesn't allow file attachments for SQL logins (like `dba_perfcheck`), so the script attaches the report as a query result instead (same `.html` file name); with Windows authentication it attaches the file itself (and up to 5 deadlock graphs). The report must fit in Database Mail's `MaxFileSize` (about 1 MB by default): `scripts/45_database_mail_setup.sql` raises it to 10 MB (`@MaxFileSizeMB`). If it is still too big, or attaching fails, the email is sent with the summary and the report's path on the VM.
 2. **Database Mail on every instance, one after the other** (local instances first). Only profiles this login can really use are picked: Database Mail XPs on, the profile has an SMTP account, and it is public, granted to the login, or the login is sysadmin (`MailProfile` is preferred). After queueing, the script waits until Database Mail has handed it to the SMTP server; if an instance can't queue it or Database Mail reports **failed**, the next instance is tried.
-3. **SMTP straight from the VM** (fallback) when no instance could send it: set `SmtpServer` (and `SmtpPort`, `SmtpUseSsl`, `SmtpFrom` if needed) in `$Config`. It uses .NET mail from the VM with the same subject, body and attachments, anonymous relay or `SmtpUseDefaultCredentials = $true` (the Windows account running the script).
+3. **SMTP straight from the VM** (fallback) when no instance could send it with the report attached: set `SmtpServer` (and `SmtpPort`, `SmtpUseSsl`, `SmtpFrom` if needed) in `$Config`. It uses .NET mail from the VM with the same subject, body and attachments, anonymous relay or `SmtpUseDefaultCredentials = $true` (the Windows account running the script). Only after that is a **summary-only** email sent through Database Mail, with the report's path on the VM.
 4. **If the check itself fails** (script error), a short `[FAILED]` email with the error is sent the same way.
 5. **If nothing worked**, the window shows `EMAIL NOT SENT` in red with every reason, the report opens in the browser (interactive runs), and the exit code is **4**, which Task Scheduler shows as *Last Run Result*.
 
@@ -112,6 +112,32 @@ SELECT name FROM sys.dm_xe_sessions WHERE name = 'DBA_PerfWindow';
 - **Top queries:** the plan cache is read once at the start and once at the end (a few seconds on a very large cache). `TopQueries = $false` skips it.
 
 **Limits of the top 20:** plans evicted or recompiled during the window and `OPTION (RECOMPILE)` statements aren't counted (anything over 5 s is still in the Extended Events list). **Always On:** run it on the VM hosting the primary to see the queues of every replica.
+
+## Several VMs, primary only, one email (SQL Agent job)
+
+For example 3 VMs with 3 instances each, in Always On AGs: **one run** checks every instance, writes **one report file per VM** and sends **one email with all the files attached**.
+
+**What gets checked (`-PrimaryOnly`):**
+- An instance is checked if it is **PRIMARY for at least one AG**, or has **no AG** (standalone). An AG with no primary (RESOLVING) also counts, so an outage is never silent.
+- An instance that is **SECONDARY for every AG** is listed in the summary as *skipped* and not checked.
+- For the instances checked, the full instance health check is kept (services, disks, error log, jobs, blocking, waits, ...). The **AG, database and listener tables keep only the AGs the instance is primary for**: AGs where it is secondary, and their databases, are left out (per-database I/O latency and Transactions/sec too). Databases that are in no AG stay.
+- The VM is the instance's physical host (`SERVERPROPERTY('ComputerNamePhysicalNetBIOS')`). Roles are read at the start; if an AG fails over during the window, the instance gets a warning in the report.
+- A VM with no primary or standalone instance still gets a (short) file, so the email always has one file per VM.
+
+**Setup on the server that runs it (the coordinator):**
+1. Copy `Run-PerfCheck-Agent.bat`, `Invoke-PerfCheck.ps1`, `PerfCheck.sql` to e.g. `C:\DBA\PerfCheck`.
+2. Copy `servers.example.txt` to `servers.txt` and list **every instance on every VM** (instance names, not listeners).
+3. In `$Config`: `IncludeLocalInstances = $false`, `Recipients`, and optionally `PrimaryOnly = $true` (or pass `-PrimaryOnly`).
+4. Run `CreateAgentJob_PerfCheck.sql` on that instance (set `@ScriptFolder`, `@Arguments`, `@ProxyName`, schedule). It creates a job with one **CmdExec** step: `cmd.exe /c ""C:\DBA\PerfCheck\Run-PerfCheck-Agent.bat" -PrimaryOnly -Label SCHEDULED"`.
+
+**Account and email:** the step runs as the Agent service account, or as an **Agent proxy** (a Windows account, recommended). That account needs the SQL permissions of the SETUP block on every instance (Windows login), or read access to the saved SQL login (`CredentialReaders`).
+- **Several files in one email through Database Mail** need **Windows authentication** and an instance with Database Mail on the **same server as the script**: Database Mail reads the files from its own server's disk, and doesn't allow file attachments for SQL logins. Each file must fit in `MaxFileSize`.
+- Otherwise set **`SmtpServer`**: the email is sent straight from the server with every file attached. This is also the way when the script runs on a jump host without SQL Server.
+- The order is: attached through Database Mail, then SMTP with the files, then a summary-only email through Database Mail (the reports stay in `Reports\`).
+
+**Job result:** `Run-PerfCheck-Agent.bat` maps the exit code for Agent: 0 OK, 1 warnings and 2 critical findings become **success** (the email went out); 3 script error and 4 email not sent **fail** the step. Set `SUCCESS_MAX=1` in the .bat to make critical findings fail the job too. Full log in `Logs\`, last step output in `AgentJobStep_output.txt`.
+
+**SSIS / SSRS / SSAS services** of the other VMs are read over CIM / WinRM (`RemoteBiServices`); if WinRM isn't open, the report shows a warning for that VM. Set `RemoteBiServices = $false` to skip them.
 
 ## Housekeeping
 
