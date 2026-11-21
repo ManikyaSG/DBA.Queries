@@ -63,11 +63,17 @@ To set up or repair Database Mail on an instance, use [`database_mail_setup.sql`
 
 1. **SQL login** - on **every instance** (every AG replica too), run the SETUP block at the top of `PerfCheck.sql` in SSMS as sysadmin, with your own password. It creates `dba_perfcheck` with only what the check needs: `VIEW SERVER STATE`, `VIEW ANY DEFINITION`, `ALTER SETTINGS`, `ALTER ANY EVENT SESSION`, read access to msdb (backup / job history) plus `DatabaseMailUserRole`, and EXECUTE on `xp_readerrorlog`. Optional lines in the block add read access to `SSISDB` and `ReportServer`. Missing access only skips that part, with a warning in the report. On AG replicas, create it with the **same SID** (shown in the block) so it keeps working after a failover. The instance must allow SQL authentication (mixed mode).
 2. **Config** - in `Invoke-PerfCheck.ps1` set `Recipients`, `MailProfile`, `PerfDatabases`, and if needed `SampleSec` / `DurationMin`.
-3. **First run** - double-click `Run-PerfCheck.bat`. It asks once for the `dba_perfcheck` password and offers to **save it on this VM**. After that, runs (and the scheduled task) don't ask anything.
+3. **First run** - double-click `Run-PerfCheck.bat` **as the Windows account that will run it later** (the scheduled task's or Agent proxy's account). It asks once for the `dba_perfcheck` password and offers to **save it for that account**. After that, its runs (and the job) don't ask anything.
 
-**How the password is stored:** in `PerfCheck.cred` next to the script, encrypted with Windows DPAPI (machine scope): it can only be decrypted on this VM, and the file is readable only by Administrators, SYSTEM and the account that saved it (add others in `CredentialReaders`, e.g. the scheduled task's account). Anyone who is an administrator on the VM can use it, which is why the login has only the permissions above. Use `Run-PerfCheck.bat -ResetCredential` to change it.
+**How the password is stored:** encrypted with Windows DPAPI, never in plain text. When the script runs, it's decrypted straight into a `SecureString` / `SqlCredential`, and never written to a connection string, the log or job history.
+- `CredentialScope = 'CurrentUser'` (default): file `PerfCheck.<account>.cred`. **Only the Windows account that saved it can decrypt it, and only on this VM**; a copy of the file is useless to anyone else. The NTFS permissions are limited to Administrators, SYSTEM and that account.
+- `CredentialScope = 'LocalMachine'`: file `PerfCheck.cred`. Any account on this VM that can read the file can decrypt it, so the NTFS permissions (Administrators, SYSTEM, the saver, `CredentialReaders`) are the only guard. Use this if the account running the job can't decrypt a CurrentUser file (DPAPI needs the account's user profile loaded).
+- What no stored-password method can prevent: an administrator on the VM, or anything that runs as that account, can recover the password. That's why the login has only the permissions above.
+- `Run-PerfCheck.bat -ResetCredential` to change it.
 
-**Fail-safe:** if the SQL login can't connect to an instance (mixed mode off, login missing, wrong password, or no `VIEW SERVER STATE`), that instance is checked with **Windows authentication** as the account running the script. The **ConnectedAs** column shows which one was used. `-WindowsAuth` skips the SQL login completely.
+**Fail-safe:** if the SQL login can't connect to an instance (mixed mode off, login missing, wrong password, or no `VIEW SERVER STATE`), that instance is checked with **Windows authentication** as the account running the script. The **ConnectedAs** column shows which one was used. `-WindowsAuth` skips the SQL login completely. **`SqlAuthOnly = $true`** turns the fail-safe off: the instances are reached only with the SQL login, and an instance where it fails is reported as FAILED.
+
+**Everything else runs as the Windows account running the script:** writing the reports and logs, reading SSIS / SSRS / SSAS services on other VMs, SMTP, and (with `MailWindowsAuth = $true`, the default) Database Mail on an instance on **this** machine. That's the one Windows connection to SQL Server, and it's what allows the report files to be attached; if it fails, the email goes out through the SQL login instead (summary, or one report as a query result).
 
 ## Run it
 
@@ -86,7 +92,7 @@ Start it when the load test starts; with the defaults the email arrives about 31
 
 ## Schedule it (Windows Task Scheduler)
 
-1. Save the SQL login once (first run above). If the task will run as a different account, add it to `CredentialReaders` and run `Run-PerfCheck.bat -ResetCredential` to save the file again.
+1. Save the SQL login once **as the account the task runs as** (first run above, e.g. from `runas /user:<account> cmd`). With `CredentialScope = 'LocalMachine'` instead, add the task's account to `CredentialReaders` and save it again with `Run-PerfCheck.bat -ResetCredential`.
 2. Task Scheduler > **Create Task**:
    - **General:** run as the account the task should use, *Run whether user is logged on or not*.
    - **Triggers:** when you want it (daily, weekly, once at the test start time).
@@ -130,8 +136,10 @@ For example 3 VMs with 3 instances each, in Always On AGs: **one run** checks ev
 3. In `$Config`: `IncludeLocalInstances = $false`, `Recipients`, and optionally `PrimaryOnly = $true` (or pass `-PrimaryOnly`).
 4. Run `CreateAgentJob_PerfCheck.sql` on that instance (set `@ScriptFolder`, `@Arguments`, `@ProxyName`, schedule). It creates a job with one **CmdExec** step: `cmd.exe /c ""C:\DBA\PerfCheck\Run-PerfCheck-Agent.bat" -PrimaryOnly -Label SCHEDULED"`.
 
-**Account and email:** the step runs as the Agent service account, or as an **Agent proxy** (a Windows account, recommended). That account needs the SQL permissions of the SETUP block on every instance (Windows login), or read access to the saved SQL login (`CredentialReaders`).
-- **Several files in one email through Database Mail** need **Windows authentication** and an instance with Database Mail on the **same server as the script**: Database Mail reads the files from its own server's disk, and doesn't allow file attachments for SQL logins. Each file must fit in `MaxFileSize`.
+**Accounts:** the step runs as an **Agent proxy** (a Windows / domain account, e.g. `EMEA\Admin.partner.db`). Recommended split:
+- **SQL login `dba_perfcheck`** (`SqlAuthOnly = $true`) for every connection to the instances that collects data. Created with the SETUP block of `PerfCheck.sql` on every instance; its password is saved once **as the proxy's account** (`CredentialScope = 'CurrentUser'`), so only that account can decrypt it.
+- **The proxy's Windows account** for everything else: files, reading the other VMs' services, and sending the email.
+- **Several files in one email through Database Mail** need a **Windows login** and an instance with Database Mail on the **same server as the script** (`MailWindowsAuth = $true`, `MailInstance`): Database Mail reads the files from its own server's disk, and doesn't allow file attachments for SQL logins. Give the proxy's account a Windows login on that one instance with `DatabaseMailUserRole` in msdb. Each file must fit in `MaxFileSize`.
 - Otherwise set **`SmtpServer`**: the email is sent straight from the server with every file attached. This is also the way when the script runs on a jump host without SQL Server.
 - The order is: attached through Database Mail, then SMTP with the files, then a summary-only email through Database Mail (the reports stay in `Reports\`).
 

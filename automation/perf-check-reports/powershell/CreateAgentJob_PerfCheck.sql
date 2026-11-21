@@ -11,22 +11,21 @@
            PowerShell allowed on this server. Run this script as sysadmin.
 
  Who the step runs as (CmdExec):
-   @ProxyName = NULL -> the SQL Server Agent service account. It needs, on every
-                        instance it checks: either Windows login + the permissions of
-                        the SETUP block in PerfCheck.sql, or read access to the saved
-                        SQL login file (PerfCheck.cred, see CredentialReaders).
-   @ProxyName = 'x'  -> an Agent proxy that runs as a Windows (domain) account, e.g. a
-                        DBA service account that already has the SQL permissions on
-                        all instances. Recommended. One-time setup (example):
+   @ProxyName = 'x'  -> an Agent proxy that runs as a Windows (domain) account, e.g.
+                        EMEA\Admin.partner.db. Recommended. One-time setup (example):
        USE master;
-       CREATE CREDENTIAL [PerfCheckCred] WITH IDENTITY = N'DOMAIN\svc_sqlperf', SECRET = N'<password>';
+       CREATE CREDENTIAL [PerfCheckCred] WITH IDENTITY = N'EMEA\Admin.partner.db', SECRET = N'<its Windows password>';
        USE msdb;
        EXEC dbo.sp_add_proxy @proxy_name = N'PerfCheckProxy', @credential_name = N'PerfCheckCred', @enabled = 1;
        EXEC dbo.sp_grant_proxy_to_subsystem @proxy_name = N'PerfCheckProxy', @subsystem_name = N'CmdExec';
-   With a SQL login, Database Mail can attach only ONE report (as a query result):
-   for one email with several VM files use Windows authentication (-WindowsAuth, or
-   the SQL login not saved) and an instance on THIS server for Database Mail, or set
-   SmtpServer in Invoke-PerfCheck.ps1.
+   @ProxyName = NULL -> the SQL Server Agent service account.
+ Connections to the instances use the SQL login dba_perfcheck (SqlAuthOnly = $true in
+ Invoke-PerfCheck.ps1). Save its password once AS the proxy's account (run
+ Run-PerfCheck.bat interactively as that account): with CredentialScope = 'CurrentUser'
+ only that account can decrypt it. Everything else (files, other VMs' services, the
+ email) runs as the proxy's account. For one email with several VM files, Database Mail
+ needs a Windows login: give the proxy's account a login on THIS instance with msdb
+ DatabaseMailUserRole (MailWindowsAuth = $true, MailInstance), or set SmtpServer.
 
  Job step exit code: Run-PerfCheck-Agent.bat returns 0 when the check ran and the
  email went out (OK, warnings or critical findings) and fails the step on a script
@@ -39,7 +38,7 @@ DECLARE
     @JobName         sysname        = N'DBA - Health & Performance Check (all VMs)',
     @ScriptFolder    nvarchar(260)  = N'C:\DBA\PerfCheck',          -- folder with Run-PerfCheck-Agent.bat on THIS server (no trailing \)
     @Arguments       nvarchar(1000) = N'-PrimaryOnly -Label SCHEDULED',
-                                    -- passed to Invoke-PerfCheck.ps1, e.g. add -SampleSec 60 -DurationMin 30, -NoPerf, -WindowsAuth
+                                    -- passed to Invoke-PerfCheck.ps1, e.g. add -SampleSec 60 -DurationMin 30, -NoPerf
                                     -- (don't add -Unattended: the .bat adds it)
     @ProxyName       sysname        = NULL,                         -- Agent proxy (Windows account) for the CmdExec step; NULL = Agent service account
     @Schedule        varchar(10)    = 'DAILY',                      -- DAILY | WEEKLY | ONCE | NONE (no schedule, run on demand)

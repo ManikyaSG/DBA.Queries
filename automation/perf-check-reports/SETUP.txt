@@ -5,56 +5,84 @@
  Files: automation/perf-check-reports/powershell  (+ database_mail_setup.sql)
 ===============================================================================
 
-Assumption: Windows authentication through an Agent proxy account. That is what
-lets Database Mail attach all the VM files to one email (Database Mail doesn't
-allow file attachments for SQL logins).
+Accounts:
+  - SQL login dba_perfcheck .... ONLY for connecting to the instances (collecting data)
+  - EMEA\Admin.partner.db ...... everything else: runs PowerShell / the Agent job,
+                                 writes the files, reads the other VMs' services,
+                                 sends the email
+The dba_perfcheck password is saved encrypted (Windows DPAPI) so that ONLY
+EMEA\Admin.partner.db, on the coordinator, can decrypt it.
 
 -------------------------------------------------------------------------------
  1. CHOOSE THE COORDINATOR AND COPY THE FILES
 -------------------------------------------------------------------------------
 Pick ONE SQL instance with SQL Agent to run the job (the coordinator).
-(Jump host without SQL Server instead? Steps 2-4 still apply, but schedule it in
- Windows Task Scheduler and set SmtpServer in step 3.)
 
 From the repo folder automation/perf-check-reports/powershell, copy to e.g.
 C:\DBA\PerfCheck on the coordinator:
 
     Invoke-PerfCheck.ps1
     PerfCheck.sql
-    Run-PerfCheck-Agent.bat
-    servers.example.txt        -> save as servers.txt
+    Run-PerfCheck.bat              (to save the password, step 4)
+    Run-PerfCheck-Agent.bat        (used by the job)
+    servers.example.txt        ->  save as servers.txt
 
 CreateAgentJob_PerfCheck.sql and database_mail_setup.sql are only opened in
 SSMS; they don't have to be on that disk.
 
 -------------------------------------------------------------------------------
- 2. SERVICE ACCOUNT WITH SQL ACCESS ON ALL 9 INSTANCES
+ 2. SQL LOGIN dba_perfcheck ON ALL 9 INSTANCES
 -------------------------------------------------------------------------------
-Use a domain account, e.g. DOMAIN\svc_sqlperf. Run on EVERY instance, including
-secondaries, so it keeps working after a failover (same permissions as the
-SETUP block in PerfCheck.sql, for a Windows login):
+Every instance must allow SQL authentication (mixed mode):
+
+    SELECT SERVERPROPERTY('IsIntegratedSecurityOnly');   -- 0 = mixed mode
+
+Run the SETUP block at the top of PerfCheck.sql on EVERY instance, including
+secondaries, as sysadmin, with a strong password (CHECK_POLICY = ON).
+On AG replicas create it with the SAME SID everywhere (shown in the block), so it
+keeps working after a failover.
+
+The login gets only: VIEW SERVER STATE, VIEW ANY DEFINITION, ALTER SETTINGS,
+ALTER ANY EVENT SESSION, msdb read + DatabaseMailUserRole, EXECUTE on xp_readerrorlog.
+  - ALTER SETTINGS is the broadest one (it allows changing any server setting).
+    It's only used to lower 'blocked process threshold' during the window and put
+    it back. Leave it out to be safer: the check still runs, but blocking is then
+    captured only if the threshold is already set on that instance.
+  - Never make it sysadmin.
+
+-------------------------------------------------------------------------------
+ 3. EMEA\Admin.partner.db ON THE COORDINATOR
+-------------------------------------------------------------------------------
+a) Folder: MODIFY rights on C:\DBA\PerfCheck (it writes Reports\, Logs\ and the
+   saved password file).
+b) Windows right "Log on as a batch job" - probably needed to run as an Agent
+   proxy (not confirmed - check this if the job step doesn't start).
+c) Windows login on the COORDINATOR instance only, to send the email with the
+   files attached (Database Mail doesn't allow attachments for SQL logins):
 
     USE master;
-    IF SUSER_ID(N'DOMAIN\svc_sqlperf') IS NULL CREATE LOGIN [DOMAIN\svc_sqlperf] FROM WINDOWS;
-    GRANT VIEW SERVER STATE, ALTER SETTINGS, ALTER ANY EVENT SESSION, VIEW ANY DEFINITION TO [DOMAIN\svc_sqlperf];
-    IF USER_ID(N'DOMAIN\svc_sqlperf') IS NULL CREATE USER [DOMAIN\svc_sqlperf] FOR LOGIN [DOMAIN\svc_sqlperf];
-    GRANT EXECUTE ON sys.xp_readerrorlog TO [DOMAIN\svc_sqlperf];
+    IF SUSER_ID(N'EMEA\Admin.partner.db') IS NULL CREATE LOGIN [EMEA\Admin.partner.db] FROM WINDOWS;
     USE msdb;
-    IF USER_ID(N'DOMAIN\svc_sqlperf') IS NULL CREATE USER [DOMAIN\svc_sqlperf] FOR LOGIN [DOMAIN\svc_sqlperf];
-    ALTER ROLE db_datareader ADD MEMBER [DOMAIN\svc_sqlperf];
-    ALTER ROLE DatabaseMailUserRole ADD MEMBER [DOMAIN\svc_sqlperf];
+    IF USER_ID(N'EMEA\Admin.partner.db') IS NULL CREATE USER [EMEA\Admin.partner.db] FOR LOGIN [EMEA\Admin.partner.db];
+    ALTER ROLE DatabaseMailUserRole ADD MEMBER [EMEA\Admin.partner.db];
 
-On the coordinator server:
-  - give the account MODIFY rights on C:\DBA\PerfCheck (it writes Reports\ and Logs\)
-  - it probably also needs the Windows right "Log on as a batch job" to run as an
-    Agent proxy (not confirmed - check this if the job step doesn't start)
+   (No SQL Server rights are needed on the other 8 instances: data is collected
+    with dba_perfcheck.)
+   No Windows login at all? Set SmtpServer in step 5 instead and
+   MailWindowsAuth = $false.
+d) SSIS / SSRS / SSAS service state of the other 2 VMs is read over CIM / WinRM
+   as this account (remote management rights on those VMs). Not allowed? Set
+   RemoteBiServices = $false in step 5.
 
 -------------------------------------------------------------------------------
- 3. DATABASE MAIL AND CONFIG
+ 4. DATABASE MAIL ON THE COORDINATOR
 -------------------------------------------------------------------------------
-On the COORDINATOR instance: run database_mail_setup.sql with @MaxFileSizeMB = 10
+Run database_mail_setup.sql on the coordinator instance with @MaxFileSizeMB = 10
 (a report covering 3 instances can be bigger than the default limit of about 1 MB).
 
+-------------------------------------------------------------------------------
+ 5. CONFIG
+-------------------------------------------------------------------------------
 servers.txt - one INSTANCE per line, instance names, not listeners:
 
     SQLVM1\INST1
@@ -71,28 +99,44 @@ $Config at the top of Invoke-PerfCheck.ps1:
     MailProfile           = the profile from database_mail_setup.sql
     IncludeLocalInstances = $false
     PrimaryOnly           = $true      (or pass -PrimaryOnly)
-    RemoteBiServices      = $false     only if WinRM between the VMs is blocked
-                                       (otherwise each VM shows a warning instead of
-                                        its SSIS / SSRS / SSAS service state)
-    SmtpServer            = only for the jump host option, or as a backup way to send
+    SqlLogin              = 'dba_perfcheck'
+    SqlAuthOnly           = $true      instances ONLY with the SQL login, never Windows
+    CredentialScope       = 'CurrentUser'   only the saving account can decrypt it
+    MailWindowsAuth       = $true      email as EMEA\Admin.partner.db (attachments)
+    MailInstance          = 'SQLVM1\INST1'  the coordinator instance (example)
+    Encrypt               = $true      optional: encrypt the connections
+    RemoteBiServices      = $false     only if WinRM to the other VMs isn't allowed
+    SmtpServer            = only if Database Mail can't be used
 
 -------------------------------------------------------------------------------
- 4. TEST BY HAND AS THE SERVICE ACCOUNT
+ 6. SAVE THE dba_perfcheck PASSWORD - AS EMEA\Admin.partner.db
 -------------------------------------------------------------------------------
-On the coordinator:
+On the coordinator, open a command prompt AS the account that runs the job:
 
-    runas /user:DOMAIN\svc_sqlperf cmd
+    runas /user:EMEA\Admin.partner.db cmd
     cd /d C:\DBA\PerfCheck
-    Run-PerfCheck-Agent.bat -PrimaryOnly -WindowsAuth -NoPerf -Label TEST
+    Run-PerfCheck.bat -PrimaryOnly -NoPerf -Label TEST
 
-When that works, a short performance window:
+It asks for the dba_perfcheck password -> enter it -> answer Y to save it.
+It is saved as C:\DBA\PerfCheck\PerfCheck.EMEA_Admin.partner.db.cred:
+  - encrypted with Windows DPAPI for EMEA\Admin.partner.db on this VM only
+    (no other account can decrypt it; a copy of the file is useless elsewhere)
+  - NTFS: only Administrators, SYSTEM and EMEA\Admin.partner.db
+  - decrypted only into memory (SecureString) when the check runs; never written
+    to a connection string, the log or job history
+  - change it later: Run-PerfCheck.bat -ResetCredential (as the same account)
+What it can't prevent: an administrator on the coordinator, or anything running
+as EMEA\Admin.partner.db, can recover it. Hence the minimal rights in step 2.
 
-    Run-PerfCheck-Agent.bat -PrimaryOnly -WindowsAuth -SampleSec 10 -DurationMin 2 -Label TEST
-
-Check:
+That same run is the first test. Check:
   - ONE email arrives with 3 attachments (one .html per VM)
+  - ConnectedAs shows "SQL: dba_perfcheck" for every instance
   - secondary-only instances are listed as skipped
   - AG tables show only the AGs where that instance is primary
+
+Then a short performance window:
+
+    Run-PerfCheck.bat -PrimaryOnly -SampleSec 10 -DurationMin 2 -Label TEST
 
 On every instance, nothing left behind:
 
@@ -100,10 +144,10 @@ On every instance, nothing left behind:
     SELECT name FROM sys.dm_xe_sessions WHERE name = 'DBA_PerfWindow';   -- no rows
 
 -------------------------------------------------------------------------------
- 5. PROXY AND JOB (ON THE COORDINATOR)
+ 7. PROXY AND JOB (ON THE COORDINATOR)
 -------------------------------------------------------------------------------
     USE master;
-    CREATE CREDENTIAL [PerfCheckCred] WITH IDENTITY = N'DOMAIN\svc_sqlperf', SECRET = N'<password>';
+    CREATE CREDENTIAL [PerfCheckCred] WITH IDENTITY = N'EMEA\Admin.partner.db', SECRET = N'<its Windows password>';
     USE msdb;
     EXEC dbo.sp_add_proxy @proxy_name = N'PerfCheckProxy', @credential_name = N'PerfCheckCred', @enabled = 1;
     EXEC dbo.sp_grant_proxy_to_subsystem @proxy_name = N'PerfCheckProxy', @subsystem_name = N'CmdExec';
@@ -111,7 +155,7 @@ On every instance, nothing left behind:
 Open CreateAgentJob_PerfCheck.sql, set the values at the top and run it:
 
     @ScriptFolder = N'C:\DBA\PerfCheck'
-    @Arguments    = N'-PrimaryOnly -WindowsAuth -Label SCHEDULED'
+    @Arguments    = N'-PrimaryOnly -Label SCHEDULED'
     @ProxyName    = N'PerfCheckProxy'
     @Schedule, @StartTime, and optionally @NotifyOperator
 
@@ -128,12 +172,22 @@ With the defaults the job runs about 31-35 minutes. Where to look:
 -------------------------------------------------------------------------------
  IF SOMETHING GOES WRONG
 -------------------------------------------------------------------------------
+Job fails at once: "No saved SQL login for EMEA\Admin.partner.db"
+    -> step 6 wasn't done as EMEA\Admin.partner.db (the file name shows the account).
+Job log: "Saved SQL login ... could not be read"
+    -> under the Agent proxy the account's user profile may not be loaded, which
+       DPAPI CurrentUser needs. Fallback: CredentialScope = 'LocalMachine',
+       CredentialReaders = @('EMEA\Admin.partner.db'), then save it again with
+       Run-PerfCheck.bat -ResetCredential (as EMEA\Admin.partner.db). Then any
+       account on this VM that can read PerfCheck.cred could decrypt it; the NTFS
+       permissions are the guard.
 Email has only a summary, no attachments
-    -> the step output says why: usually a file above MaxFileSize, or the run
-       used a SQL login instead of Windows authentication.
+    -> the step output says why: usually EMEA\Admin.partner.db has no login /
+       DatabaseMailUserRole on the coordinator (step 3c), or a file is above
+       MaxFileSize (step 4).
 An instance shows FAILED
-    -> usually firewall, named-instance port, or login between the coordinator
-       and that VM.
+    -> dba_perfcheck missing / wrong password / mixed mode off on that instance,
+       or firewall / named-instance port between the coordinator and that VM.
 Job step fails with exit code 3 or 4
     -> read the newest file in Logs\. (3 = script error, 4 = no email sent.
        0, 1 and 2 count as success: the email went out.)

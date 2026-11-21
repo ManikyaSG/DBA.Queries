@@ -35,11 +35,20 @@
                    grants, top tempdb users; every deadlock process + the graph as .xdl files
 
     Login: a dedicated SQL login (default dba_perfcheck, created once with the SETUP block at
-    the top of PerfCheck.sql). The first run asks for its password and can save it on this VM
-    (encrypted with Windows DPAPI, machine scope - only usable on this VM) so later runs and the
-    scheduled task need no prompt. Fail-safe: if the SQL login can't connect to an instance
-    (mixed mode off, login missing, wrong password, no VIEW SERVER STATE) that instance is
-    checked with Windows authentication as the account running the script.
+    the top of PerfCheck.sql). The first run asks for its password and can save it encrypted
+    with Windows DPAPI. CredentialScope 'CurrentUser' (default): only the Windows account that
+    saved it can decrypt it, on this VM only (file PerfCheck.<account>.cred) - save it while
+    running as the account that runs the job. 'LocalMachine': any account on this VM that can
+    read the file (PerfCheck.cred, NTFS limited to Administrators, SYSTEM, the saver and
+    CredentialReaders). The password is decrypted straight into a SecureString / SqlCredential;
+    it is never written to a connection string, the log or job history.
+    SqlAuthOnly = $true: instances are reached ONLY with the SQL login (no Windows fallback).
+    Otherwise, fail-safe: if the SQL login can't connect to an instance (mixed mode off, login
+    missing, wrong password, no VIEW SERVER STATE) that instance is checked with Windows
+    authentication as the account running the script.
+    Everything else runs as the Windows account running the script: files, reading SSIS /
+    SSRS / SSAS services on other VMs, SMTP, and (MailWindowsAuth) Database Mail on an instance
+    on THIS machine, which is what allows file attachments (not allowed for SQL logins).
 
     Server changes during the window, always put back: 'blocked process threshold (s)' and the
     XE session DBA_PerfWindow (needs ALTER SETTINGS / ALTER ANY EVENT SESSION, else read-only).
@@ -93,8 +102,14 @@ $Config = @{
     ReportTitle           = 'SQL Server Health & Performance Check'
 
     SqlLogin              = 'dba_perfcheck'              # dedicated SQL login (see SETUP in PerfCheck.sql)
-    CredentialFile        = Join-Path $PSScriptRoot 'PerfCheck.cred'   # saved, DPAPI-encrypted password (this VM only)
-    CredentialReaders     = @()      # extra Windows accounts allowed to read the saved login, e.g. the scheduled task's account @('DOMAIN\svc_sqltask')
+    CredentialScope       = 'CurrentUser'                # 'CurrentUser' = only the saving Windows account can decrypt it (file PerfCheck.<account>.cred)
+                                                         # 'LocalMachine' = any account on this VM that can read CredentialFile
+    CredentialFile        = Join-Path $PSScriptRoot 'PerfCheck.cred'   # LocalMachine scope file (also read as a fallback for older saves)
+    CredentialReaders     = @()      # LocalMachine scope only: extra Windows accounts allowed to read the file, e.g. @('DOMAIN\svc_sqltask')
+    SqlAuthOnly           = $false   # $true = connect to the instances ONLY with the SQL login (no Windows authentication fallback)
+    MailWindowsAuth       = $true    # send Database Mail as the Windows account running the script on an instance on THIS machine
+                                     # (needed to attach the report files); falls back to the SQL login (summary / one report)
+    MailInstance          = ''       # instance on THIS machine to send the email from, e.g. 'SQLVM1\INST1' ('' = an instance from the list on this machine)
 
     SampleSec             = 60       # seconds between samples
     DurationMin           = 30       # length of the window in minutes
@@ -712,36 +727,56 @@ function Invoke-Cleanup {
     if ($n) { Write-Step "Cleanup    : $n report/log file(s) older than $($Config.CleanupHours) h removed" 'DarkGray' }
 }
 
-# ---- SQL login: saved with DPAPI (LocalMachine scope = usable by any account on THIS VM only) ----
+# ---- SQL login: saved with DPAPI. CurrentUser scope = only the saving Windows account on THIS VM;
+#      LocalMachine scope = any account on THIS VM that can read the file (NTFS restricted). ----
 Add-Type -AssemblyName System.Security
 $script:Entropy = [System.Text.Encoding]::UTF8.GetBytes('DBA.PerfCheck.v1')
+$script:RunAs = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+function Get-CredentialPath([string]$Scope) {
+    if ($Scope -eq 'CurrentUser') { return (Join-Path $PSScriptRoot ('PerfCheck.{0}.cred' -f (Get-SafeFileName ($script:RunAs -replace '\\', '_')))) }
+    return $Config.CredentialFile
+}
 
 function Save-SqlCredential([pscredential]$Credential) {
+    $scope = if ($Config.CredentialScope -eq 'LocalMachine') { 'LocalMachine' } else { 'CurrentUser' }
+    $path = Get-CredentialPath $scope
     $plain = [System.Text.Encoding]::UTF8.GetBytes($Credential.GetNetworkCredential().Password)
     try {
-        $enc = [System.Security.Cryptography.ProtectedData]::Protect($plain, $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-        $obj = @{ user = $Credential.UserName; pwd = [Convert]::ToBase64String($enc); saved_by = "$env:USERDOMAIN\$env:USERNAME"; saved_at = (Get-Date -Format 'yyyy-MM-dd HH:mm') }
-        [System.IO.File]::WriteAllText($Config.CredentialFile, (ConvertTo-Json -InputObject $obj -Compress))
-        # Only administrators and SYSTEM may read it (plus the account that saved it)
-        $grants = @('*S-1-5-32-544:F', '*S-1-5-18:F', "$env:USERDOMAIN\$($env:USERNAME):F") + @($Config.CredentialReaders | Where-Object { $_ } | ForEach-Object { "$($_):R" })
-        try { $ErrorActionPreference = 'Continue'; & icacls.exe "$($Config.CredentialFile)" /inheritance:r /grant:r @grants 2>&1 | Out-Null } catch { } finally { $ErrorActionPreference = 'Stop' }
-        Write-Step "SQL login saved for this VM: $($Config.CredentialFile)" 'Green'
+        $enc = [System.Security.Cryptography.ProtectedData]::Protect($plain, $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::$scope)
+        $obj = @{ user = $Credential.UserName; pwd = [Convert]::ToBase64String($enc); scope = $scope; saved_by = $script:RunAs; saved_at = (Get-Date -Format 'yyyy-MM-dd HH:mm') }
+        [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $obj -Compress))
+        # NTFS: Administrators, SYSTEM and the saving account (+ CredentialReaders for the LocalMachine scope)
+        $grants = @('*S-1-5-32-544:F', '*S-1-5-18:F', "$($script:RunAs):F")
+        if ($scope -eq 'LocalMachine') { $grants += @($Config.CredentialReaders | Where-Object { $_ } | ForEach-Object { "$($_):R" }) }
+        try { $ErrorActionPreference = 'Continue'; & icacls.exe "$path" /inheritance:r /grant:r @grants 2>&1 | Out-Null } catch { } finally { $ErrorActionPreference = 'Stop' }
+        $who = if ($scope -eq 'CurrentUser') { ", only $($script:RunAs) can read it" } else { '' }
+        Write-Step "SQL login saved ($scope scope$who): $path" 'Green'
     }
     finally { [Array]::Clear($plain, 0, $plain.Length) }
 }
 
 function Read-SqlCredential {
-    if (-not (Test-Path -LiteralPath $Config.CredentialFile)) { return $null }
-    try {
-        $obj = Get-Content -LiteralPath $Config.CredentialFile -Raw | ConvertFrom-Json
-        $dec = [System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($obj.pwd), $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-        $ss = New-Object System.Security.SecureString
-        foreach ($ch in [System.Text.Encoding]::UTF8.GetString($dec).ToCharArray()) { $ss.AppendChar($ch) }
-        [Array]::Clear($dec, 0, $dec.Length)
-        Write-Step "SQL login  : $($obj.user) (saved by $($obj.saved_by) on $($obj.saved_at))" 'DarkGray'
-        return New-Object System.Management.Automation.PSCredential ([string]$obj.user, $ss)
+    # The CurrentUser file of the account running the script first, then the LocalMachine file
+    foreach ($path in @((Get-CredentialPath 'CurrentUser'), $Config.CredentialFile) | Select-Object -Unique) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $obj = $null
+        try {
+            $obj = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $scope = if ($obj.scope -eq 'CurrentUser') { 'CurrentUser' } else { 'LocalMachine' }
+            $dec = [System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($obj.pwd), $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::$scope)
+            $ss = New-Object System.Security.SecureString
+            foreach ($ch in [System.Text.Encoding]::UTF8.GetString($dec).ToCharArray()) { $ss.AppendChar($ch) }
+            [Array]::Clear($dec, 0, $dec.Length); $ss.MakeReadOnly()
+            Write-Step "SQL login  : $($obj.user) ($scope scope, saved by $($obj.saved_by) on $($obj.saved_at))" 'DarkGray'
+            return New-Object System.Management.Automation.PSCredential ([string]$obj.user, $ss)
+        }
+        catch {
+            $hint = if ($obj -and $obj.scope -eq 'CurrentUser') { " Only $($obj.saved_by) can read it, with its user profile loaded (if a SQL Agent proxy can't, set CredentialScope = 'LocalMachine' and save it again)." } else { '' }
+            Write-Step "Saved SQL login $path could not be read ($($_.Exception.Message)).$hint Run with -ResetCredential to save it again." 'Yellow'
+        }
     }
-    catch { Write-Step "Saved SQL login could not be read ($($_.Exception.Message)) - run with -ResetCredential." 'Yellow'; return $null }
+    return $null
 }
 
 function New-SqlConnection([string]$Instance, [pscredential]$SqlCred) {
@@ -835,9 +870,15 @@ function Remove-SecondaryRows($Snap, $Role) {
     }
 }
 
-function Open-SqlConnection([string]$Instance) {
-    # 1st: the SQL login. Fail-safe: Windows authentication as the account running the script.
-    $notes = @(); $win = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+function Open-SqlConnection([string]$Instance, [switch]$Windows) {
+    # 1st: the SQL login. Fail-safe (unless SqlAuthOnly): Windows authentication as the account running the script.
+    # -Windows: Windows authentication only (Database Mail with file attachments).
+    $notes = @(); $win = $script:RunAs
+    if ($Windows) {
+        $conn = New-SqlConnection $Instance $null
+        try { $conn.Open() } catch { $conn.Dispose(); throw "$($win): $($_.Exception.Message)" }
+        return [pscustomobject]@{ Connection = $conn; As = "Windows: $win" }
+    }
     if ($script:SqlCred) {
         $conn = New-SqlConnection $Instance $script:SqlCred
         try {
@@ -846,8 +887,10 @@ function Open-SqlConnection([string]$Instance) {
             $notes += "$($script:SqlCred.UserName) has no VIEW SERVER STATE"; $conn.Dispose()
         }
         catch { $notes += "$($script:SqlCred.UserName): $($_.Exception.Message)"; $conn.Dispose() }
+        if ($Config.SqlAuthOnly) { throw "SQL login only (SqlAuthOnly): $($notes -join '; ')" }
         Write-Step "  SQL login can't be used on $Instance ($($notes -join '; ')) - trying Windows authentication as $win" 'Yellow'
     }
+    elseif ($Config.SqlAuthOnly) { throw "SQL login only (SqlAuthOnly), but no SQL login is saved for $win" }
     $conn = New-SqlConnection $Instance $null
     try { $conn.Open() } catch { $conn.Dispose(); throw ((@($notes) + "$($win): $($_.Exception.Message)") -join ' | ') }
     if (-not (Test-SqlAccess $conn)) { Write-Step "  WARNING: $win has no VIEW SERVER STATE on $Instance - most metrics will be empty." 'Yellow' }
@@ -1014,10 +1057,26 @@ function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$Bod
             }
             continue
         }
-        foreach ($sender in @($Candidates | Sort-Object @{ Expression = { -not $_.Local } })) {
+        $senders = @($Candidates | Sort-Object @{ Expression = { -not $_.Local } })
+        if ($Config.MailInstance) { $senders = @([pscustomobject]@{ Instance = $Config.MailInstance; Profile = ''; Local = $true }) + @($senders | Where-Object { $_.Instance -ne $Config.MailInstance }) }
+        foreach ($sender in $senders) {
             $c = $null
             try {
-                $oc = Open-SqlConnection $sender.Instance; $c = $oc.Connection
+                $oc = $null
+                if ($Config.MailWindowsAuth -and $sender.Local) {
+                    # Windows account running the script: Database Mail allows file attachments only for Windows logins
+                    try {
+                        $oc = Open-SqlConnection $sender.Instance -Windows
+                        $wp = Get-MailProfileName $oc.Connection
+                        if ($wp) { $sender = [pscustomobject]@{ Instance = $sender.Instance; Profile = $wp; Local = $true } }
+                        else { Write-Step "  $($sender.Instance): no usable Database Mail profile for $($script:RunAs) (msdb DatabaseMailUserRole / public profile) - using the SQL login." 'DarkGray'; $oc.Connection.Dispose(); $oc = $null }
+                    } catch { Write-Step "  $($sender.Instance): Windows authentication for Database Mail failed ($($_.Exception.Message)) - using the SQL login." 'DarkGray'; $oc = $null }
+                }
+                if (-not $oc) {
+                    if (-not $sender.Profile) { continue }
+                    $oc = Open-SqlConnection $sender.Instance
+                }
+                $c = $oc.Connection
                 $isSqlLogin = ([string]$oc.As) -like 'SQL:*'
                 $maxBytes = 0
                 try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
@@ -1100,17 +1159,22 @@ try {
 
     # ---- SQL login ----
     $script:SqlCred = $null
-    if ($ResetCredential -and (Test-Path -LiteralPath $Config.CredentialFile)) { Remove-Item -LiteralPath $Config.CredentialFile -Force; Write-Step 'Saved SQL login removed.' 'Yellow' }
+    if ($WindowsAuth -and $Config.SqlAuthOnly) { throw '-WindowsAuth and SqlAuthOnly = $true contradict each other.' }
+    if ($ResetCredential) {
+        $rp = Get-CredentialPath $(if ($Config.CredentialScope -eq 'LocalMachine') { 'LocalMachine' } else { 'CurrentUser' })
+        if (Test-Path -LiteralPath $rp) { Remove-Item -LiteralPath $rp -Force; Write-Step "Saved SQL login removed: $rp" 'Yellow' }
+    }
     if (-not $WindowsAuth) {
-        $script:SqlCred = Read-SqlCredential
+        if (-not $ResetCredential) { $script:SqlCred = Read-SqlCredential }   # -ResetCredential: ask again
         if (-not $script:SqlCred -and -not $Unattended) {
             Write-Step "No saved SQL login. Enter the password for '$($Config.SqlLogin)' (or Cancel for Windows authentication as $me)." 'Yellow'
             try { $script:SqlCred = Get-Credential -UserName $Config.SqlLogin -Message "SQL login for the performance check (SQL authentication). Cancel = Windows authentication as $me" } catch { $script:SqlCred = $null }
             if ($script:SqlCred) {
-                $ans = Read-Host 'Save it on this VM so later runs and the scheduled task do not ask? (Y/N)'
+                $ans = Read-Host $(if ($Config.CredentialScope -eq 'LocalMachine') { 'Save it on this VM so later runs and the scheduled task do not ask? (Y/N)' } else { "Save it encrypted for $($script:RunAs) on this VM (only this account can read it), so its later runs and the job don't ask? (Y/N)" })
                 if ($ans -match '^[Yy]') { Save-SqlCredential $script:SqlCred }
             }
         }
+        if (-not $script:SqlCred -and $Config.SqlAuthOnly) { throw "No saved SQL login for $($script:RunAs) (SqlAuthOnly). Run Run-PerfCheck.bat once interactively AS $($script:RunAs) and save the password." }
         if (-not $script:SqlCred) { Write-Step "Using Windows authentication as $me" 'Yellow' }
     }
 
