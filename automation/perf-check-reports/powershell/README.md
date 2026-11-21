@@ -12,9 +12,9 @@ For **every SQL Server instance on the VM**: a **health check** (including SSIS 
 
 ## Health check (once, at the start)
 
-Instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery model, compat, owner, size, log use, last full / diff / log backup, AG role), Always On replicas, listeners (IP, static / DHCP) and databases per replica, cluster and quorum, disk space, failed job steps (24 h), severe error log entries (24 h), sp_configure, trace flags, linked servers, endpoints, certificates, XE sessions, **SSIS** (catalog settings, projects, environments, failed executions 24 h), **SSRS** (content and subscriptions of the report server databases on the instance), and once for the VM the **SSIS / SSRS / SSAS services** and **SSAS databases**. Problems go into a *Needs attention* table per instance.
+Instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery model, compat, owner, size, log use, last full / diff / log backup, AG role), Always On replicas, listeners (IP, static / DHCP) and databases per replica, cluster and quorum, disk space, failed job steps (24 h), severe error log entries (24 h), sp_configure, linked servers, endpoints, certificates, XE sessions, **SSIS / SSRS** failures (failed package executions, failing subscriptions, failed report executions, under *Needs attention*), and once for the VM the **SSIS / SSRS / SSAS services** and **SSAS databases**. Problems go into a *Needs attention* table per instance.
 
-**Not included:** the data / log file list, the Agent job list, logins and server role members.
+**Not included:** the data / log file list, the Agent job list, logins and server role members, global trace flags, and the SSIS catalog / project / environment and SSRS content / subscription tables (removed on request).
 
 SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to SSAS administrator rights and the MSOLAP provider on the VM; without them that part is skipped with a warning. The SSAS check runs as the Windows account running the script (SSAS doesn't use SQL logins).
 

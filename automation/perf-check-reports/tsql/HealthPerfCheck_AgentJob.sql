@@ -714,9 +714,6 @@ LEFT JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id =
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (50) LogDate AS log_time, ProcessInfo AS source, message FROM #errlog ORDER BY LogDate DESC',
          @Title = N'Severe error log entries (24 h)', @OrderBy = N'log_time DESC', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
     SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TraceFlag AS trace_flag FROM #tf WHERE Global = 1',
-         @Title = N'Global trace flags', @OrderBy = N'trace_flag', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT name, CAST(value_in_use AS nvarchar(100)) AS value_in_use, CAST(value AS nvarchar(100)) AS configured
 FROM sys.configurations
 WHERE CAST(value AS sql_variant) <> CAST(value_in_use AS sql_variant)
@@ -739,26 +736,6 @@ FROM sys.endpoints AS e LEFT JOIN sys.tcp_endpoints AS t ON t.endpoint_id = e.en
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT s.name, CASE WHEN r.name IS NULL THEN N''stopped'' ELSE N''running'' END AS state
 FROM sys.server_event_sessions AS s LEFT JOIN sys.dm_xe_sessions AS r ON r.name = s.name',
          @Title = N'XE sessions', @OrderBy = N'name', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT property_name, ISNULL(property_value, N'''') AS property_value FROM #ssis_cat',
-         @Title = N'SSIS catalog settings', @OrderBy = N'property_name', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT folder, project, packages, object_version_lsn, ISNULL(last_deployed, N'''') AS last_deployed, ISNULL(deployed_by, N'''') AS deployed_by FROM #ssis_proj',
-         @Title = N'SSIS projects', @OrderBy = N'folder, project', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT folder, environment, variables FROM #ssis_env',
-         @Title = N'SSIS environments', @OrderBy = N'folder, environment', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT execution_id, ISNULL(folder, N'''') AS folder, ISNULL(project, N'''') AS project, ISNULL(package, N'''') AS package,
-       ISNULL(start_time, N'''') AS start_time, ISNULL(status, N'''') AS status FROM #ssis_fail',
-         @Title = N'SSIS failed executions (24 h)', @OrderBy = N'execution_id DESC', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT rs_database, folders, reports, datasources, datasets, other_items, subscriptions, failing_subscriptions, schedules, failed_executions FROM #ssrs_sum',
-         @Title = N'SSRS content (report server databases)', @OrderBy = N'rs_database', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT rs_database, ISNULL(report_path, N'''') AS report_path, ISNULL(owner, N'''') AS owner, ISNULL(description, N'''') AS description,
-       ISNULL(last_status, N'''') AS last_status, ISNULL(last_run, N'''') AS last_run, is_failing FROM #ssrs_sub',
-         @Title = N'SSRS subscriptions', @OrderBy = N'rs_database, report_path', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
     SET @p_hFull += @p_part;
 
 END;   -- health check

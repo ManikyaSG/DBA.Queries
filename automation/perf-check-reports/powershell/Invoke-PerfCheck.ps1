@@ -762,7 +762,7 @@ function Save-SqlCredential([pscredential]$Credential) {
     finally { [Array]::Clear($plain, 0, $plain.Length) }
 }
 
-function Get-HandoffPath([string]$Account) { return (Join-Path $PSScriptRoot ('PerfCheck.{0}.handoff' -f (Get-SafeFileName ($Account -replace '\\', '_')))) }
+function Get-HandoffPath([string]$Sid) { return (Join-Path $PSScriptRoot ('PerfCheck.{0}.handoff' -f $Sid)) }   # keyed by SID: any way of writing the account name works
 
 function Save-SqlHandoff([pscredential]$Credential, [string]$Account) {
     # Hand-over file for another account (e.g. the SQL Agent service account, whose password nobody knows):
@@ -770,11 +770,11 @@ function Save-SqlHandoff([pscredential]$Credential, [string]$Account) {
     # with the CurrentUser scope (only that account can decrypt it) and deletes this file.
     try { $sid = (New-Object System.Security.Principal.NTAccount $Account).Translate([System.Security.Principal.SecurityIdentifier]).Value }
     catch { throw "Windows account '$Account' not found on this VM ($($_.Exception.Message)). For the SQL Agent service account see: SELECT servicename, service_account FROM sys.dm_server_services;" }
-    $path = Get-HandoffPath $Account
+    $path = Get-HandoffPath $sid
     $plain = [System.Text.Encoding]::UTF8.GetBytes($Credential.GetNetworkCredential().Password)
     try {
         $enc = [System.Security.Cryptography.ProtectedData]::Protect($plain, $script:Entropy, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
-        $obj = @{ user = $Credential.UserName; pwd = [Convert]::ToBase64String($enc); scope = 'LocalMachine'; for_account = $Account; saved_by = $script:RunAs; saved_at = (Get-Date -Format 'yyyy-MM-dd HH:mm') }
+        $obj = @{ user = $Credential.UserName; pwd = [Convert]::ToBase64String($enc); scope = 'LocalMachine'; for_account = $Account; for_sid = $sid; saved_by = $script:RunAs; saved_at = (Get-Date -Format 'yyyy-MM-dd HH:mm') }
         [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $obj -Compress))
         $ErrorActionPreference = 'Continue'
         $out = & icacls.exe "$path" /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' "*$($sid):M" 2>&1
@@ -790,7 +790,7 @@ function Read-SqlCredential {
     # 1. the CurrentUser file of the account running the script
     # 2. a hand-over file for this account (-SaveCredentialFor): re-saved as CurrentUser, then deleted
     # 3. the LocalMachine file
-    $handoff = Get-HandoffPath $script:RunAs
+    $handoff = Get-HandoffPath ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
     if (-not (Test-Path -LiteralPath (Get-CredentialPath 'CurrentUser')) -and (Test-Path -LiteralPath $handoff)) {
         try {
             $obj = Get-Content -LiteralPath $handoff -Raw | ConvertFrom-Json
@@ -952,10 +952,10 @@ $ReportSections = [ordered]@{
     issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases & backups'
     ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
     job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
-    traceflags = 'Global trace flags'; config = 'sp_configure'
+    config = 'sp_configure'
     linked_servers = 'Linked servers'; endpoints = 'Endpoints'; certificates = 'Certificates'; xe_sessions = 'XE sessions'
-    ssis_catalog = 'SSIS catalog settings'; ssis_projects = 'SSIS projects'; ssis_environments = 'SSIS environments'; ssis_failures = 'SSIS failed executions (24 h)'
-    ssrs_summary = 'SSRS content (report server databases)'; ssrs_subscriptions = 'SSRS subscriptions'
+    # Not shown (removed on request): Global trace flags, SSIS catalog / projects / environments / failed executions,
+    # SSRS content / subscriptions. SSIS / SSRS failures still appear under 'Needs attention'.
 }
 $BiSections = [ordered]@{ issues = 'Needs attention (SSIS / SSRS / SSAS on this VM)'; bi_services = 'SSIS / SSRS / SSAS services'; ssas_server = 'SSAS instances'; ssas_databases = 'SSAS databases' }
 
