@@ -25,7 +25,8 @@ Daily health & performance check of every SQL Server instance, **one email** wit
 - **Nothing missed silently:** the collector waits (up to 15 min) for runs still going. An instance with no result, a failed run or no connection is shown in red in the email.
 - **History:** every run stays in `DBA_PerfCheck_Report` for 30 days (`@KeepDays`). `DBAdmin` must not be in an availability group (secondaries can't write to it).
 - **Top lists:** top 5 queries of the window by duration, CPU and logical reads (plan cache, no Query Store), top 5 databases by transactions/s.
-- **Not included:** global trace flags, SSIS catalog / SSRS content tables, deadlock graphs, long-query capture, data / log file list, Agent job list, logins.
+- **Not included:** global trace flags, SSIS catalog / SSRS content tables, deadlock graphs, long-query capture, failed Agent job steps / job history, data / log file list, Agent job list, logins.
+- **DBAdmin** (where the check runs) is shown in the database list only: no warnings for it, and it is left out of file latency, transactions/s, problem sessions, head blockers, memory grants and the top queries (so the check doesn't report itself).
 
 ## Accounts
 

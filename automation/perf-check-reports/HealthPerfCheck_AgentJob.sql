@@ -18,11 +18,12 @@
  WHAT THE CHECK COVERS (dbo.usp_DBA_HealthPerfCheck)
    1. Health check: instance & build, SQL / Windows uptime, services, vitals,
       databases (state, recovery, backups, log use, AG role), Always On
-      replicas / listeners (IP, DHCP) / databases, cluster & quorum, disks, failed
-      job steps (24 h), severe error log entries, sp_configure, linked servers,
+      replicas / listeners (IP, DHCP) / databases, cluster & quorum, disks,
+      severe error log entries, sp_configure, linked servers,
       endpoints, certificates, XE sessions, and the SSIS / SSRS / SSAS services
-      on this server (state). NOT included: data/log file list, Agent job list,
-      logins, server role members, SSAS databases.
+      on this server (state). NOT included: data/log file list, Agent jobs and
+      job history, logins, server role members, SSAS databases. DBAdmin
+      (@HideDatabase) is shown in the database list only.
    2. Performance window: Batch Requests/sec, Transactions/sec (@PerfDatabases),
       compilations, user connections + connection pool usage, lock waits / wait
       time / timeouts / deadlocks / blocking, PLE, buffer cache hit ratio, memory
@@ -203,7 +204,9 @@ ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @SaveToTable         bit            = 0,          -- 1 = save the result in dbo.DBA_PerfCheck_Report (read by Collect-PerfCheckReports.ps1)
     @PrimaryOnly         bit            = 0,          -- 1 = SECONDARY for every AG: save a SKIPPED row and stop;
                                                       --     otherwise show only the AGs / databases this instance is primary for
-    @KeepDays            int            = 30          -- rows older than this are deleted from dbo.DBA_PerfCheck_Report
+    @KeepDays            int            = 30,         -- rows older than this are deleted from dbo.DBA_PerfCheck_Report
+    @HideDatabase        sysname        = NULL        -- NULL = this procedure's database (DBAdmin): shown in the database list only,
+                                                      --        no warnings, left out of every other section (sessions, I/O, top queries)
 AS
 BEGIN
 SET NOCOUNT ON;
@@ -221,6 +224,7 @@ BEGIN
     RETURN;
 END;
 IF @SampleSec < 5 SET @SampleSec = 5;
+SET @HideDatabase = ISNULL(@HideDatabase, DB_NAME());
 
 -- AG roles of this instance at the start (distributed AGs ignored)
 DECLARE @rp_vm sysname = CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS sysname), @rp_roles nvarchar(2000), @rp_include bit, @rp_run int = NULL;
@@ -305,7 +309,6 @@ BEGIN
     IF OBJECT_ID('tempdb..#agdb')    IS NOT NULL DROP TABLE #agdb;
     IF OBJECT_ID('tempdb..#cluster') IS NOT NULL DROP TABLE #cluster;
     IF OBJECT_ID('tempdb..#disk')    IS NOT NULL DROP TABLE #disk;
-    IF OBJECT_ID('tempdb..#jobs')    IS NOT NULL DROP TABLE #jobs;
     IF OBJECT_ID('tempdb..#errlog')  IS NOT NULL DROP TABLE #errlog;
     IF OBJECT_ID('tempdb..#el')      IS NOT NULL DROP TABLE #el;
 
@@ -432,6 +435,7 @@ BEGIN
             + CASE WHEN log_used_pct >= @LogUsedWarnPct THEN N'Log ' + CAST(log_used_pct AS nvarchar(10)) + N'% used (' + log_reuse_wait_desc + N'). ' ELSE N'' END
             + CASE WHEN user_access_desc <> N'MULTI_USER' THEN user_access_desc + N'. ' ELSE N'' END);
 
+    UPDATE #db SET status = 'OK', notes = N'' WHERE name = @HideDatabase;   -- listed, never flagged
     INSERT #issues SELECT status, 'Database', name, notes FROM #db WHERE status <> 'OK';
 
     /*=============================================================================
@@ -499,27 +503,6 @@ BEGIN
         INSERT #issues SELECT status, 'Disk', volume, CAST(free_gb AS nvarchar(20)) + N' GB free of ' + CAST(total_gb AS nvarchar(20)) + N' GB (' + CAST(free_pct AS nvarchar(10)) + N'%)'
         FROM #disk WHERE status <> 'OK';
     END;
-
-    /*=============================================================================
-      8. AGENT JOB FAILURES
-    =============================================================================*/
-    CREATE TABLE #jobs (job_name sysname, run_time datetime, step_id int, step_name sysname NULL, message nvarchar(500));
-    BEGIN TRY
-        -- run_date / run_time converted inline (msdb.dbo.agent_datetime needs EXECUTE permission)
-        INSERT #jobs (job_name, run_time, step_id, step_name, message)
-        SELECT j.name, DATETIMEFROMPARTS(h.run_date / 10000, h.run_date / 100 % 100, h.run_date % 100, h.run_time / 10000, h.run_time / 100 % 100, h.run_time % 100, 0), h.step_id, h.step_name, LEFT(h.message, 500)
-        FROM msdb.dbo.sysjobhistory AS h
-        JOIN msdb.dbo.sysjobs AS j ON j.job_id = h.job_id
-        WHERE h.run_status = 0 AND h.step_id > 0 AND h.run_date > 0
-          AND h.step_name <> N'AG role check - continue only on the primary'   -- skips on secondaries on purpose
-          AND DATETIMEFROMPARTS(h.run_date / 10000, h.run_date / 100 % 100, h.run_date % 100, h.run_time / 10000, h.run_time / 100 % 100, h.run_time % 100, 0) >= DATEADD(HOUR, -@JobFailHours, @now);
-    END TRY
-    BEGIN CATCH
-        INSERT #issues SELECT 'WARNING', 'Agent job', N'not read', N'No permission to read job history in msdb (' + ERROR_MESSAGE() + N')';
-    END CATCH;
-
-    INSERT #issues SELECT 'WARNING', 'Agent job', job_name, CAST(COUNT(*) AS nvarchar(10)) + N' failed step(s), last at ' + CONVERT(nvarchar(20), MAX(run_time), 120)
-    FROM #jobs GROUP BY job_name;
 
     /*=============================================================================
       9. ERROR LOG: SEVERITY >= 17, CORRUPTION, I/O STALLS (current log)
@@ -679,9 +662,6 @@ LEFT JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id =
     SET @p_hFull += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT volume, ISNULL(label, N'''') AS label, total_gb, free_gb, free_pct, status FROM #disk',
          @Title = N'Disk space', @OrderBy = N'volume', @StatusColumn = N'status', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
-    SET @p_hFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT job_name, run_time, CAST(step_id AS nvarchar(5)) + N'' '' + ISNULL(step_name, N'''') AS step, message FROM #jobs',
-         @Title = N'Failed job steps (24 h)', @OrderBy = N'run_time DESC', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
     SET @p_hFull += @p_part;
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (50) LogDate AS log_time, ProcessInfo AS source, message FROM #errlog ORDER BY LogDate DESC',
          @Title = N'Severe error log entries (24 h)', @OrderBy = N'log_time DESC', @MaxRows = 0, @SkipEmpty = 1, @Html = @p_part OUTPUT;
@@ -1091,7 +1071,7 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
         INSERT #qtop
         SELECT query_hash, ec, CAST(el / 1000.0 AS decimal(19, 1)), CAST(el / 1000.0 / ec AS decimal(19, 1)), CAST(cpu / 1000.0 AS decimal(19, 1)), rd,
                sh, ph, so, eo, rn_d, rn_c, rn_r
-        FROM r WHERE rn_d <= 5 OR rn_c <= 5 OR rn_r <= 5;
+        FROM r WHERE rn_d <= 25 OR rn_c <= 25 OR rn_r <= 25;   -- candidates; @HideDatabase's are removed below
     END;
     IF OBJECT_ID('tempdb..#qtx') IS NOT NULL DROP TABLE #qtx;
     SELECT q.*, ISNULL(DB_NAME(COALESCE(t.dbid, CONVERT(int, pa.value))), N'') AS db,
@@ -1102,6 +1082,18 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
     FROM #qtop AS q
     OUTER APPLY sys.dm_exec_sql_text(q.sql_handle) AS t
     OUTER APPLY (SELECT value FROM sys.dm_exec_plan_attributes(q.plan_handle) WHERE attribute = N'dbid') AS pa;
+    DELETE #qtx WHERE db = @HideDatabase;   -- e.g. this check's own queries in DBAdmin
+    WITH x AS (SELECT rn_d, rn_c, rn_r,
+                      ROW_NUMBER() OVER (ORDER BY total_duration_ms DESC) AS nd, ROW_NUMBER() OVER (ORDER BY total_cpu_ms DESC) AS nc,
+                      ROW_NUMBER() OVER (ORDER BY total_logical_reads DESC) AS nr FROM #qtx)
+    UPDATE x SET rn_d = nd, rn_c = nc, rn_r = nr;
+
+    -- @HideDatabase (DBAdmin): not in file latency, transactions/s, problem sessions, head blockers, memory grants
+    DELETE #s_io    WHERE db = @HideDatabase;
+    DELETE #s_pc    WHERE obj = N'Databases' AND inst = @HideDatabase;
+    DELETE #s_prob  WHERE db = @HideDatabase;
+    DELETE #s_head  WHERE db = @HideDatabase;
+    DELETE #s_grant WHERE db = @HideDatabase;
 
     -- @PrimaryOnly: drop the samples of AGs where this instance is SECONDARY (their databases and listeners)
     IF @PrimaryOnly = 1
