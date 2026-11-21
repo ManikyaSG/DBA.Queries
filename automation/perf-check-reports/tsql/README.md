@@ -6,10 +6,10 @@ The same check as [PowerShell version](../powershell/README.md), written entirel
 
 ## What it does (per instance)
 
-1. **Health check:** instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery, backups, log use, AG role), Always On replicas / listeners (IP, static / DHCP) / databases, cluster and quorum, disks, failed job steps (24 h), severe error log entries, key `sp_configure` values, linked servers, endpoints, certificates, XE sessions, SSIS / SSRS failures (under *Needs attention*), and the state of the **SSIS / SSRS / SSAS services** on the server.
+1. **Health check:** instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery, backups, log use, AG role), Always On replicas / listeners (IP, static / DHCP) / databases, cluster and quorum, disks, failed job steps (24 h), severe error log entries, key `sp_configure` values, linked servers, endpoints, certificates, XE sessions, and the state of the **SSIS / SSRS / SSAS services** on the server.
    *Not included:* the data / log file list, the Agent job list, logins, server role members, and SSAS databases (those need PowerShell / the MSOLAP provider).
 2. **Performance window:** a sample every `@SampleSec` seconds for `@DurationMin` minutes (default 60 s for 30 min), with the same metrics as the PowerShell version: throughput, compilations, connections and connection pool usage, locking / blocking / deadlocks, memory, wait stats per interval, file latency, log flush, tempdb, Always On queues / transaction delay / listener connections.
-   **Root cause with SPID and statement:** head blockers (including idle sessions holding an open transaction), problem sessions (blocked, I/O / log / memory / tempdb waits, long running), memory grants, tempdb users, every deadlock process plus the deadlock graph XML, every query over 5 s (Extended Events), and the top 20 queries of the window by duration / CPU / reads from the plan cache (no Query Store needed).
+   **Root cause with SPID and statement:** head blockers (including idle sessions holding an open transaction), problem sessions (blocked, I/O / log / memory / tempdb waits, long running), memory grants, tempdb users, every deadlock process, and the top 20 queries of the window by duration / CPU / reads from the plan cache (no Query Store needed).
 3. **One email with the full report in the body** (no attachment). If Database Mail rejects it, a compact report (without the per-interval tables and deadlock XML) is sent instead, then the short summary, so an email always goes out.
 
 ## Install
@@ -74,6 +74,5 @@ SELECT * FROM dbo.DBA_PerfCheck_State;   -- empty = nothing to restore
 | Instances | every instance on the VM, one combined email | the instance it runs on |
 | SSAS | services + SSAS databases | service state only |
 | Report | attached `.html` file + summary in the body | full report in the email body |
-| Deadlock graphs | saved as `.xdl` files and attached | XML shown in the report (copy into a `.xdl` file to see the diagram) |
 | SMTP fallback | yes | no (Database Mail only) |
 | Login | SQL login with Windows fallback | the job owner (`sa`) |

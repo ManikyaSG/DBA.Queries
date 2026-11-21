@@ -12,9 +12,9 @@ For **every SQL Server instance on the VM**: a **health check** (including SSIS 
 
 ## Health check (once, at the start)
 
-Instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery model, compat, owner, size, log use, last full / diff / log backup, AG role), Always On replicas, listeners (IP, static / DHCP) and databases per replica, cluster and quorum, disk space, failed job steps (24 h), severe error log entries (24 h), sp_configure, linked servers, endpoints, certificates, XE sessions, **SSIS / SSRS** failures (failed package executions, failing subscriptions, failed report executions, under *Needs attention*), and once for the VM the **SSIS / SSRS / SSAS services** and **SSAS databases**. Problems go into a *Needs attention* table per instance.
+Instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery model, compat, owner, size, log use, last full / diff / log backup, AG role), Always On replicas, listeners (IP, static / DHCP) and databases per replica, cluster and quorum, disk space, failed job steps (24 h), severe error log entries (24 h), sp_configure, linked servers, endpoints, certificates, XE sessions, and once for the VM the **SSIS / SSRS / SSAS services** and **SSAS databases**. Problems go into a *Needs attention* table per instance.
 
-**Not included:** the data / log file list, the Agent job list, logins and server role members, global trace flags, and the SSIS catalog / project / environment and SSRS content / subscription tables (removed on request).
+**Not included:** the data / log file list, the Agent job list, logins and server role members, global trace flags, SSIS catalog / projects / environments / failed executions, SSRS content / subscriptions, deadlock graphs and the list of queries over the long-query limit (removed on request).
 
 SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to SSAS administrator rights and the MSOLAP provider on the VM; without them that part is skipped with a warning. The SSAS check runs as the Windows account running the script (SSAS doesn't use SQL logins).
 
@@ -41,8 +41,7 @@ SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to
 | Problem sessions | every request that is blocked over 5 s, waiting on I/O (PAGEIOLATCH), the log (WRITELOG), memory (RESOURCE_SEMAPHORE) or tempdb pages, or running longer than 5 s: reason, SPID, login, host, program, database, wait type / time / resource, blocked by, elapsed, CPU, reads, writes, memory granted, tempdb used, open transactions, statement, object |
 | Memory grants | queries waiting for memory, and grants of 1 GB or more (`BigGrantMB`): SPID, requested / granted / used MB, wait, DOP, statement |
 | TempDB users | sessions using 500 MB or more of tempdb (`TempdbSessionMB`): SPID, login, host, program, user / internal objects MB, statement |
-| Deadlocks | every process of every deadlock (victim, SPID, login, host, app, database, isolation level, lock mode, wait resource, statement), and each **deadlock graph saved as a `.xdl` file** in `Reports\` - double-click to see the diagram in SSMS. Up to 5 are attached to the email |
-| Queries over 5 s | from Extended Events, now with the SPID |
+| Deadlocks | every process of every deadlock (victim, SPID, login, host, app, database, isolation level, lock mode, wait resource, statement) |
 
 
 **Email:** per instance the health *needs attention*, the performance *needs attention*, head blockers, the top 10 problem sessions and average / min / max of every metric. **Attachment:** the full report with the per-interval tables and query lists. If the report can't be attached (Database Mail `MaxFileSize`, or the SQL Server service account can't read `Reports\`), the email keeps the short version and gives the report's path on the VM. The subject is `[CRITICAL]`, `[WARNING]` or `[OK]`.
@@ -51,7 +50,7 @@ SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to
 
 ## Email - how it makes sure the report goes out
 
-1. **The report is attached.** Database Mail doesn't allow file attachments for SQL logins (like `dba_perfcheck`), so the script attaches the report as a query result instead (same `.html` file name); with Windows authentication it attaches the file itself (and up to 5 deadlock graphs). The report must fit in Database Mail's `MaxFileSize` (about 1 MB by default): [`database_mail_setup.sql`](../database_mail_setup.sql) raises it to 10 MB (`@MaxFileSizeMB`). If it is still too big, or attaching fails, the email is sent with the summary and the report's path on the VM.
+1. **The report is attached.** Database Mail doesn't allow file attachments for SQL logins (like `dba_perfcheck`), so the script attaches the report as a query result instead (same `.html` file name); with Windows authentication it attaches the file itself. The report must fit in Database Mail's `MaxFileSize` (about 1 MB by default): [`database_mail_setup.sql`](../database_mail_setup.sql) raises it to 10 MB (`@MaxFileSizeMB`). If it is still too big, or attaching fails, the email is sent with the summary and the report's path on the VM.
 2. **Database Mail on every instance, one after the other** (local instances first). Only profiles this login can really use are picked: Database Mail XPs on, the profile has an SMTP account, and it is public, granted to the login, or the login is sysadmin (`MailProfile` is preferred). After queueing, the script waits until Database Mail has handed it to the SMTP server; if an instance can't queue it or Database Mail reports **failed**, the next instance is tried.
 3. **SMTP straight from the VM** (fallback) when no instance could send it with the report attached: set `SmtpServer` (and `SmtpPort`, `SmtpUseSsl`, `SmtpFrom` if needed) in `$Config`. It uses .NET mail from the VM with the same subject, body and attachments, anonymous relay or `SmtpUseDefaultCredentials = $true` (the Windows account running the script). Only after that is a **summary-only** email sent through Database Mail, with the report's path on the VM.
 4. **If the check itself fails** (script error), a short `[FAILED]` email with the error is sent the same way.
@@ -86,7 +85,7 @@ Start it when the load test starts; with the defaults the email arrives about 31
 ## Test it in SSMS
 
 `PerfCheck.sql` also runs as-is in SSMS (as a login with the permissions above):
-- **F5 on the whole file** = a quick end-to-end test: the HEALTH check, then START (threshold + XE session + plan cache baseline), **one** sample, END (blocked process reports, deadlocks, long queries and top queries since START) and TEARDOWN (threshold restored, XE session dropped). The result grids are the same sections the script reads.
+- **F5 on the whole file** = a quick end-to-end test: the HEALTH check, then START (threshold + XE session + plan cache baseline), **one** sample, END (blocked process reports, deadlocks and top queries since START) and TEARDOWN (threshold restored, XE session dropped). The result grids are the same sections the script reads.
 - **Block by block** (select the text between two `GO` lines and press F5), all in the **same query window** so the temp tables carry over: START, then SAMPLE a few times while you generate load, then END, then TEARDOWN. Always finish with TEARDOWN.
 - Each block starts with its `DECLARE @p_...` parameters (threshold, long-query limit, top queries on/off); change them there for a manual test. The script sets them from `$Config`.
 

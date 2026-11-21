@@ -22,11 +22,11 @@
       Always On queues / transaction delay / listener connections.
       Root cause with SPID + statement: head blockers (incl. idle sessions with an
       open transaction), problem sessions (blocked / I/O / log / memory / tempdb
-      waits / long running), memory grants, tempdb users, every deadlock process
-      (+ the graph XML), every query over @LongQuerySec s (XE), and the top 20
-      queries of the window by duration / CPU / reads (plan cache, no Query Store).
+      waits / long running), memory grants, tempdb users, every deadlock process,
+      and the top 20 queries of the window by duration / CPU / reads (plan cache,
+      no Query Store).
    3. One email with the FULL report in the body (no attachment). If Database Mail
-      rejects it, a compact report (no per-interval tables / deadlock XML) is sent,
+      rejects it, a compact report (no per-interval tables) is sent,
       then the short summary - an email always goes out.
 
  SERVER CHANGES during the window, always put back: 'blocked process threshold (s)'
@@ -164,7 +164,7 @@ ALTER PROCEDURE dbo.usp_DBA_HealthPerfCheck
     @DurationMin         int            = 30,         -- length of the performance window
     @PerfDatabases       nvarchar(max)  = NULL,       -- e.g. N'MARS,CLR' for 'Trans/s'; NULL = all databases
     @BlockedThresholdSec int            = 5,          -- 'blocked process threshold' during the window
-    @LongQuerySec        int            = 5,          -- capture queries running longer than this
+    @LongQuerySec        int            = 5,          -- requests running longer than this count as problem sessions
     @TopQueries          bit            = 1,          -- top 20 queries of the window (plan cache)
     @BigGrantMB          int            = 1024,       -- list memory grants of at least this size (waiting ones always)
     @TempdbSessionMB     int            = 500,        -- list sessions using at least this much tempdb
@@ -486,106 +486,6 @@ BEGIN
            OR (c.pvt_key_last_backup_date IS NULL AND EXISTS (SELECT 1 FROM sys.dm_database_encryption_keys k WHERE k.encryptor_thumbprint = c.thumbprint)));
 
     /*=============================================================================
-      11. EXTRA DATA FOR PRE / POST COMPARISON
-    =============================================================================*/
-    IF OBJECT_ID('tempdb..#tf') IS NOT NULL DROP TABLE #tf;
-    CREATE TABLE #tf (TraceFlag int, Status int, Global int, Session int);
-    INSERT #tf EXEC (N'DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');
-
-    /*=============================================================================
-      12. SSIS CATALOG (SSISDB) - catalog settings, projects, environments, failures
-    =============================================================================*/
-    IF OBJECT_ID('tempdb..#ssis_cat')  IS NOT NULL DROP TABLE #ssis_cat;
-    IF OBJECT_ID('tempdb..#ssis_proj') IS NOT NULL DROP TABLE #ssis_proj;
-    IF OBJECT_ID('tempdb..#ssis_env')  IS NOT NULL DROP TABLE #ssis_env;
-    IF OBJECT_ID('tempdb..#ssis_fail') IS NOT NULL DROP TABLE #ssis_fail;
-    CREATE TABLE #ssis_cat  (property_name nvarchar(256), property_value nvarchar(4000));
-    CREATE TABLE #ssis_proj (folder nvarchar(128), project nvarchar(128), packages int, object_version_lsn bigint, last_deployed nvarchar(19), deployed_by nvarchar(256));
-    CREATE TABLE #ssis_env  (folder nvarchar(128), environment nvarchar(128), variables int);
-    CREATE TABLE #ssis_fail (execution_id bigint, folder nvarchar(128) NULL, project nvarchar(128) NULL, package nvarchar(260) NULL, start_time nvarchar(19) NULL, status nvarchar(30) NULL);
-
-    IF DB_ID(N'SSISDB') IS NOT NULL AND HAS_DBACCESS(N'SSISDB') = 1
-    BEGIN
-        BEGIN TRY
-            EXEC (N'INSERT #ssis_cat SELECT property_name, CAST(property_value AS nvarchar(4000)) FROM SSISDB.catalog.catalog_properties;');
-            EXEC (N'INSERT #ssis_proj SELECT f.name, p.name, (SELECT COUNT(*) FROM SSISDB.catalog.packages AS k WHERE k.project_id = p.project_id),
-                           p.object_version_lsn, CONVERT(nvarchar(19), p.last_deployed_time, 120), p.deployed_by_name
-                    FROM SSISDB.catalog.projects AS p JOIN SSISDB.catalog.folders AS f ON f.folder_id = p.folder_id;');
-            EXEC (N'INSERT #ssis_env SELECT f.name, e.name, (SELECT COUNT(*) FROM SSISDB.catalog.environment_variables AS v WHERE v.environment_id = e.environment_id)
-                    FROM SSISDB.catalog.environments AS e JOIN SSISDB.catalog.folders AS f ON f.folder_id = e.folder_id;');
-            SET @sql = N'INSERT #ssis_fail SELECT TOP (200) execution_id, folder_name, project_name, package_name, CONVERT(nvarchar(19), start_time, 120),
-                           CASE status WHEN 4 THEN N''Failed'' WHEN 6 THEN N''Ended unexpectedly'' END
-                    FROM SSISDB.catalog.executions
-                    WHERE status IN (4, 6) AND start_time >= DATEADD(HOUR, -@h, SYSDATETIMEOFFSET())
-                    ORDER BY execution_id DESC;';
-            EXEC sys.sp_executesql @sql, N'@h int', @h = @JobFailHours;
-        END TRY
-        BEGIN CATCH
-            INSERT #issues (severity, area, item, detail) VALUES ('WARNING', 'SSIS', N'SSISDB', LEFT(N'Could not read the SSIS catalog: ' + ERROR_MESSAGE(), 1900));
-        END CATCH;
-
-        INSERT #issues (severity, area, item, detail)
-        SELECT 'WARNING', 'SSIS', N'Failed package executions',
-               CAST(COUNT(*) AS nvarchar(10)) + N' in the last ' + CAST(@JobFailHours AS nvarchar(5)) + N' h, latest: ' + ISNULL(MAX(package), N'')
-        FROM #ssis_fail HAVING COUNT(*) > 0;
-    END;
-
-    /*=============================================================================
-      13. SSRS REPORT SERVER DATABASES ON THIS INSTANCE - content & subscriptions
-      Any database with dbo.Catalog + dbo.Subscriptions + dbo.ExecutionLogStorage.
-    =============================================================================*/
-    IF OBJECT_ID('tempdb..#ssrs_sum') IS NOT NULL DROP TABLE #ssrs_sum;
-    IF OBJECT_ID('tempdb..#ssrs_sub') IS NOT NULL DROP TABLE #ssrs_sub;
-    CREATE TABLE #ssrs_sum (rs_database sysname, folders int, reports int, datasources int, datasets int, other_items int,
-                            subscriptions int, failing_subscriptions int, schedules int, failed_executions int);
-    CREATE TABLE #ssrs_sub (rs_database sysname, subscription_id nvarchar(40), report_path nvarchar(425) NULL, owner nvarchar(260) NULL,
-                            description nvarchar(512) NULL, inactive_flags int NULL, last_status nvarchar(260) NULL, last_run nvarchar(19) NULL, is_failing int);
-
-    DECLARE rsc CURSOR LOCAL FAST_FORWARD FOR
-        SELECT name FROM sys.databases
-        WHERE state_desc = N'ONLINE' AND HAS_DBACCESS(name) = 1 AND source_database_id IS NULL
-          AND OBJECT_ID(QUOTENAME(name) + N'.dbo.Catalog') IS NOT NULL
-          AND OBJECT_ID(QUOTENAME(name) + N'.dbo.Subscriptions') IS NOT NULL
-          AND OBJECT_ID(QUOTENAME(name) + N'.dbo.ExecutionLogStorage') IS NOT NULL;
-    OPEN rsc; FETCH NEXT FROM rsc INTO @dbn;
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        BEGIN TRY
-            SET @sql = N'USE ' + QUOTENAME(@dbn) + N';
-    INSERT #ssrs_sub (rs_database, subscription_id, report_path, owner, description, inactive_flags, last_status, last_run, is_failing)
-    SELECT DB_NAME(), CAST(s.SubscriptionID AS nvarchar(40)), c.Path, u.UserName, LEFT(s.Description, 512), s.InactiveFlags,
-           LEFT(s.LastStatus, 260), CONVERT(nvarchar(19), s.LastRunTime, 120),
-           CASE WHEN s.LastStatus LIKE N''%fail%'' OR s.LastStatus LIKE N''%error%'' THEN 1 ELSE 0 END
-    FROM dbo.Subscriptions AS s
-    LEFT JOIN dbo.Catalog AS c ON c.ItemID = s.Report_OID
-    LEFT JOIN dbo.Users AS u ON u.UserID = s.OwnerID;
-    INSERT #ssrs_sum
-    SELECT DB_NAME(),
-           SUM(CASE WHEN c.Type = 1 THEN 1 ELSE 0 END), SUM(CASE WHEN c.Type = 2 THEN 1 ELSE 0 END),
-           SUM(CASE WHEN c.Type = 5 THEN 1 ELSE 0 END), SUM(CASE WHEN c.Type = 8 THEN 1 ELSE 0 END),
-           SUM(CASE WHEN c.Type NOT IN (1, 2, 5, 8) THEN 1 ELSE 0 END),
-           (SELECT COUNT(*) FROM dbo.Subscriptions),
-           (SELECT COUNT(*) FROM #ssrs_sub AS x WHERE x.rs_database = DB_NAME() AND x.is_failing = 1),
-           (SELECT COUNT(*) FROM dbo.Schedule),
-           (SELECT COUNT(*) FROM dbo.ExecutionLogStorage AS e WHERE e.TimeStart >= DATEADD(HOUR, -@h, GETDATE()) AND e.Status <> N''rsSuccess'')
-    FROM dbo.Catalog AS c;';
-            EXEC sys.sp_executesql @sql, N'@h int', @h = @JobFailHours;
-        END TRY
-        BEGIN CATCH
-            INSERT #issues (severity, area, item, detail) VALUES ('WARNING', 'SSRS', @dbn, LEFT(N'Could not read the report server database: ' + ERROR_MESSAGE(), 1900));
-        END CATCH;
-        FETCH NEXT FROM rsc INTO @dbn;
-    END
-    CLOSE rsc; DEALLOCATE rsc;
-
-    INSERT #issues (severity, area, item, detail)
-    SELECT 'WARNING', 'SSRS', LEFT(rs_database + N' / ' + ISNULL(report_path, subscription_id), 300), N'Subscription failing: ' + ISNULL(last_status, N'')
-    FROM #ssrs_sub WHERE is_failing = 1;
-    INSERT #issues (severity, area, item, detail)
-    SELECT 'WARNING', 'SSRS', rs_database, CAST(failed_executions AS nvarchar(10)) + N' failed report executions in the last ' + CAST(@JobFailHours AS nvarchar(5)) + N' h'
-    FROM #ssrs_sum WHERE failed_executions > 0;
-
-    /*=============================================================================
       SSIS / SSRS / SSAS SERVICES ON THIS SERVER (xp_servicecontrol - sysadmin only)
     =============================================================================*/
     IF OBJECT_ID('tempdb..#bi_svc') IS NOT NULL DROP TABLE #bi_svc;
@@ -802,22 +702,16 @@ BEGIN
             IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'DBA_PerfCheckJob') DROP EVENT SESSION DBA_PerfCheckJob ON SERVER;
             SET @pf_xeSql = REPLACE(N'CREATE EVENT SESSION DBA_PerfCheckJob ON SERVER
 ADD EVENT sqlserver.blocked_process_report,
-ADD EVENT sqlserver.xml_deadlock_report,
-ADD EVENT sqlserver.rpc_completed (
-    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
-    WHERE duration > #LONG#),
-ADD EVENT sqlserver.sql_batch_completed (
-    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username)
-    WHERE duration > #LONG#)
+ADD EVENT sqlserver.xml_deadlock_report
 ADD TARGET package0.ring_buffer (SET max_memory = 8192, max_events_limit = 2000)
-WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, STARTUP_STATE = OFF);', N'#LONG#', CAST(CAST(@LongQuerySec AS bigint) * 1000000 AS nvarchar(20)));
+WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, STARTUP_STATE = OFF);', N'#LONG#', N'');
             EXEC (@pf_xeSql);
             ALTER EVENT SESSION DBA_PerfCheckJob ON SERVER STATE = START;
             SET @pf_xe = 1;
         END TRY
         BEGIN CATCH SET @p_notes += N'XE session not started: ' + ERROR_MESSAGE() + N' '; END CATCH;
     END
-    ELSE SET @p_notes += N'No ALTER ANY EVENT SESSION permission - no blocked process reports, deadlocks or long-query capture. ';
+    ELSE SET @p_notes += N'No ALTER ANY EVENT SESSION permission - no blocked process reports or deadlocks. ';
 
     -- 2. plan cache baseline for the window's top queries
     IF OBJECT_ID('tempdb..#qstart') IS NOT NULL DROP TABLE #qstart;
@@ -1066,7 +960,6 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
     IF OBJECT_ID('tempdb..#x_blocked') IS NOT NULL DROP TABLE #x_blocked;
     IF OBJECT_ID('tempdb..#x_dl')      IS NOT NULL DROP TABLE #x_dl;
     IF OBJECT_ID('tempdb..#x_dlproc')  IS NOT NULL DROP TABLE #x_dlproc;
-    IF OBJECT_ID('tempdb..#x_long')    IS NOT NULL DROP TABLE #x_long;
     SELECT DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), ev.value('(event/@timestamp)[1]', 'datetime2')) AS event_time,
            ev.value('(event/data[@name="duration"]/value)[1]', 'bigint') / 1000000 AS blocked_s,
            ISNULL(ev.value('(event/data[@name="database_name"]/value)[1]', 'nvarchar(128)'), N'') AS db,
@@ -1093,20 +986,6 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
            ISNULL(LEFT(LTRIM(p.n.value('(inputbuf)[1]', 'nvarchar(max)')), 400), N'') AS statement
     INTO #x_dlproc
     FROM #x_dl AS d CROSS APPLY d.deadlock_graph.nodes('deadlock/process-list/process') AS p(n);
-
-    SELECT DATEADD(MINUTE, DATEDIFF(MINUTE, GETUTCDATE(), GETDATE()), ev.value('(event/@timestamp)[1]', 'datetime2')) AS end_time,
-           CAST(ev.value('(event/data[@name="duration"]/value)[1]', 'bigint') / 1000000.0 AS decimal(18, 1)) AS duration_s,
-           ev.value('(event/data[@name="cpu_time"]/value)[1]', 'bigint') / 1000 AS cpu_ms,
-           ev.value('(event/data[@name="logical_reads"]/value)[1]', 'bigint') AS logical_reads,
-           ISNULL(ev.value('(event/action[@name="session_id"]/value)[1]', 'nvarchar(10)'), N'') AS session_id,
-           ISNULL(ev.value('(event/action[@name="database_name"]/value)[1]', 'nvarchar(128)'), N'') AS db,
-           ISNULL(ev.value('(event/action[@name="client_app_name"]/value)[1]', 'nvarchar(128)'), N'') AS app,
-           ISNULL(ev.value('(event/action[@name="client_hostname"]/value)[1]', 'nvarchar(128)'), N'') AS host,
-           ISNULL(ev.value('(event/action[@name="username"]/value)[1]', 'nvarchar(128)'), N'') AS login,
-           ISNULL(LEFT(LTRIM(COALESCE(ev.value('(event/data[@name="statement"]/value)[1]', 'nvarchar(max)'),
-                                      ev.value('(event/data[@name="batch_text"]/value)[1]', 'nvarchar(max)'))), 400), N'') AS statement
-    INTO #x_long
-    FROM #xe WHERE ev.value('(event/@name)[1]', 'nvarchar(60)') IN (N'rpc_completed', N'sql_batch_completed');
 
     -- 8. top queries of the window: plan cache now minus the baseline, per query_hash
     IF OBJECT_ID('tempdb..#qtop') IS NOT NULL DROP TABLE #qtop;
@@ -1297,8 +1176,6 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
         FROM #s_ag WHERE sync_state NOT IN (N'SYNCHRONIZED', N'SYNCHRONIZING', N'');
     INSERT #pissues SELECT 'WARNING', 'Always On', N'Log send queue', N'Peaked at ' + CAST(MAX(ag_send_mb) AS nvarchar(20)) + N' MB (threshold ' + CAST(@AgSendQueueMB AS nvarchar(10)) + N' MB)'
         FROM #iv HAVING MAX(ag_send_mb) > @AgSendQueueMB;
-    INSERT #pissues SELECT 'WARNING', 'Queries', N'Queries over ' + CAST(@LongQuerySec AS nvarchar(10)) + N' s', CAST(COUNT(*) AS nvarchar(10)) + N' query(ies), longest ' + CAST(MAX(duration_s) AS nvarchar(20)) + N' s'
-        FROM #x_long HAVING COUNT(*) > 0;
     INSERT #pissues SELECT 'WARNING', 'Locking', N'Idle session ' + CAST(session_id AS nvarchar(10)) + N' holding locks',
                            login + N' on ' + host + N' (' + program + N') left a transaction open and blocked ' + CAST(MAX(blocked_sessions) AS nvarchar(10))
                            + N' session(s) for up to ' + CAST(MAX(max_blocked_s) AS nvarchar(20)) + N' s - last statement: ' + statement
@@ -1437,16 +1314,8 @@ FROM #s_lsn GROUP BY listener, ip',
          @Title = N'Deadlock processes', @OrderBy = N'deadlock_no, victim DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
     SET @p_pFull += @p_part;
     SET @p_pMid += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (10) deadlock_no, CONVERT(nvarchar(max), deadlock_graph) AS deadlock_xml FROM #x_dl ORDER BY deadlock_no',
-         @Title = N'Deadlock graphs - copy a graph into a .xdl file to see the diagram in SSMS', @OrderBy = N'deadlock_no', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
-    SET @p_pFull += @p_part;
-    EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT TOP (200) * FROM #x_long ORDER BY duration_s DESC',
-         @Title = N'Queries over the long-query limit (XE)', @OrderBy = N'duration_s DESC', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
-    SET @p_pFull += @p_part;
-    SET @p_pMid += @p_part;
     SET @p_pFull += N'<div style="color:#555;margin-top:12px">Top queries = plan cache (sys.dm_exec_query_stats) at the end of the window minus the start, grouped by query_hash ('
-                  + CAST(@pf_cached AS nvarchar(20)) + N' cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted; those over '
-                  + CAST(@LongQuerySec AS nvarchar(10)) + N' s are in the list above.</div>';
+                  + CAST(@pf_cached AS nvarchar(20)) + N' cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted.</div>';
     EXEC dbo.usp_DBA_HtmlTable @Query = N'SELECT db, object_name, CONVERT(nvarchar(20), query_hash, 1) AS query_hash, executions, total_duration_ms, avg_duration_ms, total_cpu_ms, total_logical_reads, query_text, rn_d AS _r
 FROM #qtx WHERE rn_d <= 20',
          @Title = N'Top 20 queries in the window by duration', @OrderBy = N'_r', @MaxRows = 0, @SkipEmpty = 0, @Html = @p_part OUTPUT;
@@ -1502,7 +1371,7 @@ table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#f
 td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 .banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
 </style></head><body>' + @r_head + @p_hFull + @p_pMid
-               + N'<p style="color:#555">Compact report: the per-interval tables and the deadlock graph XML were left out because the full report could not be sent. Run the procedure with @SendEmail = 0 to see them.</p></body></html>';
+               + N'<p style="color:#555">Compact report: the per-interval tables were left out because the full report could not be sent. Run the procedure with @SendEmail = 0 to see them.</p></body></html>';
 SET @r_subject = N'[' + @r_tag + N'] SQL Server Health & Performance Check [' + @Label + N'] - ' + @@SERVERNAME;
 
 IF @SendEmail = 0

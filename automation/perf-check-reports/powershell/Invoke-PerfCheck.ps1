@@ -24,7 +24,7 @@
       Wait stats   per interval: LCK_M_*, PAGEIOLATCH_*, PAGELATCH_*, WRITELOG, CXPACKET,
                    CXCONSUMER, SOS_SCHEDULER_YIELD, HADR_SYNC_COMMIT, RESOURCE_SEMAPHORE
       Queries      top 20 by duration / CPU / logical reads in the window (plan cache, start vs
-                   end - no Query Store needed) and every query longer than LongQuerySec (XE)
+                   end - no Query Store needed)
       I/O          data / log file read and write latency, Log Flush Wait Time, Log Bytes Flushed/sec
       TempDB       space used, version store size, allocation contention
       Always On    synchronization state, log send queue, redo queue, transaction delay,
@@ -32,7 +32,7 @@
       Root cause   SPID, login, host, program, database, wait, statement for: blocked sessions,
                    head blockers (incl. idle sessions with an open transaction), I/O / log /
                    memory-grant / tempdb waits, long-running requests, big or waiting memory
-                   grants, top tempdb users; every deadlock process + the graph as .xdl files
+                   grants, top tempdb users; every deadlock process
 
     Login: a dedicated SQL login (default dba_perfcheck, created once with the SETUP block at
     the top of PerfCheck.sql). The first run asks for its password and can save it encrypted
@@ -121,7 +121,7 @@ $Config = @{
     DurationMin           = 30       # length of the window in minutes
     PerfDatabases         = @()      # databases for 'Trans/s', e.g. @('MARS', 'CLR'); @() = all databases
     BlockedProcessThresholdSec = 5   # 'blocked process threshold' during the window (restored after)
-    LongQuerySec          = 5        # capture every query running longer than this (XE)
+    LongQuerySec          = 5        # requests running longer than this count as problem sessions
     TopQueries            = $true    # top 20 queries of the window from the plan cache; $false = skip
     BigGrantMB            = 1024     # list memory grants of at least this size (MB); waiting grants are always listed
     TempdbSessionMB       = 500      # list sessions using at least this much tempdb (MB)
@@ -309,7 +309,7 @@ function R1([double]$v) { return [math]::Round($v, 1) }
 
 function Invoke-PerfWindow($Items, [hashtable]$Blocks, [int]$SampleSec, [int]$DurationMin) {
     # $Items: objects with Instance, Conn, Safe. Adds Samples, Setup, End, Notes, StartTime.
-    $tok = @{ p_BptSec = [int]$Config.BlockedProcessThresholdSec; p_LongUs = [int64]$Config.LongQuerySec * 1000000; p_TopQ = $(if ($Config.TopQueries) { 1 } else { 0 })
+    $tok = @{ p_BptSec = [int]$Config.BlockedProcessThresholdSec; p_TopQ = $(if ($Config.TopQueries) { 1 } else { 0 })
               p_LongSec = [int]$Config.LongQuerySec; p_BigGrantMB = [int]$Config.BigGrantMB; p_TempdbMB = [int]$Config.TempdbSessionMB }
     foreach ($it in $Items) {
         $it | Add-Member -NotePropertyName Samples -NotePropertyValue (New-Object System.Collections.ArrayList) -Force
@@ -579,19 +579,12 @@ function Get-PerfResult($It, [int]$SampleSec) {
     $metric = { param($name, $stat) $r = $sum | Where-Object { $_['Metric'] -eq $name } | Select-Object -First 1; if ($r) { [double]$r[$stat] } else { 0.0 } }
 
     # ---- issues ----
-    $xeBlocked = @(Get-Rows $It.End 'xe_blocked'); $xeDl = @(Get-Rows $It.End 'xe_deadlocks'); $xeLong = @(Get-Rows $It.End 'xe_long')
+    $xeBlocked = @(Get-Rows $It.End 'xe_blocked'); $xeDl = @(Get-Rows $It.End 'xe_deadlocks')
     $probRows  = Merge-SampleRows $S 'problem_sessions' @('session_id', 'reason', 'statement') @('wait_ms', 'elapsed_s', 'cpu_ms', 'logical_reads', 'writes', 'granted_mb', 'tempdb_mb')
     $headRows  = Merge-SampleRows $S 'head_blockers' @('session_id', 'statement') @('blocked_sessions', 'max_blocked_s')
     $grantRows = Merge-SampleRows $S 'memory_grants' @('session_id', 'statement') @('requested_mb', 'granted_mb', 'used_mb', 'wait_ms')
     $tdbRows   = Merge-SampleRows $S 'tempdb_sessions' @('session_id', 'statement') @('user_objects_mb', 'internal_objects_mb')
     $dlProcs   = @(Get-Rows $It.End 'xe_deadlock_procs')
-    # every deadlock graph as a .xdl file (double-click opens the diagram in SSMS)
-    $xdlFiles = @(); $n = 0
-    foreach ($d in @(Get-Rows $It.End 'xe_deadlock_xml')) {
-        $n++
-        $f = Join-Path $Config.ReportsFolder ("{0}_deadlock_{1}_{2:D2}.xdl" -f $It.Safe, ((Get-Val $d 'event_time') -replace '[-: ]', ''), $n)
-        try { [System.IO.File]::WriteAllText($f, [string]$d['deadlock_xml'], [System.Text.Encoding]::UTF8); $xdlFiles += $f } catch { }
-    }
     if ($iv.Count -and (& $metric 'PLE s' 'Min') -lt $th.PleMin) { & $addIssue 'WARNING' 'Memory' 'Page Life Expectancy' ("Dropped to {0} s (threshold {1} s)" -f (& $metric 'PLE s' 'Min'), $th.PleMin) }
     if ((& $metric 'Grants pending' 'Max') -gt 0) { & $addIssue 'WARNING' 'Memory' 'Memory Grants Pending' ("Up to {0} queries waiting for memory" -f (& $metric 'Grants pending' 'Max')) }
     if ($waitTot['RESOURCE_SEMAPHORE'] -gt 0) { & $addIssue 'WARNING' 'Memory' 'RESOURCE_SEMAPHORE waits' ("{0:N0} ms waited for query memory" -f $waitTot['RESOURCE_SEMAPHORE']) }
@@ -608,7 +601,6 @@ function Get-PerfResult($It, [int]$SampleSec) {
         & $addIssue 'WARNING' 'Locking' "Idle session $($h['session_id']) holding locks" ("{0} on {1} ({2}) left a transaction open and blocked {3} session(s) for up to {4} s - last statement: {5}" -f $h['login'], $h['host'], $h['program'], $h['blocked_sessions'], $h['max_blocked_s'], $h['statement']) }
     $waitingGrants = @($grantRows | Where-Object { $_['grant_state'] -eq 'WAITING' })
     if ($waitingGrants.Count) { & $addIssue 'WARNING' 'Memory' 'Queries waiting for memory' ("{0} query(ies) waited for a memory grant - see 'Memory grants'" -f $waitingGrants.Count) }
-    if ($xeLong.Count -gt 0) { & $addIssue 'WARNING' 'Queries' "Queries over $($Config.LongQuerySec) s" ("{0} query(ies), longest {1} s" -f $xeLong.Count, (Get-Val $xeLong[0] 'duration_s')) }
     foreach ($note in @($It.Notes)) { & $addIssue 'WARNING' 'Collection' 'Performance window' $note }
 
     $crit = @($issues | Where-Object { $_.severity -eq 'CRITICAL' }).Count
@@ -623,7 +615,7 @@ function Get-PerfResult($It, [int]$SampleSec) {
                 "<h3>$(Enc $title) ($($r.Count))</h3>" + $(if ($r.Count -and $c.Count) { [string](ConvertTo-HtmlTable $r $c) } else { '<div style="color:#2e7d32">None</div>' }) }
     $tqInfo = @(Get-Rows $It.End 'topq_info') | Select-Object -First 1
     $qsNote = if (-not $Config.TopQueries) { 'Top queries skipped (TopQueries = $false).' }
-              elseif ($tqInfo) { "Top queries = plan cache (sys.dm_exec_query_stats) at the end of the window minus the start, grouped by query_hash ($(Get-Val $tqInfo 'plan_cache_entries') cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted; those over $($Config.LongQuerySec) s are still in the list above." }
+              elseif ($tqInfo) { "Top queries = plan cache (sys.dm_exec_query_stats) at the end of the window minus the start, grouped by query_hash ($(Get-Val $tqInfo 'plan_cache_entries') cached statements). Plans evicted or recompiled during the window and OPTION (RECOMPILE) statements are not counted." }
               else { 'Top queries not collected.' }
 
     $short = (@(
@@ -648,14 +640,12 @@ function Get-PerfResult($It, [int]$SampleSec) {
         & $tbl "TempDB users (over $($Config.TempdbSessionMB) MB)" $tdbRows
         & $endTbl 'Deadlocks' 'xe_deadlocks'
         & $tbl 'Deadlock processes' $dlProcs
-        $(if ($xdlFiles.Count) { "<div>Deadlock graphs saved on $(Enc $env:COMPUTERNAME) (open in SSMS): $(Enc (($xdlFiles | ForEach-Object { Split-Path $_ -Leaf }) -join ', '))</div>" })
-        & $endTbl "Queries over $($Config.LongQuerySec) s" 'xe_long'
         "<div style='color:#555;margin-top:12px'>$(Enc $qsNote)</div>"
         & $endTbl 'Top 20 queries in the window by duration' 'top_duration'
         & $endTbl 'Top 20 queries in the window by CPU' 'top_cpu'
         & $endTbl 'Top 20 queries in the window by logical reads' 'top_reads'
     ) -join '')
-    return [pscustomobject]@{ Short = $short; Full = $full; Crit = $crit; Warn = $warn; Intervals = $iv.Count; Xdl = $xdlFiles }
+    return [pscustomobject]@{ Short = $short; Full = $full; Crit = $crit; Warn = $warn; Intervals = $iv.Count }
 }
 
 function Get-Rows($Snap, [string]$Section) {
@@ -1084,7 +1074,7 @@ function Wait-DbMailStatus($Connection, [int]$MailId) {
 }
 
 function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$BodySummary, [string[]]$Files, [string]$Importance, $Candidates, [string]$ReportHtml = '', [int]$ReportCount = 1) {
-    # $Files: the first $ReportCount are report files (one per VM), the rest extras (deadlock graphs).
+    # $Files: the first $ReportCount are report files (one per VM), the rest extras.
     # Order (the full reports always win over a summary-only email):
     #   pass 'attach' : every instance with Database Mail (instances on this machine first):
     #                   a. reports attached as files (Windows authentication, and only an instance on THIS machine:
@@ -1326,7 +1316,6 @@ try {
     }
 
     # ---- performance window (all instances sampled together) ----
-    $xdlAll = @()
     if ($items.Count -and -not $NoPerf) {
         try { Invoke-PerfWindow $items $blocks $sampleSecUsed $durationUsed }
         finally {
@@ -1335,7 +1324,7 @@ try {
                     if ($it.Role) { foreach ($snap in @($it.Samples)) { Remove-SecondaryRows $snap $it.Role } }
                     $pr = Get-PerfResult $it $sampleSecUsed
                     $it.Row.PerfCrit = $pr.Crit; $it.Row.PerfWarn = $pr.Warn; $it.Row.PerfShort = $pr.Short; $it.Row.PerfFull = $pr.Full
-                    $it.Row.PerfNote = "$($pr.Intervals) intervals"; $xdlAll += @($pr.Xdl)
+                    $it.Row.PerfNote = "$($pr.Intervals) intervals"
                     Write-Step ("{0}: performance - {1} critical, {2} warning(s)" -f $it.Instance, $pr.Crit, $pr.Warn) $(if ($pr.Crit) { 'Red' } elseif ($pr.Warn) { 'Yellow' } else { 'Green' })
                 }
                 catch {
@@ -1442,7 +1431,7 @@ try {
     $bodyAttached = $shortHtml + "<p style='color:#555'>Full report per VM (per-interval tables and query lists) attached: $(Enc $fileNames)</p></body></html>"
     $bodySummary  = $shortHtml + "<p style='color:#555'>Full reports saved on $(Enc $env:COMPUTERNAME): $(Enc ($reportFiles -join '; '))</p></body></html>"
     $subject = "[$tag] $($Config.ReportTitle) [$Label] - $($vmNames -join ', ') - $($checked.Count) instance(s)" + $(if ($skipped.Count) { " ($($skipped.Count) secondary skipped)" } else { '' })
-    $files = @($reportFiles) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
+    $files = @($reportFiles)
     $res = Send-Notification $subject $bodyAttached $bodySummary $files $importance $mailCandidates $(if ($reportFiles.Count -eq 1) { $combinedHtml } else { '' }) $reportFiles.Count
     $script:MailSent = $res.Sent; $mailStatus = $res.Status
     if (-not $res.Sent) { Write-Step "EMAIL NOT SENT: $mailStatus" 'Red' }
