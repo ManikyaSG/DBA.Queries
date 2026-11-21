@@ -1,12 +1,12 @@
 /*******************************************************************************
- File    : CreateAgentJob_PerfCheck.sql   (automation/perf-check)
+ File    : CreateAgentJob_PerfCheck.sql   (automation/perf-check-reports/powershell)
  Purpose : Creates (or updates in place) a SQL Agent job that runs the PowerShell
            health & performance check through Run-PerfCheck-Agent.bat, so the run
            has Agent job history, a schedule and failure alerts.
            Typical use: ONE job on ONE instance (the coordinator) checks every
            instance on every VM listed in servers.txt and emails one message with
            one report file per VM (-PrimaryOnly: only primary / standalone instances).
- Needs   : the perf-check folder copied to @ScriptFolder on THIS server:
+ Needs   : the perf-check-reports/powershell folder copied to @ScriptFolder on THIS server:
              Run-PerfCheck-Agent.bat, Invoke-PerfCheck.ps1, PerfCheck.sql, servers.txt
            PowerShell allowed on this server. Run this script as sysadmin.
 
@@ -85,7 +85,7 @@ IF NOT EXISTS (SELECT 1 FROM dbo.syscategories WHERE name = N'Database Maintenan
     EXEC dbo.sp_add_category @class = N'JOB', @type = N'LOCAL', @name = N'Database Maintenance';
 
 DECLARE @existed bit = 0, @stepId int, @schedId int,
-        @desc nvarchar(512) = N'Health check + performance window of the instances in servers.txt, one report per VM, one email (Invoke-PerfCheck.ps1, automation/perf-check).';
+        @desc nvarchar(512) = N'Health check + performance window of the instances in servers.txt, one report per VM, one email (Invoke-PerfCheck.ps1, automation/perf-check-reports/powershell).';
 SELECT @jobId = job_id FROM dbo.sysjobs WHERE name = @JobName;
 IF @jobId IS NOT NULL
 BEGIN

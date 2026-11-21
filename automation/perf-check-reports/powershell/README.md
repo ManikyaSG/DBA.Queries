@@ -51,13 +51,13 @@ SSIS needs read access to `SSISDB`, SSRS to the `ReportServer` database, SSAS to
 
 ## Email - how it makes sure the report goes out
 
-1. **The report is attached.** Database Mail doesn't allow file attachments for SQL logins (like `dba_perfcheck`), so the script attaches the report as a query result instead (same `.html` file name); with Windows authentication it attaches the file itself (and up to 5 deadlock graphs). The report must fit in Database Mail's `MaxFileSize` (about 1 MB by default): `scripts/45_database_mail_setup.sql` raises it to 10 MB (`@MaxFileSizeMB`). If it is still too big, or attaching fails, the email is sent with the summary and the report's path on the VM.
+1. **The report is attached.** Database Mail doesn't allow file attachments for SQL logins (like `dba_perfcheck`), so the script attaches the report as a query result instead (same `.html` file name); with Windows authentication it attaches the file itself (and up to 5 deadlock graphs). The report must fit in Database Mail's `MaxFileSize` (about 1 MB by default): [`database_mail_setup.sql`](../database_mail_setup.sql) raises it to 10 MB (`@MaxFileSizeMB`). If it is still too big, or attaching fails, the email is sent with the summary and the report's path on the VM.
 2. **Database Mail on every instance, one after the other** (local instances first). Only profiles this login can really use are picked: Database Mail XPs on, the profile has an SMTP account, and it is public, granted to the login, or the login is sysadmin (`MailProfile` is preferred). After queueing, the script waits until Database Mail has handed it to the SMTP server; if an instance can't queue it or Database Mail reports **failed**, the next instance is tried.
 3. **SMTP straight from the VM** (fallback) when no instance could send it with the report attached: set `SmtpServer` (and `SmtpPort`, `SmtpUseSsl`, `SmtpFrom` if needed) in `$Config`. It uses .NET mail from the VM with the same subject, body and attachments, anonymous relay or `SmtpUseDefaultCredentials = $true` (the Windows account running the script). Only after that is a **summary-only** email sent through Database Mail, with the report's path on the VM.
 4. **If the check itself fails** (script error), a short `[FAILED]` email with the error is sent the same way.
 5. **If nothing worked**, the window shows `EMAIL NOT SENT` in red with every reason, the report opens in the browser (interactive runs), and the exit code is **4**, which Task Scheduler shows as *Last Run Result*.
 
-To set up or repair Database Mail on an instance, use [`scripts/45_database_mail_setup.sql`](../../scripts/45_database_mail_setup.sql) (it makes the profile public and default, which this check needs when it runs as the SQL login).
+To set up or repair Database Mail on an instance, use [`database_mail_setup.sql`](../database_mail_setup.sql) (it makes the profile public and default, which this check needs when it runs as the SQL login).
 
 ## One-time setup
 

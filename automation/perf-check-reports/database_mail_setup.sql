@@ -1,5 +1,5 @@
 /*******************************************************************************
- File    : 45_database_mail_setup.sql
+ File    : database_mail_setup.sql   (automation/perf-check-reports)
  Purpose : Make Database Mail usable on an instance, safely re-runnable.
              - Profile missing  -> creates the SMTP account + profile and links them.
              - Profile present but not usable ("disabled") -> fixes whatever is off:
@@ -91,7 +91,7 @@ BEGIN
          @email_address           = @EmailAddress,
          @display_name            = @DisplayName,
          @replyto_address         = @ReplyTo,
-         @description             = N'Created by 45_database_mail_setup.sql',
+         @description             = N'Created by database_mail_setup.sql',
          @mailserver_name         = @SmtpServer,
          @mailserver_type         = N'SMTP',
          @port                    = @SmtpPort,
@@ -187,7 +187,7 @@ IF @TestRecipient IS NOT NULL
 BEGIN
     DECLARE @mailId int, @subj nvarchar(255) = N'Database Mail test - ' + CAST(SERVERPROPERTY('ServerName') AS nvarchar(128));
     EXEC msdb.dbo.sp_send_dbmail @profile_name = @ProfileName, @recipients = @TestRecipient, @subject = @subj,
-         @body = N'Database Mail is working on this instance (sent by 45_database_mail_setup.sql).', @mailitem_id = @mailId OUTPUT;
+         @body = N'Database Mail is working on this instance (sent by database_mail_setup.sql).', @mailitem_id = @mailId OUTPUT;
     PRINT N'[SENT]   Test email queued, mailitem_id ' + CAST(@mailId AS nvarchar(10)) + N'. Check it in ~30 s with the last query in this script.';
 END;
 
