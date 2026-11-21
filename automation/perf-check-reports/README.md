@@ -6,6 +6,7 @@ Everything for the SQL Server **health & performance check reports** lives in th
 |---|---|---|
 | [`powershell/`](powershell/README.md) | `Invoke-PerfCheck.ps1` + `PerfCheck.sql`. Health check + performance window for many instances. **One report file per VM, one email**. `-PrimaryOnly` checks only instances that are primary for an AG (or standalone). Run by double-click (`Run-PerfCheck.bat`), Task Scheduler, or a **SQL Agent job** (`Run-PerfCheck-Agent.bat` + `CreateAgentJob_PerfCheck.sql`). | PowerShell is allowed. Several VMs / instances in one email. |
 | [`tsql/`](tsql/README.md) | `HealthPerfCheck_AgentJob.sql`. The same check in **pure T-SQL**: a stored procedure plus a SQL Agent job on each instance, report emailed through Database Mail. | PowerShell is not allowed on the server. One report per instance. |
+| [`SETUP.txt`](SETUP.txt) | Step-by-step setup for several VMs, primary instances only, one email, one SQL Agent job: service account, Database Mail, config, test, proxy and job. | Setting it up on a new set of servers. |
 | [`database_mail_setup.sql`](database_mail_setup.sql) | Database Mail setup / repair, safe to re-run (account, profile, public/default, `MaxFileSize`, test email). Both versions send their email through Database Mail. | Before the first run, or when the email doesn't go out. |
 
 ## Several VMs, primary instances only, one email
