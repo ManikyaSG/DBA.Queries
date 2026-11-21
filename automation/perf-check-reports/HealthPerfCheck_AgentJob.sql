@@ -45,9 +45,8 @@
             in DBAdmin (DBAdmin must NOT be in an availability group). Safe to
             re-run to upgrade: objects are ALTERed, nothing is dropped.
    PART 2 - every instance: the check job (saves to the table, no email).
-   PART 3 - every instance: the SQL login the collector reads with (SELECT on
-            the report table only).
-   PART 4 - ONE instance only (the coordinator): the collector job.
+   PART 3 - ONE instance only (the coordinator): the collector job.
+   The SQL login the collector reads with: Create_PerfCheck_Logins.sql.
    Test by hand first:
        EXEC DBAdmin.dbo.usp_DBA_HealthPerfCheck @SampleSec = 10, @DurationMin = 1, @SendEmail = 0, @SaveToTable = 1, @PrimaryOnly = 1;
        SELECT TOP (5) * FROM DBAdmin.dbo.DBA_PerfCheck_Report ORDER BY run_id DESC;
@@ -1689,47 +1688,11 @@ PRINT N'Run it now: EXEC msdb.dbo.sp_start_job @job_name = N''' + @JobName + N''
 GO
 
 /*=============================================================================
-  PART 3 - THE READER LOGIN  (EVERY instance)
-  The SQL login Collect-PerfCheckReports.ps1 connects with. It needs NO server
-  permissions: only SELECT on DBAdmin.dbo.DBA_PerfCheck_Report (the check itself
-  runs locally as the job owner). Instances must allow SQL authentication:
-  SELECT SERVERPROPERTY('IsIntegratedSecurityOnly');  -- 0 = mixed mode
-  Type the password here, run, then remove it from the file - don't save it.
-  An existing login keeps its password (nothing is changed on it).
-=============================================================================*/
-USE [master];
-GO
-DECLARE @ReaderLogin    sysname       = N'dba_perfcheck',
-        @ReaderPassword nvarchar(128) = N'<strong password here>',
-        @ProcDatabase   sysname       = N'DBAdmin',
-        @sql            nvarchar(max);
-
-IF SUSER_ID(@ReaderLogin) IS NULL
-BEGIN
-    IF @ReaderPassword LIKE N'<%>' BEGIN RAISERROR(N'Set @ReaderPassword first (and remove it from the file afterwards).', 16, 1); RETURN; END;
-    SET @sql = N'CREATE LOGIN ' + QUOTENAME(@ReaderLogin) + N' WITH PASSWORD = N''' + REPLACE(@ReaderPassword, N'''', N'''''')
-             + N''', CHECK_POLICY = ON, CHECK_EXPIRATION = OFF, DEFAULT_DATABASE = ' + QUOTENAME(@ProcDatabase) + N';';
-    EXEC (@sql);
-    PRINT N'Login created: ' + @ReaderLogin;
-END
-ELSE PRINT N'Login exists (password not changed): ' + @ReaderLogin;
-
-SET @sql = N'USE ' + QUOTENAME(@ProcDatabase) + N';
-IF USER_ID(N''' + REPLACE(@ReaderLogin, N'''', N'''''') + N''') IS NULL CREATE USER ' + QUOTENAME(@ReaderLogin) + N' FOR LOGIN ' + QUOTENAME(@ReaderLogin) + N';
-GRANT SELECT ON dbo.DBA_PerfCheck_Report TO ' + QUOTENAME(@ReaderLogin) + N';';
-EXEC (@sql);
-PRINT N'SELECT on ' + @ProcDatabase + N'.dbo.DBA_PerfCheck_Report granted to ' + @ReaderLogin + N'.';
--- Used the login for the older version of this check? It no longer needs these - remove them:
---   REVOKE VIEW SERVER STATE, ALTER SETTINGS, ALTER ANY EVENT SESSION, VIEW ANY DEFINITION FROM [dba_perfcheck];
---   USE msdb; DROP USER [dba_perfcheck];   USE master; DROP USER [dba_perfcheck];
-GO
-
-/*=============================================================================
-  PART 4 - THE COLLECTOR JOB  (ONE instance only: the coordinator, e.g. MARSDBW1\MARS01)
+  PART 3 - THE COLLECTOR JOB  (ONE instance only: the coordinator, e.g. MARSDBW1\MARS01)
   Runs Collect-PerfCheckReports.ps1 (CmdExec, no proxy: as the SQL Agent service
   account, so no Windows password is needed). Schedule it about 10 minutes after
   the check job; it also waits for runs that are still going. Before the first run,
-  hand it the reader login's password once (from a secondary-logon prompt):
+  create the reader login (Create_PerfCheck_Logins.sql) and hand its password over once (from a secondary-logon prompt):
       Collect-PerfCheckReports.ps1 -SaveCredentialFor "NT SERVICE\SQLAgent$MARS01"
   (the Agent service account: SELECT servicename, service_account FROM sys.dm_server_services;)
 =============================================================================*/

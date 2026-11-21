@@ -4,7 +4,8 @@ Daily health & performance check of every SQL Server instance, **one email** wit
 
 | File | What it is |
 |---|---|
-| [`HealthPerfCheck_AgentJob.sql`](HealthPerfCheck_AgentJob.sql) | Everything on the SQL Server side. **PART 1** (every instance): the procedure `usp_DBA_HealthPerfCheck` and the results table `DBA_PerfCheck_Report` in **DBAdmin**. **PART 2** (every instance): the check job. **PART 3** (every instance): the read-only SQL login for the collector. **PART 4** (one instance): the collector job. |
+| [`HealthPerfCheck_AgentJob.sql`](HealthPerfCheck_AgentJob.sql) | Everything on the SQL Server side. **PART 1** (every instance): the procedure `usp_DBA_HealthPerfCheck` and the results table `DBA_PerfCheck_Report` in **DBAdmin**. **PART 2** (every instance): the check job. **PART 3** (one instance): the collector job. |
+| [`Create_PerfCheck_Logins.sql`](Create_PerfCheck_Logins.sql) | The logins: **section A** (every instance) the read-only SQL login `dba_perfcheck` for the collector (`SELECT` on the results table only); **section B** (coordinator) Database Mail access for the Agent service account; **section C** password change / clean-up reference. |
 | [`Collect-PerfCheckReports.ps1`](Collect-PerfCheckReports.ps1) | The collector: reads the latest result of every instance, writes one HTML file per VM, sends one email with all files attached. |
 | [`database_mail_setup.sql`](database_mail_setup.sql) | Database Mail setup / repair (only needed on the instance that sends the email). |
 | [`SETUP.txt`](SETUP.txt) | Step-by-step setup. |

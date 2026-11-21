@@ -8,7 +8,7 @@
     The check itself runs on every instance as a SQL Agent job (HealthPerfCheck_AgentJob.sql,
     PART 2) and saves its result in DBAdmin. This script only reads those rows:
       - connects to every instance in $Config.Instances with a SQL login that has SELECT on
-        DBAdmin.dbo.DBA_PerfCheck_Report and nothing else (PART 3)
+        DBAdmin.dbo.DBA_PerfCheck_Report and nothing else (Create_PerfCheck_Logins.sql)
       - takes each instance's latest run (started within MaxAgeMinutes); runs still going
         are waited for, up to WaitMinutes
       - instances that are SECONDARY for every availability group saved a SKIPPED row: listed,
@@ -19,7 +19,7 @@
         only for Windows logins), or SMTP if SmtpServer is set
       - an instance with no row, still running, failed or not reachable is shown as such
 
-    Run by a SQL Agent job on ONE instance (HealthPerfCheck_AgentJob.sql, PART 4): CmdExec,
+    Run by a SQL Agent job on ONE instance (HealthPerfCheck_AgentJob.sql, PART 3): CmdExec,
     no proxy, so it runs as the Agent service account and no Windows password is needed.
 
     The SQL login's password is stored encrypted with Windows DPAPI:
@@ -67,7 +67,7 @@ $Config = @{
     MailProfile       = ''               # '' = default public profile, else the first profile with an account
     ReportTitle       = 'SQL Server Health & Performance Check'
 
-    SqlLogin          = 'dba_perfcheck'  # reader login (PART 3 of HealthPerfCheck_AgentJob.sql)
+    SqlLogin          = 'dba_perfcheck'  # reader login (Create_PerfCheck_Logins.sql)
     CredentialScope   = 'CurrentUser'    # or 'LocalMachine'
     CredentialFile    = Join-Path $PSScriptRoot 'PerfCheck.cred'   # LocalMachine scope file
     Encrypt           = $false           # $true = encrypt the SQL connections

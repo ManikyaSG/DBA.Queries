@@ -4,7 +4,8 @@
  Every instance saves its own check in DBAdmin; ONE collector job on
  MARSDBW1\MARS01 sends one email with one HTML report per VM.
  Files: automation/perf-check-reports
-   HealthPerfCheck_AgentJob.sql   (SQL side: PART 1-4)
+   HealthPerfCheck_AgentJob.sql   (SQL side: PART 1-3)
+   Create_PerfCheck_Logins.sql    (logins)
    Collect-PerfCheckReports.ps1   (collector)
    database_mail_setup.sql        (Database Mail on the coordinator)
 ===============================================================================
@@ -40,16 +41,17 @@ It creates "DBA - Health & Performance Check" (owner sa). It saves to the table
 and sends no email. Secondary-only instances save a SKIPPED row and stop.
 
 -------------------------------------------------------------------------------
- 3. ON ALL 9 INSTANCES - PART 3 (the reader login)
+ 3. ON ALL 9 INSTANCES - Create_PerfCheck_Logins.sql SECTION A (the reader login)
 -------------------------------------------------------------------------------
 The instances must allow SQL authentication:
 
     SELECT SERVERPROPERTY('IsIntegratedSecurityOnly');   -- 0 = mixed mode
 
-Type the password in @ReaderPassword, run PART 3, then REMOVE the password from
+Type the password in @Password, run SECTION A, then REMOVE the password from
 the file (don't save it). Use the same password on all 9 instances.
 dba_perfcheck gets SELECT on DBAdmin.dbo.DBA_PerfCheck_Report and nothing else.
-(Existing dba_perfcheck login from the older version: PART 3 shows the REVOKE
+It ends by listing what the login can do (should be CONNECT SQL + SELECT on the table).
+(Existing dba_perfcheck login from the older version: SECTION C has the REVOKE
  lines to remove the rights it no longer needs.)
 
 -------------------------------------------------------------------------------
@@ -77,7 +79,8 @@ d) Database Mail on MARSDBW1\MARS01: run database_mail_setup.sql with
        SELECT name, IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
        FROM sys.server_principals WHERE name LIKE N'NT SERVICE\SQL%Agent%';
 
-   No login / not sysadmin? Give it msdb DatabaseMailUserRole.
+   Or simply run Create_PerfCheck_Logins.sql SECTION B on MARSDBW1\MARS01: it
+   checks this and, if needed, gives the account msdb DatabaseMailUserRole.
 
 -------------------------------------------------------------------------------
  5. ON MARSDBW1 - HAND THE dba_perfcheck PASSWORD TO THE COLLECTOR (one-time)
@@ -93,7 +96,8 @@ first run re-encrypts it so that ONLY the Agent service account can decrypt it
 (Windows DPAPI, this machine only) and deletes the hand-over file. The password
 is only ever decrypted into memory - never written to a connection string, the
 log or job history.
-Change it later: run this step again and delete PerfCheck.NT_SERVICE_SQLAgent$MARS01.cred.
+Change it later: Create_PerfCheck_Logins.sql SECTION C (ALTER LOGIN on all 9),
+delete PerfCheck.NT_SERVICE_SQLAgent$MARS01.cred, then run this step again.
 
 Optional manual test as your own account (asks for the password, answer N to
 "Save it"): after a check job has run on all 9 instances,
@@ -101,9 +105,9 @@ Optional manual test as your own account (asks for the password, answer N to
     powershell -ExecutionPolicy Bypass -File .\Collect-PerfCheckReports.ps1
 
 -------------------------------------------------------------------------------
- 6. ON MARSDBW1\MARS01 ONLY - PART 4 (the collector job)
+ 6. ON MARSDBW1\MARS01 ONLY - PART 3 (the collector job)
 -------------------------------------------------------------------------------
-Set at the top of PART 4 and run it:
+Set at the top of PART 3 and run it:
     @ScriptPath = N'C:\DBA\PerfCheck\Collect-PerfCheckReports.ps1'
     @StartTime  = '06:10'      (10 min after the check job)
 It creates "DBA - Perf Check Reports (collector)": CmdExec, no proxy, owner sa.
