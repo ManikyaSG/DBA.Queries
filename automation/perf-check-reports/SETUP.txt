@@ -1,0 +1,139 @@
+===============================================================================
+ PERF CHECK REPORTS - SETUP
+ Several VMs (e.g. 3 VMs x 3 instances, Always On AGs), primary instances only,
+ one email with one report file per VM, run by ONE SQL Agent job.
+ Files: automation/perf-check-reports/powershell  (+ database_mail_setup.sql)
+===============================================================================
+
+Assumption: Windows authentication through an Agent proxy account. That is what
+lets Database Mail attach all the VM files to one email (Database Mail doesn't
+allow file attachments for SQL logins).
+
+-------------------------------------------------------------------------------
+ 1. CHOOSE THE COORDINATOR AND COPY THE FILES
+-------------------------------------------------------------------------------
+Pick ONE SQL instance with SQL Agent to run the job (the coordinator).
+(Jump host without SQL Server instead? Steps 2-4 still apply, but schedule it in
+ Windows Task Scheduler and set SmtpServer in step 3.)
+
+From the repo folder automation/perf-check-reports/powershell, copy to e.g.
+C:\DBA\PerfCheck on the coordinator:
+
+    Invoke-PerfCheck.ps1
+    PerfCheck.sql
+    Run-PerfCheck-Agent.bat
+    servers.example.txt        -> save as servers.txt
+
+CreateAgentJob_PerfCheck.sql and database_mail_setup.sql are only opened in
+SSMS; they don't have to be on that disk.
+
+-------------------------------------------------------------------------------
+ 2. SERVICE ACCOUNT WITH SQL ACCESS ON ALL 9 INSTANCES
+-------------------------------------------------------------------------------
+Use a domain account, e.g. DOMAIN\svc_sqlperf. Run on EVERY instance, including
+secondaries, so it keeps working after a failover (same permissions as the
+SETUP block in PerfCheck.sql, for a Windows login):
+
+    USE master;
+    IF SUSER_ID(N'DOMAIN\svc_sqlperf') IS NULL CREATE LOGIN [DOMAIN\svc_sqlperf] FROM WINDOWS;
+    GRANT VIEW SERVER STATE, ALTER SETTINGS, ALTER ANY EVENT SESSION, VIEW ANY DEFINITION TO [DOMAIN\svc_sqlperf];
+    IF USER_ID(N'DOMAIN\svc_sqlperf') IS NULL CREATE USER [DOMAIN\svc_sqlperf] FOR LOGIN [DOMAIN\svc_sqlperf];
+    GRANT EXECUTE ON sys.xp_readerrorlog TO [DOMAIN\svc_sqlperf];
+    USE msdb;
+    IF USER_ID(N'DOMAIN\svc_sqlperf') IS NULL CREATE USER [DOMAIN\svc_sqlperf] FOR LOGIN [DOMAIN\svc_sqlperf];
+    ALTER ROLE db_datareader ADD MEMBER [DOMAIN\svc_sqlperf];
+    ALTER ROLE DatabaseMailUserRole ADD MEMBER [DOMAIN\svc_sqlperf];
+
+On the coordinator server:
+  - give the account MODIFY rights on C:\DBA\PerfCheck (it writes Reports\ and Logs\)
+  - it probably also needs the Windows right "Log on as a batch job" to run as an
+    Agent proxy (not confirmed - check this if the job step doesn't start)
+
+-------------------------------------------------------------------------------
+ 3. DATABASE MAIL AND CONFIG
+-------------------------------------------------------------------------------
+On the COORDINATOR instance: run database_mail_setup.sql with @MaxFileSizeMB = 10
+(a report covering 3 instances can be bigger than the default limit of about 1 MB).
+
+servers.txt - one INSTANCE per line, instance names, not listeners:
+
+    SQLVM1\INST1
+    SQLVM1\INST2
+    SQLVM1\INST3
+    SQLVM2\INST1
+    ...
+    SQLVM3\INST3
+
+If SQL Browser is blocked, add the port, e.g. SQLVM1\INST1,1433
+
+$Config at the top of Invoke-PerfCheck.ps1:
+    Recipients            = 'dba-team@yourcompany.com'   (and CopyRecipients if needed)
+    MailProfile           = the profile from database_mail_setup.sql
+    IncludeLocalInstances = $false
+    PrimaryOnly           = $true      (or pass -PrimaryOnly)
+    RemoteBiServices      = $false     only if WinRM between the VMs is blocked
+                                       (otherwise each VM shows a warning instead of
+                                        its SSIS / SSRS / SSAS service state)
+    SmtpServer            = only for the jump host option, or as a backup way to send
+
+-------------------------------------------------------------------------------
+ 4. TEST BY HAND AS THE SERVICE ACCOUNT
+-------------------------------------------------------------------------------
+On the coordinator:
+
+    runas /user:DOMAIN\svc_sqlperf cmd
+    cd /d C:\DBA\PerfCheck
+    Run-PerfCheck-Agent.bat -PrimaryOnly -WindowsAuth -NoPerf -Label TEST
+
+When that works, a short performance window:
+
+    Run-PerfCheck-Agent.bat -PrimaryOnly -WindowsAuth -SampleSec 10 -DurationMin 2 -Label TEST
+
+Check:
+  - ONE email arrives with 3 attachments (one .html per VM)
+  - secondary-only instances are listed as skipped
+  - AG tables show only the AGs where that instance is primary
+
+On every instance, nothing left behind:
+
+    SELECT value_in_use FROM sys.configurations WHERE name = 'blocked process threshold (s)';
+    SELECT name FROM sys.dm_xe_sessions WHERE name = 'DBA_PerfWindow';   -- no rows
+
+-------------------------------------------------------------------------------
+ 5. PROXY AND JOB (ON THE COORDINATOR)
+-------------------------------------------------------------------------------
+    USE master;
+    CREATE CREDENTIAL [PerfCheckCred] WITH IDENTITY = N'DOMAIN\svc_sqlperf', SECRET = N'<password>';
+    USE msdb;
+    EXEC dbo.sp_add_proxy @proxy_name = N'PerfCheckProxy', @credential_name = N'PerfCheckCred', @enabled = 1;
+    EXEC dbo.sp_grant_proxy_to_subsystem @proxy_name = N'PerfCheckProxy', @subsystem_name = N'CmdExec';
+
+Open CreateAgentJob_PerfCheck.sql, set the values at the top and run it:
+
+    @ScriptFolder = N'C:\DBA\PerfCheck'
+    @Arguments    = N'-PrimaryOnly -WindowsAuth -Label SCHEDULED'
+    @ProxyName    = N'PerfCheckProxy'
+    @Schedule, @StartTime, and optionally @NotifyOperator
+
+Start it once:
+
+    EXEC msdb.dbo.sp_start_job @job_name = N'DBA - Health & Performance Check (all VMs)';
+
+With the defaults the job runs about 31-35 minutes. Where to look:
+  - SQL Agent job history
+  - C:\DBA\PerfCheck\AgentJobStep_output.txt   (output of the last run)
+  - C:\DBA\PerfCheck\Logs\                     (full log of each run)
+  - C:\DBA\PerfCheck\Reports\                  (the .html reports)
+
+-------------------------------------------------------------------------------
+ IF SOMETHING GOES WRONG
+-------------------------------------------------------------------------------
+Email has only a summary, no attachments
+    -> the step output says why: usually a file above MaxFileSize, or the run
+       used a SQL login instead of Windows authentication.
+An instance shows FAILED
+    -> usually firewall, named-instance port, or login between the coordinator
+       and that VM.
+Job step fails with exit code 3 or 4
+    -> read the newest file in Logs\. (3 = script error, 4 = no email sent.
+       0, 1 and 2 count as success: the email went out.)
