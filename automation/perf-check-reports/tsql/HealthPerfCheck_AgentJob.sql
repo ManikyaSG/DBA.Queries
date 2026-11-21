@@ -1,6 +1,6 @@
 /*******************************************************************************
- File    : HealthPerfCheck_AgentJob.sql   (automation/perf-check-agent)
- Purpose : The health & performance check of automation/perf-check, in pure T-SQL,
+ File    : HealthPerfCheck_AgentJob.sql   (automation/perf-check-reports/tsql)
+ Purpose : The health & performance check of perf-check-reports/powershell, in pure T-SQL,
            for servers where PowerShell can't be used. Runs as a SQL Agent job
            (or by hand) on ONE instance and emails one report via Database Mail.
 
@@ -47,7 +47,7 @@
        EXEC dbo.usp_DBA_HealthPerfCheck @Recipients = N'dba-team@yourcompany.com', @SampleSec = 10, @DurationMin = 2;
 
  NEEDS: SQL Server 2016 RTM+ (any edition with Agent), Database Mail with a profile
- (scripts/45_database_mail_setup.sql sets it up). The job runs as its owner
+ (perf-check-reports/database_mail_setup.sql sets it up). The job runs as its owner
  (sa by default) so it has all permissions; run by hand as a non-sysadmin and the
  parts it can't read are skipped with a warning.
  Tags    : [BOX] SQL Server 2016 SP1 - 2025 / Azure VM. Not for Azure SQL Database.
@@ -1544,7 +1544,7 @@ IF @MailProfile IS NULL
     WHERE EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profileaccount AS pa WHERE pa.profile_id = p.profile_id)
     ORDER BY CASE WHEN pp.profile_id IS NOT NULL THEN 0 ELSE 1 END, p.profile_id;
 IF @MailProfile IS NULL
-    RAISERROR(N'No Database Mail profile with an SMTP account on this instance - run scripts/45_database_mail_setup.sql. The report was not sent.', 16, 1);
+    RAISERROR(N'No Database Mail profile with an SMTP account on this instance - run database_mail_setup.sql (automation/perf-check-reports). The report was not sent.', 16, 1);
 
 SET @r_mailId = NULL;
 -- The full report is the email body (no attachment). If Database Mail rejects it, the compact report
@@ -1705,7 +1705,7 @@ BEGIN
     IF @UpdateExisting = 0 BEGIN RAISERROR(N'Job %s already exists (set @UpdateExisting = 1 to update it).', 16, 1, @JobName); RETURN; END;
     SET @existed = 1;
     EXEC dbo.sp_update_job @job_id = @jobId, @enabled = 1, @category_name = N'Database Maintenance',
-         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-agent).',
+         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-reports/tsql).',
          @notify_level_eventlog = 2, @notify_level_email = 0, @start_step_id = 1;
     WHILE EXISTS (SELECT 1 FROM dbo.sysjobsteps WHERE job_id = @jobId)
     BEGIN
@@ -1721,7 +1721,7 @@ END
 ELSE
     EXEC dbo.sp_add_job
          @job_name = @JobName, @enabled = 1, @category_name = N'Database Maintenance',
-         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-agent).',
+         @description = N'Health check + performance window, emailed by Database Mail (dbo.usp_DBA_HealthPerfCheck, automation/perf-check-reports/tsql).',
          @owner_login_name = @JobOwner, @notify_level_eventlog = 2,
          @notify_level_email = 0, @job_id = @jobId OUTPUT;
 DECLARE @owner sysname = ISNULL(@JobOwner, SUSER_SNAME(0x01));
