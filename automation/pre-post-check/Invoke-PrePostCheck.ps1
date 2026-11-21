@@ -324,6 +324,7 @@ $script:ImpUser     = $null
 $script:RetryErrors = $null   # set in the original window when the run-as window hands instances back
 $script:HandOffRows = $null
 $script:HandOffMail = $null
+$script:RunStart = Get-Date           # used to avoid sending the same report twice
 $script:DbMailNotes = [ordered]@{}   # instance -> why Database Mail auto-setup didn't give a usable profile
 $script:KeyedUser   = $null
 
@@ -687,6 +688,24 @@ td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
 </style></head><body>
 '@
 
+function Find-QueuedMail($Connection, [string]$Subject) {
+    # mailitem_id of an email with this subject already queued / sent since this run started (any window), else $null.
+    # Uses the server's own clock (seconds since the run started), so a time difference with the VM doesn't matter.
+    $age = [int][math]::Ceiling(((Get-Date) - $script:RunStart).TotalSeconds) + 60
+    $q = @"
+SELECT TOP (1) mailitem_id FROM msdb.dbo.sysmail_allitems
+WHERE subject = @subject AND sent_status IN ('unsent', 'sent', 'retrying')
+  AND send_request_date >= DATEADD(second, -@age, GETDATE())
+ORDER BY mailitem_id DESC;
+"@
+    try {
+        $r = Invoke-Scalar $Connection $q @{ '@subject' = $Subject; '@age' = $age }
+        if ($null -eq $r -or $r -is [DBNull]) { return $null }
+        return [int]$r
+    }
+    catch { return $null }
+}
+
 function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [string]$Html, [string]$Importance, [string]$Attachment = '') {
     $cmd = $Connection.CreateCommand()
     $cmd.CommandText = 'msdb.dbo.sp_send_dbmail'
@@ -704,6 +723,7 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
     if ($Attachment) { [void]$cmd.Parameters.AddWithValue('@file_attachments', $Attachment) }
     $pMailItemId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pMailItemId.Direction = [System.Data.ParameterDirection]::Output
     [void]$cmd.ExecuteNonQuery()
+    if ($pMailItemId.Value -is [DBNull] -or $null -eq $pMailItemId.Value) { return (Find-QueuedMail $Connection $Subject) }
     return [int]$pMailItemId.Value
 }
 
@@ -789,7 +809,8 @@ if (-not $Inner) {
                 [void](Connect-AsUser $cred)      # lets the email still be sent as your account
             }
             else {
-                $ans = Read-Host "The check as $($cred.UserName) ended without a result. Run it from this window instead ($($cred.UserName) first, then $rdpUser)? (Y/N)"
+                Write-Step "The check as $($cred.UserName) ended without handing back a result. If it already emailed the report, running again here won't send a second copy." 'Yellow'
+                $ans = Read-Host "Run it from this window instead ($($cred.UserName) first, then $rdpUser)? (Y/N)"
                 if ($ans -notmatch '^[Yy]') { exit 1 }
                 [void](Connect-AsUser $cred)
             }
@@ -1126,16 +1147,28 @@ try {
             try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
             $attach = $Config.AttachReport -and ($maxBytes -le 0 -or $sizeBytes -le $maxBytes)
             if ($Config.AttachReport -and -not $attach) { Write-Step ("Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) - sending it in the email body instead." -f ($sizeBytes / 1KB), ($maxBytes / 1KB)) 'Yellow' }
-            $mailId = $null
-            if ($attach) {
+            $mailId = Find-QueuedMail $c $subject
+            if ($mailId) {
+                $mailStatus = 'Already queued by this run (not sent again)'
+                Write-Step "This report was already queued (mailitem_id $mailId) - not sending it again." 'Yellow'
+            }
+            if ($attach -and -not $mailId) {
                 try {
                     $body = $shortHtml + "<p style='color:#555'>The full report for every instance is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
                     $mailId = Send-DbMail $c $sender.Profile $subject $body $importance $combinedFile
                     $mailStatus = 'Queued with attachment'
                 }
                 catch {
-                    Write-Step "Attachment not possible ($($_.Exception.Message)) - sending the full report in the email body instead." 'Yellow'
-                    Write-Step '  (the SQL Server service account must be able to read the Reports folder on a local disk)' 'DarkGray'
+                    # sp_send_dbmail can queue the email and still return an error - don't send a second copy then
+                    $mailId = Find-QueuedMail $c $subject
+                    if ($mailId) {
+                        $mailStatus = 'Queued with attachment'
+                        Write-Step "sp_send_dbmail reported: $($_.Exception.Message) - but the email was queued (mailitem_id $mailId), so it is not sent again." 'Yellow'
+                    }
+                    else {
+                        Write-Step "Attachment not possible ($($_.Exception.Message)) - sending the full report in the email body instead." 'Yellow'
+                        Write-Step '  (the SQL Server service account must be able to read the Reports folder on a local disk)' 'DarkGray'
+                    }
                 }
             }
             if (-not $mailId) {
