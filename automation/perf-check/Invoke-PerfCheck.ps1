@@ -47,6 +47,16 @@
     -NoPerf runs the health check only.
     Only 3 files: Run-PerfCheck.bat, Invoke-PerfCheck.ps1, PerfCheck.sql.
 
+    Several VMs: list every instance (servers.txt / ExtraInstances / -Instances, instance
+      names, not listeners). One report file per VM (the instance's physical host), all
+      attached to ONE email.
+    -PrimaryOnly (or $Config.PrimaryOnly): an instance is checked only if it is PRIMARY for
+      at least one availability group, or has no AG (an AG with no primary - RESOLVING - also
+      counts, so an outage is never silent). Instances that are SECONDARY for every AG are
+      listed as skipped. For the instances checked, AG / database / listener tables keep
+      only the AGs the instance is primary for; instance-level health is complete.
+    SQL Agent: Run-PerfCheck-Agent.bat + CreateAgentJob_PerfCheck.sql (CmdExec step).
+
 .EXAMPLE
     .\Invoke-PerfCheck.ps1                                   # $Config interval / length
 .EXAMPLE
@@ -67,6 +77,7 @@ param(
     [switch]   $WindowsAuth,          # skip the SQL login, use Windows authentication only
     [switch]   $NoPerf,               # health check only (no performance window)
     [switch]   $NoHealth,             # performance window only (no health check)
+    [switch]   $PrimaryOnly,          # check only instances that are primary for an AG (or have no AG)
     [string]   $SqlFile
 )
 
@@ -95,8 +106,10 @@ $Config = @{
     TempdbSessionMB       = 500      # list sessions using at least this much tempdb (MB)
     PerfThresholds        = @{ PleMin = 300; DataReadMs = 20; LogWriteMs = 10; AgSendQueueMB = 100 }
 
-    IncludeLocalInstances = $true
-    ExtraInstances        = @()      # other instances, e.g. @('SQLVM2', 'SQLVM3\INST2')
+    IncludeLocalInstances = $true    # $false when the script runs centrally for other VMs (jump host / one coordinator)
+    ExtraInstances        = @()      # other instances, e.g. @('SQLVM2', 'SQLVM3\INST2') - instance names, not AG listeners
+    PrimaryOnly           = $false   # $true = same as -PrimaryOnly
+    RemoteBiServices      = $true    # read SSIS / SSRS / SSAS services of other VMs over CIM (WinRM); $false = this VM only
     ServersFile           = Join-Path $PSScriptRoot 'servers.txt'   # optional, one instance per line
     ReportsFolder         = Join-Path $PSScriptRoot 'Reports'
     LogsFolder            = Join-Path $PSScriptRoot 'Logs'
@@ -745,6 +758,83 @@ function Test-SqlAccess($Connection) {
     try { return ([int](Invoke-Scalar $Connection "SELECT ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0);") -eq 1) } catch { return $false }
 }
 
+function Get-HostFromName([string]$Instance) {
+    # Best guess of the VM from an instance name (used only when the instance can't be reached)
+    $h = ($Instance -replace '^(tcp|np|lpc):', '').Split('\')[0].Split(',')[0]
+    if ($h -in @('.', '(local)', 'localhost')) { $h = $env:COMPUTERNAME }
+    return $h.ToUpperInvariant()
+}
+
+function New-NameSet { return New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase) }
+
+function Get-InstanceRole($Connection) {
+    # Physical host (VM) of the instance and its role in each availability group (distributed AGs are ignored).
+    $q = @"
+SET NOCOUNT ON;
+SELECT CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS nvarchar(128)) AS vm;
+IF CAST(ISNULL(SERVERPROPERTY('IsHadrEnabled'), 0) AS int) = 1
+    SELECT ag.name AS ag_name, ISNULL(ars.role_desc, N'UNKNOWN') AS role_desc, x.kind, x.item
+    FROM sys.availability_groups AS ag
+    LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.group_id = ag.group_id AND ars.is_local = 1
+    CROSS APPLY (SELECT N'AG' AS kind, ag.name AS item
+                 UNION ALL SELECT N'DB', adc.database_name FROM sys.availability_databases_cluster AS adc WHERE adc.group_id = ag.group_id
+                 UNION ALL SELECT N'LSN', l.dns_name FROM sys.availability_group_listeners AS l WHERE l.group_id = ag.group_id) AS x
+    WHERE ag.is_distributed = 0;
+"@
+    $cmd = $Connection.CreateCommand(); $cmd.CommandText = $q; $cmd.CommandTimeout = 60
+    $vm = ''; $ags = [ordered]@{}; $dbAg = @{}; $lsnAg = @{}
+    $reader = $cmd.ExecuteReader()
+    try {
+        if ($reader.Read() -and -not $reader.IsDBNull(0)) { $vm = ([string]$reader.GetValue(0)).ToUpperInvariant() }
+        if ($reader.NextResult()) {
+            while ($reader.Read()) {
+                $ag = [string]$reader['ag_name']; $ags[$ag] = [string]$reader['role_desc']
+                $kind = [string]$reader['kind']; $item = [string]$reader['item']
+                if ($kind -eq 'DB') { $dbAg[$item] = $ag } elseif ($kind -eq 'LSN') { $lsnAg[$item] = $ag }
+            }
+        }
+    }
+    finally { $reader.Close() }
+    $dropAgs = New-NameSet; $dropDbs = New-NameSet; $dropLsn = New-NameSet
+    foreach ($k in @($ags.Keys)) { if ($ags[$k] -eq 'SECONDARY') { [void]$dropAgs.Add($k) } }
+    foreach ($k in @($dbAg.Keys))  { if ($dropAgs.Contains($dbAg[$k]))  { [void]$dropDbs.Add($k) } }
+    foreach ($k in @($lsnAg.Keys)) { if ($dropAgs.Contains($lsnAg[$k])) { [void]$dropLsn.Add($k) } }
+    $byRole = [ordered]@{}
+    foreach ($k in @($ags.Keys)) { $r = $ags[$k]; if (-not $byRole.Contains($r)) { $byRole[$r] = @() }; $byRole[$r] += $k }
+    $text = if ($ags.Count -eq 0) { 'no availability group' } else { (@($byRole.Keys | Sort-Object | ForEach-Object { "$($_): $(@($byRole[$_] | Sort-Object) -join ', ')" }) -join '; ') }
+    return [pscustomobject]@{
+        VM = $vm; Text = $text; AgCount = $ags.Count
+        Include = ($ags.Count -eq 0 -or $dropAgs.Count -lt $ags.Count)      # no AG, or PRIMARY / RESOLVING for at least one
+        SecondaryAgs = @($dropAgs | Sort-Object); DropAgs = $dropAgs; DropDbs = $dropDbs; DropListeners = $dropLsn
+    }
+}
+
+function Remove-SecondaryRows($Snap, $Role) {
+    # Keeps only what the instance is primary for: drops the rows of AGs where it is SECONDARY, their databases and listeners.
+    # Instance-level data (counters, waits, sessions, disks, error log, ...) is not touched.
+    if ($null -eq $Snap -or $null -eq $Role -or $Role.DropAgs.Count -eq 0) { return }
+    $s = $Snap['sections']; if (-not $s) { return }
+    $byAg = { param($r) -not $Role.DropAgs.Contains([string]$r['ag_name']) }
+    $rules = @{
+        databases    = { param($r) -not $Role.DropDbs.Contains([string]$r['name']) }
+        ag_replicas  = $byAg; ag_listeners = $byAg; ag_databases = $byAg; ag = $byAg
+        listener     = { param($r) -not $Role.DropListeners.Contains([string]$r['listener']) }
+        io           = { param($r) -not $Role.DropDbs.Contains([string]$r['db']) }
+        pc           = { param($r) -not ([string]$r['obj'] -eq 'Databases' -and $Role.DropDbs.Contains([string]$r['inst'])) }
+        issues       = { param($r)
+            $area = [string]$r['area']; $item = [string]$r['item']
+            if ($area -eq 'Database') { return (-not $Role.DropDbs.Contains($item)) }
+            if ($area -like 'AlwaysOn*') { return (-not $Role.DropAgs.Contains(($item -split ' / ', 2)[0])) }
+            return $true }
+    }
+    foreach ($sec in @($rules.Keys)) {
+        if (-not $s.ContainsKey($sec) -or $null -eq $s[$sec]) { continue }
+        $keep = New-Object System.Collections.ArrayList
+        foreach ($r in @($s[$sec])) { if (& $rules[$sec] $r) { [void]$keep.Add($r) } }
+        $s[$sec] = $keep
+    }
+}
+
 function Open-SqlConnection([string]$Instance) {
     # 1st: the SQL login. Fail-safe: Windows authentication as the account running the script.
     $notes = @(); $win = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -776,12 +866,16 @@ $ReportSections = [ordered]@{
 }
 $BiSections = [ordered]@{ issues = 'Needs attention (SSIS / SSRS / SSAS on this VM)'; bi_services = 'SSIS / SSRS / SSAS services'; ssas_server = 'SSAS instances'; ssas_databases = 'SSAS databases' }
 
-function Get-MachineBiSnapshot {
-    # SSIS / SSRS / SSAS Windows services on THIS VM (not visible from T-SQL) and SSAS databases via the MSOLAP provider.
+function Get-MachineBiSnapshot([string]$ComputerName = $env:COMPUTERNAME) {
+    # SSIS / SSRS / SSAS Windows services on a VM (not visible from T-SQL) and SSAS databases via the MSOLAP provider.
+    # Another VM is read over CIM (WinRM); if that fails the caller reports it as a warning.
     $sections = @{}; $columns = @{}
     $issues = New-Object System.Collections.ArrayList
     $pattern = '^(MsDtsServer\d*|SSISScaleOutMaster\d*|SSISScaleOutWorker\d*|ReportServer(\$.+)?|SQLServerReportingServices|PowerBIReportServer|MSSQLServerOLAPService|MSOLAP\$.+|SQLBrowser)$'
-    $svcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $pattern } | Sort-Object Name)
+    $isLocal = ($ComputerName -eq $env:COMPUTERNAME)
+    $cim = if ($isLocal) { Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue }
+           else { Get-CimInstance -ClassName Win32_Service -ComputerName $ComputerName -OperationTimeoutSec 30 -ErrorAction Stop }
+    $svcs = @($cim | Where-Object { $_.Name -match $pattern } | Sort-Object Name)
 
     $svcRows = New-Object System.Collections.ArrayList
     foreach ($s in $svcs) {
@@ -795,7 +889,7 @@ function Get-MachineBiSnapshot {
     $srvRows = New-Object System.Collections.ArrayList
     $dbRows  = New-Object System.Collections.ArrayList
     foreach ($s in @($svcs | Where-Object { $_.Name -eq 'MSSQLServerOLAPService' -or $_.Name -like 'MSOLAP$*' })) {
-        $inst = if ($s.Name -eq 'MSSQLServerOLAPService') { $env:COMPUTERNAME } else { $env:COMPUTERNAME + '\' + $s.Name.Substring(7) }
+        $inst = if ($s.Name -eq 'MSSQLServerOLAPService') { $ComputerName } else { $ComputerName + '\' + $s.Name.Substring(7) }
         $row = @{ ssas_instance = $inst; service_state = [string]$s.State; connected = '0'; version = ''; error = '' }
         if ($s.State -eq 'Running') {
             $c = $null
@@ -896,75 +990,90 @@ function Wait-DbMailStatus($Connection, [int]$MailId) {
     return $st
 }
 
-function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$BodySummary, [string[]]$Files, [string]$Importance, $Candidates, [string]$ReportHtml = '') {
-    # Tries every instance with Database Mail (local first). On each one, in order:
-    #   1. report attached as a file (Windows authentication only - Database Mail rule)
-    #   2. report attached as a query result (works for SQL logins)
-    #   3. summary only
-    # moving on when Database Mail rejects it or reports 'failed'; then the SMTP fallback. Returns @{ Sent; Status }.
+function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$BodySummary, [string[]]$Files, [string]$Importance, $Candidates, [string]$ReportHtml = '', [int]$ReportCount = 1) {
+    # $Files: the first $ReportCount are report files (one per VM), the rest extras (deadlock graphs).
+    # Order (the full reports always win over a summary-only email):
+    #   pass 'attach' : every instance with Database Mail (instances on this machine first):
+    #                   a. reports attached as files (Windows authentication, and only an instance on THIS machine:
+    #                      Database Mail reads the files from its own server's disk; every report must fit in MaxFileSize)
+    #                   b. report attached as a query result (works for SQL logins; only possible with ONE report file)
+    #   pass 'smtp'   : SMTP straight from this machine with every file attached (if SmtpServer is set)
+    #   pass 'summary': every instance with Database Mail, summary only (reports stay on this machine)
+    # moving on when Database Mail rejects it or reports 'failed'. Returns @{ Sent; Status }.
     $attempts = @()
-    foreach ($sender in @($Candidates | Sort-Object @{ Expression = { -not $_.Local } })) {
-        $c = $null
-        try {
-            $oc = Open-SqlConnection $sender.Instance; $c = $oc.Connection
-            $isSqlLogin = ([string]$oc.As) -like 'SQL:*'
-            $maxBytes = 0
-            try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
-            $reportFile = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) | Select-Object -First 1
-            $methods = @()
-            if ($Config.AttachReport -and $BodyAttached -and $reportFile) {
-                if (-not $isSqlLogin) { $methods += 'file' }
-                if ($ReportHtml) {
-                    $ansiBytes = [System.Text.Encoding]::Default.GetByteCount($ReportHtml)
-                    if ($maxBytes -le 0 -or $ansiBytes -le $maxBytes) { $methods += 'query' }
-                    else { Write-Step ("  Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) on {2} - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB) or set SmtpServer." -f ($ansiBytes / 1KB), ($maxBytes / 1KB), $sender.Instance) 'Yellow' }
-                }
-            }
-            $methods += 'summary'
-            foreach ($m in $methods) {
-                $mailId = $null; $how = ''
-                $okFiles = @($Files | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($maxBytes -le 0 -or (Get-Item -LiteralPath $_).Length -le $maxBytes) })
-                if ($m -eq 'file' -and -not $okFiles.Count) { continue }      # report bigger than MaxFileSize
+    foreach ($pass in @('attach', 'smtp', 'summary')) {
+        if ($pass -eq 'smtp') {
+            if ($Config.SmtpServer) {
                 try {
-                    switch ($m) {
-                        'file' {
-                            $mailId = Send-DbMail $c $sender.Profile $Subject $BodyAttached $Importance ($okFiles -join ';'); $how = "with $($okFiles.Count) file attachment(s)"
-                        }
-                        'query'   { $mailId = Send-DbMailQueryAttachment $c $sender.Profile $Subject $BodyAttached $Importance (Split-Path $reportFile -Leaf) $ReportHtml; $how = 'with the report attached' }
-                        'summary' { $mailId = Send-DbMail $c $sender.Profile $Subject $BodySummary $Importance; $how = 'summary only, full report on the VM' }
+                    $body = if ($Config.AttachReport -and @($Files).Count -and $BodyAttached) { $BodyAttached } else { $BodySummary }
+                    Send-SmtpMail $Subject $body $Importance $(if ($Config.AttachReport) { $Files } else { @() })
+                    Write-Step "Email      : sent directly via SMTP $($Config.SmtpServer):$($Config.SmtpPort)" 'Green'
+                    return @{ Sent = $true; Status = "sent via SMTP $($Config.SmtpServer)" }
+                }
+                catch { $attempts += "SMTP $($Config.SmtpServer): $($_.Exception.Message)"; Write-Step "  SMTP $($Config.SmtpServer) failed ($($_.Exception.Message)) - trying the next way." 'Yellow' }
+            }
+            continue
+        }
+        foreach ($sender in @($Candidates | Sort-Object @{ Expression = { -not $_.Local } })) {
+            $c = $null
+            try {
+                $oc = Open-SqlConnection $sender.Instance; $c = $oc.Connection
+                $isSqlLogin = ([string]$oc.As) -like 'SQL:*'
+                $maxBytes = 0
+                try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
+                $reportFiles = @($Files | Select-Object -First $ReportCount | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+                $reportFile = $reportFiles | Select-Object -First 1
+                $tooBig = @($reportFiles | Where-Object { $maxBytes -gt 0 -and (Get-Item -LiteralPath $_).Length -gt $maxBytes })
+                $methods = @()
+                if ($pass -eq 'attach' -and $Config.AttachReport -and $BodyAttached -and $reportFile) {
+                    if (-not $isSqlLogin -and $sender.Local) {
+                        if ($tooBig.Count) { Write-Step ("  {0} report file(s) above Database Mail MaxFileSize ({1:N0} KB) on {2}: {3} - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB) or set SmtpServer." -f $tooBig.Count, ($maxBytes / 1KB), $sender.Instance, ((@($tooBig | ForEach-Object { Split-Path $_ -Leaf })) -join ', ')) 'Yellow' }
+                        else { $methods += 'file' }
+                    }
+                    if ($ReportHtml -and $ReportCount -eq 1) {
+                        $ansiBytes = [System.Text.Encoding]::Default.GetByteCount($ReportHtml)
+                        if ($maxBytes -le 0 -or $ansiBytes -le $maxBytes) { $methods += 'query' }
+                        else { Write-Step ("  Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) on {2} - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB) or set SmtpServer." -f ($ansiBytes / 1KB), ($maxBytes / 1KB), $sender.Instance) 'Yellow' }
                     }
                 }
-                catch {
-                    $attempts += "$($sender.Instance) [$m]: $($_.Exception.Message)"
-                    Write-Step "  $($sender.Instance): sending $m failed ($($_.Exception.Message)) - trying the next way." 'Yellow'
-                    continue
+                if ($pass -eq 'summary') { $methods += 'summary' }
+                if (-not $methods.Count) { continue }
+                foreach ($m in $methods) {
+                    $mailId = $null; $how = ''
+                    $okFiles = @($reportFiles) + @($Files | Select-Object -Skip $ReportCount | Where-Object { $_ -and (Test-Path -LiteralPath $_) -and ($maxBytes -le 0 -or (Get-Item -LiteralPath $_).Length -le $maxBytes) })
+                    if ($m -eq 'file' -and -not $reportFiles.Count) { continue }
+                    try {
+                        switch ($m) {
+                            'file' {
+                                $mailId = Send-DbMail $c $sender.Profile $Subject $BodyAttached $Importance ($okFiles -join ';'); $how = "with $($okFiles.Count) file attachment(s)"
+                            }
+                            'query'   { $mailId = Send-DbMailQueryAttachment $c $sender.Profile $Subject $BodyAttached $Importance (Split-Path $reportFile -Leaf) $ReportHtml; $how = 'with the report attached' }
+                            'summary' { $mailId = Send-DbMail $c $sender.Profile $Subject $BodySummary $Importance; $how = 'summary only, full report(s) on ' + $env:COMPUTERNAME }
+                        }
+                    }
+                    catch {
+                        $attempts += "$($sender.Instance) [$m]: $($_.Exception.Message)"
+                        Write-Step "  $($sender.Instance): sending $m failed ($($_.Exception.Message)) - trying the next way." 'Yellow'
+                        continue
+                    }
+                    Write-Step "Email      : queued as mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)' ($how)" 'Green'
+                    $st = Wait-DbMailStatus $c $mailId
+                    if ($st -eq 'failed') {
+                        $why = Invoke-Scalar $c "SELECT TOP (1) LEFT(description, 300) FROM msdb.dbo.sysmail_event_log WHERE mailitem_id = @id ORDER BY log_id DESC;" @{ '@id' = $mailId }
+                        $attempts += "$($sender.Instance) [$m]: Database Mail failed - $why"
+                        Write-Step "  Database Mail on $($sender.Instance) failed to deliver it ($why) - trying the next way." 'Yellow'
+                        continue
+                    }
+                    $note = if ($st -eq 'sent') { 'sent' } else { "$st (still in the Database Mail queue)" }
+                    return @{ Sent = $true; Status = "$note via $($sender.Instance) / '$($sender.Profile)' ($how)" }
                 }
-                Write-Step "Email      : queued as mailitem_id $mailId via $($sender.Instance) / profile '$($sender.Profile)' ($how)" 'Green'
-                $st = Wait-DbMailStatus $c $mailId
-                if ($st -eq 'failed') {
-                    $why = Invoke-Scalar $c "SELECT TOP (1) LEFT(description, 300) FROM msdb.dbo.sysmail_event_log WHERE mailitem_id = @id ORDER BY log_id DESC;" @{ '@id' = $mailId }
-                    $attempts += "$($sender.Instance) [$m]: Database Mail failed - $why"
-                    Write-Step "  Database Mail on $($sender.Instance) failed to deliver it ($why) - trying the next way." 'Yellow'
-                    continue
-                }
-                $note = if ($st -eq 'sent') { 'sent' } else { "$st (still in the Database Mail queue)" }
-                return @{ Sent = $true; Status = "$note via $($sender.Instance) / '$($sender.Profile)' ($how)" }
             }
+            catch {
+                $attempts += "$($sender.Instance): $($_.Exception.Message)"
+                Write-Step "  Could not send via $($sender.Instance): $($_.Exception.Message) - trying the next option." 'Yellow'
+            }
+            finally { if ($c) { $c.Dispose() } }
         }
-        catch {
-            $attempts += "$($sender.Instance): $($_.Exception.Message)"
-            Write-Step "  Could not send via $($sender.Instance): $($_.Exception.Message) - trying the next option." 'Yellow'
-        }
-        finally { if ($c) { $c.Dispose() } }
-    }
-    if ($Config.SmtpServer) {
-        try {
-            $body = if ($Config.AttachReport -and @($Files).Count -and $BodyAttached) { $BodyAttached } else { $BodySummary }
-            Send-SmtpMail $Subject $body $Importance $(if ($Config.AttachReport) { $Files } else { @() })
-            Write-Step "Email      : sent directly via SMTP $($Config.SmtpServer):$($Config.SmtpPort)" 'Green'
-            return @{ Sent = $true; Status = "sent via SMTP $($Config.SmtpServer)" }
-        }
-        catch { $attempts += "SMTP $($Config.SmtpServer): $($_.Exception.Message)" }
     }
     if (-not $attempts.Count) { $attempts += 'no instance has a usable Database Mail profile and no SmtpServer is set in $Config' }
     return @{ Sent = $false; Status = 'NOT SENT - ' + ($attempts -join ' | ') }
@@ -979,7 +1088,7 @@ $logFile = Join-Path $Config.LogsFolder ("PerfCheck_{0}_{1}.log" -f $Label, $sta
 try { Start-Transcript -Path $logFile -Append | Out-Null } catch { }
 
 $me = "$env:USERDOMAIN\$env:USERNAME"
-$summary = @(); $combinedFile = $null; $mailStatus = 'Not sent'; $exitCode = 0; $mailCandidates = @(); $script:MailSent = $false
+$summary = @(); $combinedFile = $null; $reportFiles = @(); $mailStatus = 'Not sent'; $exitCode = 0; $mailCandidates = @(); $script:MailSent = $false
 $sampleSecUsed = if ($SampleSec -gt 0) { $SampleSec } else { [int]$Config.SampleSec }
 $durationUsed  = if ($DurationMin -gt 0) { $DurationMin } else { [int]$Config.DurationMin }
 
@@ -1012,17 +1121,13 @@ try {
     if (-not $targets) { throw 'No SQL Server instances found on this VM (and no ExtraInstances / -Instances).' }
     Write-Step "Instances  : $(($targets | ForEach-Object { $_.Instance }) -join ', ')"
 
-    # ---- SSIS / SSRS / SSAS services and SSAS databases on THIS VM (once) ----
-    $machineBi = $null
-    if (-not $NoHealth -and @($targets | Where-Object { $_.Status -ne 'Listed' }).Count) {
-        try { Write-Step 'Collecting SSIS / SSRS / SSAS service and SSAS database info for this VM...'; $machineBi = Get-MachineBiSnapshot }
-        catch { Write-Step "SSIS / SSRS / SSAS info not collected: $($_.Exception.Message)" 'Yellow' }
-    }
-
-    # ---- connect to every instance (+ health check) ----
+    # ---- connect to every instance: VM, AG role (+ health check) ----
+    $usePrimaryOnly = [bool]$PrimaryOnly -or [bool]$Config.PrimaryOnly
+    if ($usePrimaryOnly) { Write-Step 'Mode       : primary only - instances that are SECONDARY for every availability group are skipped' }
     $items = @()
     foreach ($t in $targets) {
-        $row = [pscustomobject][ordered]@{ Instance = $t.Instance; ConnectedAs = ''; Outcome = ''; State = ''; ShortHtml = ''; FullHtml = ''
+        $localVm = if ($t.Status -ne 'Listed') { $env:COMPUTERNAME.ToUpperInvariant() } else { Get-HostFromName $t.Instance }
+        $row = [pscustomobject][ordered]@{ VM = $localVm; Instance = $t.Instance; Roles = ''; RoleNote = ''; ConnectedAs = ''; Outcome = ''; State = ''; ShortHtml = ''; FullHtml = ''
                                            HealthCrit = 0; HealthWarn = 0; HealthShort = ''; HealthFull = ''; PerfCrit = 0; PerfWarn = 0; PerfShort = ''; PerfFull = ''; PerfNote = '' }
         if ($t.Status -and $t.Status -notin @('Running', 'Listed', 'Unknown')) {
             $row.State = 'FAILED'; $row.Outcome = "SQL Server service is $($t.Status)"
@@ -1032,17 +1137,28 @@ try {
         try {
             $oc = Open-SqlConnection $t.Instance
             $row.ConnectedAs = $oc.As
-            Write-Step "$($t.Instance): connected as $($oc.As)" 'Green'
+            $role = $null
+            try { $role = Get-InstanceRole $oc.Connection; if ($role.VM) { $row.VM = $role.VM }; $row.Roles = $role.Text }
+            catch { $row.Roles = "AG role not read: $($_.Exception.Message)"; Write-Step "  $($t.Instance): AG role not read - $($_.Exception.Message) (checked in full)" 'Yellow' }
+            Write-Step "$($t.Instance): connected as $($oc.As) - VM $($row.VM) - $($row.Roles)" 'Green'
+            $isLocalVm = ($row.VM -eq $env:COMPUTERNAME)
             try {
                 $p = Get-MailProfileName $oc.Connection
-                if ($p) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $p; Local = ($t.Status -ne 'Listed') } }
+                if ($p) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $p; Local = $isLocalVm } }
                 else { Write-Step "  $($t.Instance): no usable Database Mail profile for $($oc.As) (XPs off, no profile / account, or profile not public)" 'DarkGray' }
             } catch { Write-Step "  $($t.Instance): could not read Database Mail profiles - $($_.Exception.Message)" 'DarkGray' }
-            $items += [pscustomobject]@{ Instance = $t.Instance; Conn = $oc.Connection; Safe = (Get-SafeFileName $t.Instance); Row = $row; Local = ($t.Status -ne 'Listed') }
+            if ($usePrimaryOnly -and $role -and -not $role.Include) {
+                $row.State = 'SKIPPED'; $row.Outcome = "Skipped - SECONDARY for every availability group ($($role.SecondaryAgs -join ', '))"
+                Write-Step "$($t.Instance): $($row.Outcome)" 'DarkGray'
+                $oc.Connection.Dispose(); $summary += $row; continue
+            }
+            $filterRole = if ($usePrimaryOnly) { $role } else { $null }
+            $items += [pscustomobject]@{ Instance = $t.Instance; Conn = $oc.Connection; Safe = (Get-SafeFileName $t.Instance); Row = $row; Local = $isLocalVm; Role = $filterRole }
             if (-not $NoHealth) {
                 Write-Step "$($t.Instance): health check..."
                 try {
                     $hc = Invoke-SqlSections $oc.Connection $blocks['HEALTH']
+                    Remove-SecondaryRows $hc $filterRole
                     $hIssues = @(Get-Rows $hc 'issues')
                     $row.HealthCrit = @($hIssues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
                     $row.HealthWarn = @($hIssues | Where-Object { (Get-Val $_ 'severity') -eq 'WARNING' }).Count
@@ -1068,6 +1184,21 @@ try {
         $summary += $row
     }
 
+    # ---- SSIS / SSRS / SSAS services and SSAS databases, once per VM that has an instance checked ----
+    $biByVm = @{}
+    if (-not $NoHealth) {
+        foreach ($vm in @($items | ForEach-Object { $_.Row.VM } | Sort-Object -Unique)) {
+            if ($vm -ne $env:COMPUTERNAME -and -not $Config.RemoteBiServices) { continue }
+            try { Write-Step "Collecting SSIS / SSRS / SSAS service and SSAS database info for $vm..."; $biByVm[$vm] = Get-MachineBiSnapshot $vm }
+            catch {
+                Write-Step "  SSIS / SSRS / SSAS info for $vm not collected: $($_.Exception.Message)" 'Yellow'
+                $ni = New-Object System.Collections.ArrayList
+                [void]$ni.Add(@{ severity = 'WARNING'; area = 'BI services'; item = $vm; detail = "Not collected (remote CIM / WinRM to the VM needed, or set RemoteBiServices = `$false): $($_.Exception.Message)" })
+                $biByVm[$vm] = @{ sections = @{}; columns = @{}; issues = $ni }
+            }
+        }
+    }
+
     # ---- performance window (all instances sampled together) ----
     $xdlAll = @()
     if ($items.Count -and -not $NoPerf) {
@@ -1075,6 +1206,7 @@ try {
         finally {
             foreach ($it in $items) {
                 try {
+                    if ($it.Role) { foreach ($snap in @($it.Samples)) { Remove-SecondaryRows $snap $it.Role } }
                     $pr = Get-PerfResult $it $sampleSecUsed
                     $it.Row.PerfCrit = $pr.Crit; $it.Row.PerfWarn = $pr.Warn; $it.Row.PerfShort = $pr.Short; $it.Row.PerfFull = $pr.Full
                     $it.Row.PerfNote = "$($pr.Intervals) intervals"; $xdlAll += @($pr.Xdl)
@@ -1088,58 +1220,104 @@ try {
         }
     }
 
+    # ---- primary only: did an AG fail over during the run? (the report keeps the roles from the start) ----
+    if ($usePrimaryOnly) {
+        foreach ($it in $items) {
+            if (-not $it.Role) { continue }
+            try {
+                $now = Get-InstanceRole $it.Conn
+                if ($now.Text -ne $it.Role.Text) {
+                    $it.Row.RoleNote = "AG roles changed during the run (failover?). At the start: $($it.Role.Text). At the end: $($now.Text). The report uses the roles from the start."
+                    Write-Step "  $($it.Instance): $($it.Row.RoleNote)" 'Yellow'
+                }
+            } catch { }
+        }
+    }
+
     # ---- per instance: health + performance in one section ----
     foreach ($it in $items) {
         $r = $it.Row
-        $c = $r.HealthCrit + $r.PerfCrit; $w = $r.HealthWarn + $r.PerfWarn
+        $c = $r.HealthCrit + $r.PerfCrit; $w = $r.HealthWarn + $r.PerfWarn + $(if ($r.RoleNote) { 1 } else { 0 })
         $r.State = if ($c) { 'CRIT' } elseif ($w) { 'WARN' } else { 'OK' }
         $parts = @()
         if (-not $NoHealth) { $parts += "health: $($r.HealthCrit) critical, $($r.HealthWarn) warning(s)" }
         if (-not $NoPerf)   { $parts += "performance ($($r.PerfNote)): $($r.PerfCrit) critical, $($r.PerfWarn) warning(s)" }
         $r.Outcome = $parts -join '; '
         $banner = if ($c) { '#f8d7da' } elseif ($w) { '#fff3cd' } else { '#d4edda' }
-        $hdr = "<h1>$(Enc $it.Instance)</h1><div class='banner' style='background:$banner'>$(Enc $r.Outcome)</div><div>Connected as: $(Enc $r.ConnectedAs)</div>"
+        $hdr = "<h1>$(Enc $it.Instance)</h1><div class='banner' style='background:$banner'>$(Enc $r.Outcome)</div><div>Connected as: $(Enc $r.ConnectedAs) &nbsp;|&nbsp; VM: $(Enc $r.VM) &nbsp;|&nbsp; Availability groups: $(Enc $r.Roles)</div>" +
+               $(if ($it.Role -and $it.Role.SecondaryAgs.Count) { "<div style='color:#555'>Primary only: AGs where this instance is SECONDARY ($(Enc ($it.Role.SecondaryAgs -join ', '))) and their databases are left out of this report.</div>" } else { '' }) +
+               $(if ($r.RoleNote) { "<div class='banner' style='background:#fff3cd'>$(Enc $r.RoleNote)</div>" } else { '' })
         $r.ShortHtml = $hdr + $r.HealthShort + $r.PerfShort
         $r.FullHtml  = $hdr + $r.HealthFull + $r.PerfFull
     }
 
-    # ---- one combined report + one email for the VM ----
-    $states = @($summary | ForEach-Object { $_.State })
+    # ---- one report file per VM + ONE email with every file attached ----
+    $statusOf = { param($st) switch ($st) { 'CRIT' { 'CRITICAL' } 'FAILED' { 'CRITICAL' } 'WARN' { 'WARNING' } default { '' } } }
+    $checked = @($summary | Where-Object { $_.State -ne 'SKIPPED' })
+    $skipped = @($summary | Where-Object { $_.State -eq 'SKIPPED' })
+    $states = @($checked | ForEach-Object { $_.State })
     $nCrit = @($states | Where-Object { $_ -in @('CRIT', 'FAILED') }).Count; $nWarn = @($states | Where-Object { $_ -eq 'WARN' }).Count
-    $biShort = ''; $biFull = ''
-    if ($machineBi) {
-        $biIssues = @($machineBi.issues)
-        $biSnap = @{ sections = $machineBi.sections; columns = $machineBi.columns }
-        $biSnap.sections['issues'] = $biIssues; $biSnap.columns['issues'] = @('severity', 'area', 'item', 'detail')
-        if (@($biIssues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count) { $nCrit++ } elseif ($biIssues.Count) { $nWarn++ }
-        $biShort = "<h3>SSIS / SSRS / SSAS on $(Enc $env:COMPUTERNAME) - needs attention ($($biIssues.Count))</h3>" + [string](ConvertTo-HtmlTable $biIssues @('severity', 'area', 'item', 'detail') '' 'severity')
-        $biFull  = $biShort + ([string](Get-FullReportHtml $biSnap $BiSections) -replace '^<h3>Needs attention[^<]*</h3>.*?(?=<h3>)', '')
+    $runInfo = "<div>Label: <b>$(Enc $Label)</b> &nbsp;|&nbsp; Window: $(if ($NoPerf) { 'none (health check only)' } else { "every $sampleSecUsed s for $durationUsed min" }) &nbsp;|&nbsp; Run by: $(Enc $me) on $(Enc $env:COMPUTERNAME) &nbsp;|&nbsp; $(Get-Date -Format 'yyyy-MM-dd HH:mm')" +
+               $(if ($usePrimaryOnly) { ' &nbsp;|&nbsp; <b>Primary only</b>' } else { '' }) + '</div>'
+    $tableCols = if ($usePrimaryOnly) { @('Instance', 'Roles', 'ConnectedAs', 'Outcome') } else { @('Instance', 'ConnectedAs', 'Outcome') }
+    $fileStamp = Get-Date -Format 'yyyyMMdd_HHmm'
+    $reportFiles = @(); $vmBodies = @()
+    foreach ($g in @($summary | Group-Object -Property VM | Sort-Object Name)) {
+        $vm = [string]$g.Name; $vmRows = @($g.Group)
+        $vmChecked = @($vmRows | Where-Object { $_.State -ne 'SKIPPED' })
+        $vC = @($vmChecked | Where-Object { $_.State -in @('CRIT', 'FAILED') }).Count; $vW = @($vmChecked | Where-Object { $_.State -eq 'WARN' }).Count
+        $biShort = ''; $biFull = ''
+        if ($biByVm.ContainsKey($vm)) {
+            $bi = $biByVm[$vm]; $biIssues = @($bi.issues)
+            $biSnap = @{ sections = $bi.sections; columns = $bi.columns }
+            $biSnap.sections['issues'] = $biIssues; $biSnap.columns['issues'] = @('severity', 'area', 'item', 'detail')
+            if (@($biIssues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count) { $nCrit++; $vC++ } elseif ($biIssues.Count) { $nWarn++; $vW++ }
+            $biShort = "<h3>SSIS / SSRS / SSAS on $(Enc $vm) - needs attention ($($biIssues.Count))</h3>" + [string](ConvertTo-HtmlTable $biIssues @('severity', 'area', 'item', 'detail') '' 'severity')
+            $biFull  = $biShort + ([string](Get-FullReportHtml $biSnap $BiSections) -replace '^<h3>Needs attention[^<]*</h3>.*?(?=<h3>)', '')
+        }
+        $vTag = if ($vC) { 'CRITICAL' } elseif ($vW) { 'WARNING' } elseif ($vmChecked.Count) { 'OK' } else { 'NOTHING TO CHECK' }
+        $vColor = switch ($vTag) { 'CRITICAL' { '#f8d7da' } 'WARNING' { '#fff3cd' } 'OK' { '#d4edda' } default { '#e2e3e5' } }
+        $vOverall = "$vTag - $($vmChecked.Count) instance(s) checked: $vC critical/failed, $vW with warnings" + $(if ($vmRows.Count -gt $vmChecked.Count) { "; $($vmRows.Count - $vmChecked.Count) skipped (secondary only)" } else { '' })
+        $vmTableRows = @($vmRows | ForEach-Object { [pscustomobject][ordered]@{ status = (& $statusOf $_.State); Instance = $_.Instance; Roles = $_.Roles; ConnectedAs = $_.ConnectedAs; Outcome = $_.Outcome } })
+        $vmHeader = (@(
+            "<h2>$(Enc $Config.ReportTitle) - $(Enc $vm)</h2>"
+            "<div class='banner' style='background:$vColor'>$(Enc $vOverall)</div>"
+            $runInfo
+            "<h3>Instances on $(Enc $vm)</h3>"
+            [string](ConvertTo-HtmlTable $vmTableRows $tableCols '' 'status')
+            $(if (-not $vmChecked.Count) { "<div style='color:#555'>No instance on $(Enc $vm) is primary for an availability group or standalone, so there is nothing else to report for this VM.</div>" } else { '' })
+        ) -join '')
+        $vmHtml = [string]$HtmlHead + $vmHeader + $biFull + (($vmChecked | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + '</body></html>'
+        $vmFile = Join-Path $Config.ReportsFolder ("{0}_PERF_{1}_{2}.html" -f (Get-SafeFileName $vm), $Label, $fileStamp)
+        [System.IO.File]::WriteAllText($vmFile, $vmHtml, [System.Text.Encoding]::UTF8)
+        Write-Step "Report     : $vmFile" 'Green'
+        $reportFiles += $vmFile
+        $vmBodies += "<h2 style='margin-top:28px'>VM $(Enc $vm)</h2><div class='banner' style='background:$vColor'>$(Enc $vOverall)</div>" + $biShort +
+                     (($vmChecked | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
+        if ($reportFiles.Count -eq 1) { $combinedHtml = $vmHtml }
     }
+    $combinedFile = $reportFiles | Select-Object -First 1
+    $vmNames = @($summary | ForEach-Object { $_.VM } | Sort-Object -Unique)
+
     $tag = if ($nCrit) { 'CRITICAL' } elseif ($nWarn) { 'WARNING' } else { 'OK' }
-    $overall = "$tag - $($summary.Count) instance(s): $nCrit critical/failed, $nWarn with warnings"
+    $overall = "$tag - $($checked.Count) instance(s) checked on $($vmNames.Count) VM(s): $nCrit critical/failed, $nWarn with warnings" + $(if ($skipped.Count) { "; $($skipped.Count) skipped (secondary only)" } else { '' })
     $overallColor = switch ($tag) { 'CRITICAL' { '#f8d7da' } 'WARNING' { '#fff3cd' } default { '#d4edda' } }
     $importance = if ($tag -eq 'CRITICAL') { 'High' } else { 'Normal' }
-    $summaryRows = @($summary | ForEach-Object {
-        [pscustomobject][ordered]@{ status = $(switch ($_.State) { 'CRIT' { 'CRITICAL' } 'FAILED' { 'CRITICAL' } 'WARN' { 'WARNING' } default { '' } }); Instance = $_.Instance; ConnectedAs = $_.ConnectedAs; Outcome = $_.Outcome } })
+    $summaryRows = @($summary | Sort-Object VM, Instance | ForEach-Object { [pscustomobject][ordered]@{ status = (& $statusOf $_.State); VM = $_.VM; Instance = $_.Instance; Roles = $_.Roles; ConnectedAs = $_.ConnectedAs; Outcome = $_.Outcome } })
     $header = (@(
-        "<h2>$(Enc $Config.ReportTitle) - $(Enc $env:COMPUTERNAME)</h2>"
+        "<h2>$(Enc $Config.ReportTitle) - $(Enc ($vmNames -join ', '))</h2>"
         "<div class='banner' style='background:$overallColor'>$(Enc $overall)</div>"
-        "<div>Label: <b>$(Enc $Label)</b> &nbsp;|&nbsp; Window: every $sampleSecUsed s for $durationUsed min &nbsp;|&nbsp; Run by: $(Enc $me) &nbsp;|&nbsp; $(Get-Date -Format 'yyyy-MM-dd HH:mm')</div>"
+        $runInfo
         '<h3>Summary</h3>'
-        [string](ConvertTo-HtmlTable $summaryRows @('Instance', 'ConnectedAs', 'Outcome') '' 'status')
+        [string](ConvertTo-HtmlTable $summaryRows (@('VM') + $tableCols) '' 'status')
     ) -join '')
-    $headerShort = $header + $biShort; $header = $header + $biFull
-    $combinedHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + '</body></html>'
-    $combinedFile = Join-Path $Config.ReportsFolder ("{0}_PERF_{1}_{2}.html" -f (Get-SafeFileName $env:COMPUTERNAME), $Label, (Get-Date -Format 'yyyyMMdd_HHmm'))
-    [System.IO.File]::WriteAllText($combinedFile, $combinedHtml, [System.Text.Encoding]::UTF8)
-    Write-Step "`nReport     : $combinedFile" 'Green'
-
-    $subject = "[$tag] $($Config.ReportTitle) [$Label] - $env:COMPUTERNAME - $($summary.Count) instance(s)"
-    $shortHtml = [string]$HtmlHead + $headerShort + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
-    $bodyAttached = $shortHtml + "<p style='color:#555'>The full report (per-interval tables and query lists) is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
-    $bodySummary  = $shortHtml + "<p style='color:#555'>Full report saved on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p></body></html>"
-    $files = @($combinedFile) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
-    $res = Send-Notification $subject $bodyAttached $bodySummary $files $importance $mailCandidates $combinedHtml
+    $shortHtml = [string]$HtmlHead + $header + ($vmBodies -join "<hr style='margin:30px 0'>")
+    $fileNames = (@($reportFiles | ForEach-Object { Split-Path $_ -Leaf })) -join ', '
+    $bodyAttached = $shortHtml + "<p style='color:#555'>Full report per VM (per-interval tables and query lists) attached: $(Enc $fileNames)</p></body></html>"
+    $bodySummary  = $shortHtml + "<p style='color:#555'>Full reports saved on $(Enc $env:COMPUTERNAME): $(Enc ($reportFiles -join '; '))</p></body></html>"
+    $subject = "[$tag] $($Config.ReportTitle) [$Label] - $($vmNames -join ', ') - $($checked.Count) instance(s)" + $(if ($skipped.Count) { " ($($skipped.Count) secondary skipped)" } else { '' })
+    $files = @($reportFiles) + @($xdlAll | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 5)
+    $res = Send-Notification $subject $bodyAttached $bodySummary $files $importance $mailCandidates $(if ($reportFiles.Count -eq 1) { $combinedHtml } else { '' }) $reportFiles.Count
     $script:MailSent = $res.Sent; $mailStatus = $res.Status
     if (-not $res.Sent) { Write-Step "EMAIL NOT SENT: $mailStatus" 'Red' }
     if ($nCrit) { $exitCode = 2 } elseif ($nWarn) { $exitCode = 1 }
@@ -1162,11 +1340,11 @@ catch {
 finally {
     foreach ($it in @($items)) { if ($it -and $it.Conn) { try { $it.Conn.Dispose() } catch { } } }
     Write-Step "`n=== SUMMARY ($Label) ===" 'Green'
-    if ($summary) { $summary | Format-Table Instance, ConnectedAs, Outcome -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+    if ($summary) { $summary | Format-Table VM, Instance, ConnectedAs, Outcome -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
     Write-Step "Email      : $mailStatus"
-    Write-Step "Report     : $combinedFile"
+    foreach ($rf in @($reportFiles)) { Write-Step "Report     : $rf" }
     if (-not $Unattended -and $combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
-        try { Invoke-Item -LiteralPath $combinedFile } catch { }
+        foreach ($rf in @($reportFiles)) { try { Invoke-Item -LiteralPath $rf } catch { } }
     }
     Write-Step "Log        : $logFile"
     try { Stop-Transcript | Out-Null } catch { }

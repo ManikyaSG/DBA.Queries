@@ -2,6 +2,8 @@
 
 The same check as [`automation/perf-check`](../perf-check/README.md), written entirely in **T-SQL**, for servers where PowerShell can't be used. One file, [`HealthPerfCheck_AgentJob.sql`](HealthPerfCheck_AgentJob.sql), installs a stored procedure and creates a **SQL Agent job** that runs it and emails the report through **Database Mail**.
 
+> **Several VMs, primary instances only, one email with one file per VM:** use the PowerShell version run by a SQL Agent job instead: see [`automation/perf-check`](../perf-check/README.md#several-vms-primary-only-one-email-sql-agent-job) (`-PrimaryOnly`, `Run-PerfCheck-Agent.bat`, `CreateAgentJob_PerfCheck.sql`).
+
 ## What it does (per instance)
 
 1. **Health check:** instance and build, SQL Server and Windows uptime, services, vitals, databases (state, recovery, backups, log use, AG role), Always On replicas / listeners (IP, static / DHCP) / databases, cluster and quorum, disks, failed job steps (24 h), severe error log entries, key `sp_configure` values, trace flags, linked servers, endpoints, certificates, XE sessions, SSIS catalog / projects / environments / failures, SSRS content and subscriptions, and the state of the **SSIS / SSRS / SSAS services** on the server.
