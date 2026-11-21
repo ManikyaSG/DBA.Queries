@@ -1,8 +1,8 @@
 # Health & performance check as a SQL Agent job (no PowerShell)
 
-The same check as [`automation/perf-check`](../perf-check/README.md), written entirely in **T-SQL**, for servers where PowerShell can't be used. One file, [`HealthPerfCheck_AgentJob.sql`](HealthPerfCheck_AgentJob.sql), installs a stored procedure and creates a **SQL Agent job** that runs it and emails the report through **Database Mail**.
+The same check as [PowerShell version](../powershell/README.md), written entirely in **T-SQL**, for servers where PowerShell can't be used. One file, [`HealthPerfCheck_AgentJob.sql`](HealthPerfCheck_AgentJob.sql), installs a stored procedure and creates a **SQL Agent job** that runs it and emails the report through **Database Mail**.
 
-> **Several VMs, primary instances only, one email with one file per VM:** use the PowerShell version run by a SQL Agent job instead: see [`automation/perf-check`](../perf-check/README.md#several-vms-primary-only-one-email-sql-agent-job) (`-PrimaryOnly`, `Run-PerfCheck-Agent.bat`, `CreateAgentJob_PerfCheck.sql`).
+> **Several VMs, primary instances only, one email with one file per VM:** use the PowerShell version run by a SQL Agent job instead: see the [PowerShell version](../powershell/README.md#several-vms-primary-only-one-email-sql-agent-job) (`-PrimaryOnly`, `Run-PerfCheck-Agent.bat`, `CreateAgentJob_PerfCheck.sql`).
 
 ## What it does (per instance)
 
@@ -14,7 +14,7 @@ The same check as [`automation/perf-check`](../perf-check/README.md), written en
 
 ## Install
 
-1. **Database Mail** must work on the instance. [`scripts/45_database_mail_setup.sql`](../../scripts/45_database_mail_setup.sql) sets it up and makes the profile the default.
+1. **Database Mail** must work on the instance. [`database_mail_setup.sql`](../database_mail_setup.sql) sets it up and makes the profile the default.
 2. Open `HealthPerfCheck_AgentJob.sql` in SSMS as **sysadmin**.
 3. **PART 1** (top of the file): leave `USE [master];` or change it to your DBA database, then run PART 1. It creates `dbo.DBA_PerfCheck_State`, `dbo.fn_DBA_Html`, `dbo.usp_DBA_HtmlTable` and `dbo.usp_DBA_HealthPerfCheck`. Re-run it to upgrade: each object is created only if it's missing and then `ALTER`ed, so nothing is dropped and granted permissions stay. It ends with *PART 1 done* or, if the procedure didn't compile, an error.
 4. **Test by hand** with a short window; the report comes back as a clickable XML cell instead of an email:
@@ -69,7 +69,7 @@ SELECT * FROM dbo.DBA_PerfCheck_State;   -- empty = nothing to restore
 
 ## Differences from the PowerShell version
 
-| | PowerShell (`perf-check`) | Agent job (this folder) |
+| | PowerShell (`powershell/`) | Agent job (`tsql/`, this folder) |
 |---|---|---|
 | Instances | every instance on the VM, one combined email | the instance it runs on |
 | SSAS | services + SSAS databases | service state only |

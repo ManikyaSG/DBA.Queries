@@ -1027,13 +1027,13 @@ function Send-Notification([string]$Subject, [string]$BodyAttached, [string]$Bod
                 $methods = @()
                 if ($pass -eq 'attach' -and $Config.AttachReport -and $BodyAttached -and $reportFile) {
                     if (-not $isSqlLogin -and $sender.Local) {
-                        if ($tooBig.Count) { Write-Step ("  {0} report file(s) above Database Mail MaxFileSize ({1:N0} KB) on {2}: {3} - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB) or set SmtpServer." -f $tooBig.Count, ($maxBytes / 1KB), $sender.Instance, ((@($tooBig | ForEach-Object { Split-Path $_ -Leaf })) -join ', ')) 'Yellow' }
+                        if ($tooBig.Count) { Write-Step ("  {0} report file(s) above Database Mail MaxFileSize ({1:N0} KB) on {2}: {3} - raise it with database_mail_setup.sql (@MaxFileSizeMB, perf-check-reports folder) or set SmtpServer." -f $tooBig.Count, ($maxBytes / 1KB), $sender.Instance, ((@($tooBig | ForEach-Object { Split-Path $_ -Leaf })) -join ', ')) 'Yellow' }
                         else { $methods += 'file' }
                     }
                     if ($ReportHtml -and $ReportCount -eq 1) {
                         $ansiBytes = [System.Text.Encoding]::Default.GetByteCount($ReportHtml)
                         if ($maxBytes -le 0 -or $ansiBytes -le $maxBytes) { $methods += 'query' }
-                        else { Write-Step ("  Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) on {2} - raise it with scripts/45_database_mail_setup.sql (@MaxFileSizeMB) or set SmtpServer." -f ($ansiBytes / 1KB), ($maxBytes / 1KB), $sender.Instance) 'Yellow' }
+                        else { Write-Step ("  Report is {0:N0} KB, above Database Mail MaxFileSize ({1:N0} KB) on {2} - raise it with database_mail_setup.sql (@MaxFileSizeMB, perf-check-reports folder) or set SmtpServer." -f ($ansiBytes / 1KB), ($maxBytes / 1KB), $sender.Instance) 'Yellow' }
                     }
                 }
                 if ($pass -eq 'summary') { $methods += 'summary' }
