@@ -60,15 +60,18 @@ GRANT SELECT ON dbo.DBA_PerfCheck_Report TO ' + QUOTENAME(@Login) + N';';
 EXEC (@sql);
 PRINT N'SELECT on ' + @ReportDb + N'.dbo.DBA_PerfCheck_Report granted to ' + @Login + N'.';
 
--- show what the login can do now (should be: CONNECT SQL at server level, SELECT on the table)
-SET @sql = N'SELECT N''server'' AS level, sp.permission_name, sp.state_desc, N'''' AS object
+-- show what the login can do now (should be: CONNECT SQL at server level, CONNECT + SELECT on the table)
+-- COLLATE DATABASE_DEFAULT: server views and the report database can have different collations
+SET @sql = N'SELECT N''server'' COLLATE DATABASE_DEFAULT AS level, sp.permission_name COLLATE DATABASE_DEFAULT AS permission_name,
+       sp.state_desc COLLATE DATABASE_DEFAULT AS state_desc, N'''' COLLATE DATABASE_DEFAULT AS object
 FROM sys.server_permissions AS sp JOIN sys.server_principals AS p ON p.principal_id = sp.grantee_principal_id WHERE p.name = @l
 UNION ALL
-SELECT N''server role'', r.name, N''MEMBER'', N'''' FROM sys.server_role_members AS m
+SELECT N''server role'', r.name COLLATE DATABASE_DEFAULT, N''MEMBER'', N'''' FROM sys.server_role_members AS m
 JOIN sys.server_principals AS r ON r.principal_id = m.role_principal_id JOIN sys.server_principals AS p ON p.principal_id = m.member_principal_id WHERE p.name = @l
 UNION ALL
-SELECT N''' + REPLACE(@ReportDb, N'''', N'''''') + N''', dp.permission_name, dp.state_desc, ISNULL(OBJECT_SCHEMA_NAME(dp.major_id, DB_ID(N''' + REPLACE(@ReportDb, N'''', N'''''') + N''')) + N''.'' + OBJECT_NAME(dp.major_id, DB_ID(N''' + REPLACE(@ReportDb, N'''', N'''''') + N''')), N'''')
-FROM ' + QUOTENAME(@ReportDb) + N'.sys.database_permissions AS dp JOIN ' + QUOTENAME(@ReportDb) + N'.sys.database_principals AS u ON u.principal_id = dp.grantee_principal_id WHERE u.name = @l;';
+SELECT N''' + REPLACE(@ReportDb, N'''', N'''''') + N''', dp.permission_name COLLATE DATABASE_DEFAULT, dp.state_desc COLLATE DATABASE_DEFAULT,
+       ISNULL(OBJECT_SCHEMA_NAME(dp.major_id, DB_ID(N''' + REPLACE(@ReportDb, N'''', N'''''') + N''')) + N''.'' + OBJECT_NAME(dp.major_id, DB_ID(N''' + REPLACE(@ReportDb, N'''', N'''''') + N''')), N'''') COLLATE DATABASE_DEFAULT
+FROM ' + QUOTENAME(@ReportDb) + N'.sys.database_permissions AS dp JOIN ' + QUOTENAME(@ReportDb) + N'.sys.database_principals AS u ON u.principal_id = dp.grantee_principal_id WHERE u.name = @l COLLATE DATABASE_DEFAULT;';
 EXEC sys.sp_executesql @sql, N'@l sysname', @l = @Login;
 GO
 
