@@ -66,6 +66,7 @@ $Config = @{
     MailInstance      = 'MARSDBW1\MARS01' # instance on THIS machine that sends the email (Database Mail)
     MailProfile       = ''               # '' = default public profile, else the first profile with an account
     ReportTitle       = 'SQL Server Health & Performance Check'
+    EmailSubject      = 'Black Friday Monitoring'   # the email subject as is; '' = automatic ([STATUS] title [label] - VMs - counts)
 
     SqlLogin          = 'dba_perfcheck'  # reader login (Create_PerfCheck_Logins.sql)
     CredentialScope   = 'CurrentUser'    # or 'LocalMachine'
@@ -421,7 +422,7 @@ td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
     $names = (@($files | ForEach-Object { Split-Path $_ -Leaf })) -join ', '
     $bodyAttached = $body + "<p style='color:#555'>Full report per VM attached: $(Enc $names)</p></body></html>"
     $bodyNoFiles  = $body + "<p style='color:#555'>Full reports saved on $(Enc $env:COMPUTERNAME): $(Enc ($files -join '; '))</p></body></html>"
-    $subject = "[$tag] $($Config.ReportTitle) [$runLabel] - $($vms -join ', ') - $nRep reported, $nSkip skipped" + $(if ($nMiss) { ", $nMiss missing" } else { '' })
+    $subject = if ($Config.EmailSubject) { [string]$Config.EmailSubject } else { "[$tag] $($Config.ReportTitle) [$runLabel] - $($vms -join ', ') - $nRep reported, $nSkip skipped" + $(if ($nMiss) { ", $nMiss missing" } else { '' }) }
     $sent = Send-Report $subject $bodyAttached $bodyNoFiles $files $(if ($tag -eq 'CRITICAL') { 'High' } else { 'Normal' })
     if ($sent.Sent) { $exitCode = 0 } else { Write-Step "EMAIL NOT SENT: $($sent.Status)" 'Red'; $exitCode = 4 }
 }
