@@ -328,6 +328,21 @@ $script:RunStart = Get-Date           # used to avoid sending the same report tw
 $script:DbMailNotes = [ordered]@{}   # instance -> why Database Mail auto-setup didn't give a usable profile
 $script:KeyedUser   = $null
 
+function Get-LogonErrorHint([int]$Code) {
+    switch ($Code) {
+        1326 { 'wrong user name or password (or no domain in the user name)' }
+        1385 { 'the account is not allowed to log on locally on this VM ("Allow log on locally" / "Deny log on locally" policy)' }
+        1327 { 'account restriction (logon hours, workstations, or blank password)' }
+        1330 { 'password expired' }
+        1331 { 'account disabled' }
+        1909 { 'account locked out' }
+        1058 { 'the Secondary Logon service is disabled' }
+        267  { "your account can't open the script folder $PSScriptRoot" }
+        5    { "access denied - your account can't read $PSScriptRoot or $PSHOME" }
+        default { '' }
+    }
+}
+
 function Connect-AsUser([pscredential]$Credential) {
     # Returns $true if the keyed-in Windows account could be logged on (password / logon rights OK).
     $name = $Credential.UserName; $domain = $null; $user = $name
@@ -340,9 +355,14 @@ function Connect-AsUser([pscredential]$Credential) {
             $script:ImpIdentity = New-Object System.Security.Principal.WindowsIdentity($token)
             [void][DbaLogon]::CloseHandle($token)
             $script:ImpUser = $script:ImpIdentity.Name
+            $script:ImpLogonType = $type
+            if ($type -ne 2) {
+                Write-Step "Note: $name is not allowed to log on locally here (error $script:LastLogonError); using a network logon. Local instances may then see ANONYMOUS LOGON." 'Yellow'
+            }
             return $true
         }
         $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($type -eq 2) { $script:LastLogonError = $err }
         if ($err -eq 1326) { Write-Step "Logon failed for $name - wrong user name or password." 'Red'; return $false }
         if ($err -in 1327, 1330, 1331, 1909) { Write-Step "Logon failed for $name - account restricted, expired, disabled or locked (error $err)." 'Red'; return $false }
     }
@@ -783,6 +803,15 @@ if (-not $Inner) {
         while (-not $cred) {
             try   { $cred = Get-Credential -Message "Enter YOUR Windows account (DOMAIN\user) that has access to SQL Server - same as SSMS 'Run as different user'." }
             catch { $cred = $null }
+            if ($cred -and $cred.UserName -notmatch '\\|@') {
+                Write-Step "Enter the account with its domain, e.g. $env:USERDOMAIN\$($cred.UserName.TrimStart('\'))  (same as in SSMS 'Run as different user')." 'Red'
+                $cred = $null; continue
+            }
+            if ($cred) {
+                Write-Step "Checking the password for $($cred.UserName)..." 'DarkGray'
+                if (-not (Connect-AsUser $cred)) { $cred = $null }
+                else { Write-Step "  OK - $($script:ImpUser) (logon type $script:ImpLogonType)" 'DarkGray' }
+            }
             if (-not $cred) {
                 $ans = Read-Host "No credentials entered. R = retry, C = continue as $rdpUser only"
                 if ($ans -notmatch '^[Rr]') { break }
@@ -803,11 +832,15 @@ if (-not $Inner) {
             # window has started. This window then ran the whole check too (two runs, two emails). Wait on the process instead.
             $proc = $null
             try {
-                $proc = Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -PassThru -ErrorAction Stop
+                $proc = Start-Process -FilePath "$PSHOME\powershell.exe" -Credential $cred -ArgumentList $argList -WorkingDirectory $PSScriptRoot -LoadUserProfile -PassThru -ErrorAction Stop
             }
             catch {
-                Write-Step "Could not start as $($cred.UserName): $($_.Exception.Message)" 'Red'
-                Write-Step '  (wrong password / locked account, no "log on locally" right, or the account cannot read this folder)' 'DarkGray'
+                $code = 0; $ex = $_.Exception
+                while ($ex) { if ($ex -is [System.ComponentModel.Win32Exception]) { $code = $ex.NativeErrorCode; break }; $ex = $ex.InnerException }
+                Write-Step "Could not start the new window as $($cred.UserName): $($_.Exception.Message)$(if ($code) { " (Windows error $code)" })" 'Red'
+                $hint = Get-LogonErrorHint $code
+                if ($hint) { Write-Step "  Reason: $hint" 'Yellow' }
+                else { Write-Step '  (wrong password / locked account, no "log on locally" right, or the account cannot read this folder)' 'DarkGray' }
             }
             if ($proc) {
                 $launched = $true
