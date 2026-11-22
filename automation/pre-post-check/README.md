@@ -24,7 +24,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
 - The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the report goes in the email body instead, **without the data / log file list**, which stays in the report file on the VM (its path is given in the email).
 - If Database Mail isn't usable on an instance, the script fixes it there and checks again:
   1. **Database Mail XPs off** → it runs `sp_configure 'Database Mail XPs', 1` + `RECONFIGURE`. `show advanced options` is turned on only for this step and put back afterwards if it was off.
-  2. **No mail profile** → it runs **`db_mail_setup.sql`** (your setup script, kept next to the `.ps1`). Its batches are split on `GO` and its `PRINT` messages go to the console and log. SQLCMD-mode lines (`:setvar`, `:r`, `:connect`) aren't supported.
+  2. **No mail profile with an SMTP account** (none at all, or a profile with no account / no SMTP server) → it runs **`db_mail_setup.sql`** (your setup script, kept next to the `.ps1`). Its batches are split on `GO` and its `PRINT` messages go to the console and log. SQLCMD-mode lines (`:setvar`, `:r`, `:connect`) aren't supported.
 
   Both steps need sysadmin. If either one fails, the run carries on and the reason is shown on the `Email :` line of the summary. Turn this off with `AutoSetupDbMail = $false` in `$Config`.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.

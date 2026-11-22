@@ -437,6 +437,9 @@ function Get-MailProfileName($Connection) {
 SELECT TOP (1) p.name
 FROM msdb.dbo.sysmail_profile AS p
 LEFT JOIN msdb.dbo.sysmail_principalprofile AS pp ON pp.profile_id = p.profile_id AND pp.is_default = 1
+WHERE EXISTS (SELECT 1 FROM msdb.dbo.sysmail_profileaccount AS pa                    -- a profile only counts if it has
+              JOIN msdb.dbo.sysmail_server AS s ON s.account_id = pa.account_id      -- an account with an SMTP server
+              WHERE pa.profile_id = p.profile_id AND LTRIM(RTRIM(ISNULL(s.servername, ''))) <> '')
 ORDER BY CASE WHEN p.name = @pref THEN 0 WHEN pp.profile_id IS NOT NULL THEN 1 ELSE 2 END, p.profile_id;
 "@
     $r = Invoke-Scalar $Connection $q @{ '@pref' = $Config.MailProfile }
@@ -445,14 +448,18 @@ ORDER BY CASE WHEN p.name = @pref THEN 0 WHEN pp.profile_id IS NOT NULL THEN 1 E
 }
 
 function Get-DbMailState($Connection) {
-    # XpsOn = 'Database Mail XPs' value_in_use = 1; Profiles = number of profiles in msdb
+    # XpsOn = 'Database Mail XPs' value_in_use = 1; Profiles = profiles in msdb;
+    # Usable = profiles that have an account with an SMTP server (a profile without one can't send)
     $q = @"
 SELECT CAST(ISNULL((SELECT value_in_use FROM sys.configurations WHERE name = N'Database Mail XPs'), 0) AS int) AS xps,
-       (SELECT COUNT(*) FROM msdb.dbo.sysmail_profile) AS profiles;
+       (SELECT COUNT(*) FROM msdb.dbo.sysmail_profile) AS profiles,
+       (SELECT COUNT(DISTINCT pa.profile_id) FROM msdb.dbo.sysmail_profileaccount AS pa
+          JOIN msdb.dbo.sysmail_server AS s ON s.account_id = pa.account_id
+         WHERE LTRIM(RTRIM(ISNULL(s.servername, ''))) <> '') AS usable;
 "@
     $cmd = $Connection.CreateCommand(); $cmd.CommandText = $q; $cmd.CommandTimeout = 60
     $r = $cmd.ExecuteReader()
-    try { [void]$r.Read(); return [pscustomobject]@{ XpsOn = ([int]$r.GetValue(0) -eq 1); Profiles = [int]$r.GetValue(1) } }
+    try { [void]$r.Read(); return [pscustomobject]@{ XpsOn = ([int]$r.GetValue(0) -eq 1); Profiles = [int]$r.GetValue(1); Usable = [int]$r.GetValue(2) } }
     finally { $r.Close() }
 }
 
@@ -484,7 +491,7 @@ function Invoke-DbMailSetup($Connection, [string]$Instance) {
         Write-Step "Database Mail setup script not found ($file) - skipping auto-setup on $Instance." 'Yellow'
         $script:DbMailNotes[$Instance] = "setup script not found: $file"; return $false
     }
-    Write-Step "No Database Mail profile on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
+    Write-Step "No Database Mail profile with an SMTP account on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
     $text = Get-Content -LiteralPath $file -Raw
     $batches = [regex]::Split($text, '(?im)^[ \t]*GO[ \t]*(?:--.*)?\r?$') | Where-Object { $_ -match '\S' }
     $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
@@ -963,16 +970,16 @@ try {
             if (-not $profileName -and $Config.AutoSetupDbMail) {
                 try {
                     $st = Get-DbMailState $conn
-                    Write-Step "Database Mail on $($t.Instance): XPs $(if ($st.XpsOn) { 'enabled' } else { 'disabled' }), $($st.Profiles) profile(s)" 'Yellow'
+                    Write-Step "Database Mail on $($t.Instance): XPs $(if ($st.XpsOn) { 'enabled' } else { 'disabled' }), $($st.Profiles) profile(s), $($st.Usable) with an SMTP account" 'Yellow'
                     # 1) XPs off -> enable them (sp_configure + RECONFIGURE)
                     if (-not $st.XpsOn) { [void](Enable-DbMailXps $conn $t.Instance) }
-                    # 2) no profile -> run the Database Mail setup script
-                    if ($st.Profiles -eq 0) { [void](Invoke-DbMailSetup $conn $t.Instance) }
+                    # 2) no profile with an SMTP account -> run the Database Mail setup script
+                    if ($st.Usable -eq 0) { [void](Invoke-DbMailSetup $conn $t.Instance) }
                     $profileName = Get-MailProfileName $conn
                     if ($profileName) { Write-Step "Database Mail profile now available: $profileName" 'Green' }
                     elseif (-not $script:DbMailNotes.Contains($t.Instance)) {
                         $st2 = Get-DbMailState $conn
-                        $script:DbMailNotes[$t.Instance] = "still not usable after auto-setup (Database Mail XPs = $(if ($st2.XpsOn) { 1 } else { 0 }), profiles = $($st2.Profiles))"
+                        $script:DbMailNotes[$t.Instance] = "still not usable after auto-setup (Database Mail XPs = $(if ($st2.XpsOn) { 1 } else { 0 }), profiles = $($st2.Profiles), with an SMTP account = $($st2.Usable))"
                         Write-Step "  $($script:DbMailNotes[$t.Instance])" 'Yellow'
                     }
                 }
@@ -981,6 +988,8 @@ try {
                     $script:DbMailNotes[$t.Instance] = "auto-setup error: $($_.Exception.Message)"
                 }
             }
+            if ($profileName) { Write-Step "Database Mail  : profile '$profileName' ready on $($t.Instance)" 'DarkGray' }
+            elseif (-not $Config.AutoSetupDbMail) { Write-Step "Database Mail  : not usable on $($t.Instance) and AutoSetupDbMail is off - db_mail_setup.sql not run." 'Yellow' }
             if ($profileName) { $mailCandidates += [pscustomobject]@{ Instance = $t.Instance; Profile = $profileName; Local = [bool]$t.Service } }
             else { Write-Step "Database Mail is not configured / enabled on $($t.Instance) - another instance will be used to send, if any." 'Yellow' }
 
