@@ -351,7 +351,25 @@ function Connect-AsUser([pscredential]$Credential) {
 }
 
 function Test-SqlAccess($Connection) {
-    try { return ([int](Invoke-Scalar $Connection "SELECT ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0);") -eq 1) } catch { return $false }
+    # Enough access for the checks: sysadmin, CONTROL SERVER, VIEW SERVER STATE, or (2022+) VIEW SERVER PERFORMANCE STATE.
+    # Sets $script:LastAccessInfo to what SQL Server sees (login name, sysadmin, permission) for the log.
+    $q = @"
+SELECT SUSER_SNAME() + ' (sysadmin=' + CAST(ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0) AS varchar(1))
+     + ', VIEW SERVER STATE=' + CAST(ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0) AS varchar(1)) + ')',
+       CASE WHEN ISNULL(IS_SRVROLEMEMBER('sysadmin'), 0) = 1
+              OR ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER'), 0) = 1
+              OR ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE'), 0) = 1
+              OR ISNULL(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER PERFORMANCE STATE'), 0) = 1
+            THEN 1 ELSE 0 END;
+"@
+    $script:LastAccessInfo = ''
+    try {
+        $cmd = $Connection.CreateCommand(); $cmd.CommandText = $q; $cmd.CommandTimeout = 60
+        $r = $cmd.ExecuteReader()
+        try { [void]$r.Read(); $script:LastAccessInfo = "SQL Server sees login $([string]$r.GetValue(0))"; return ([int]$r.GetValue(1) -eq 1) }
+        finally { $r.Close() }
+    }
+    catch { $script:LastAccessInfo = "access check failed: $($_.Exception.Message)"; return $false }
 }
 
 function Open-SqlConnection([string]$Instance, [switch]$RequirePerms, [switch]$NoImpersonation) {
@@ -366,7 +384,7 @@ function Open-SqlConnection([string]$Instance, [switch]$RequirePerms, [switch]$N
         finally { if ($ctx) { $ctx.Undo() } }
         if ($conn) {
             if (Test-SqlAccess $conn) { return [pscustomobject]@{ Connection = $conn; As = $script:ImpUser } }
-            $notes += "$($script:ImpUser): connected but has no VIEW SERVER STATE"
+            $notes += "$($script:ImpUser): connected but has no VIEW SERVER STATE - $($script:LastAccessInfo)"
             $conn.Dispose()
         }
         Write-Step "  $($script:ImpUser) can't be used on $Instance - trying $current" 'Yellow'
@@ -379,8 +397,8 @@ function Open-SqlConnection([string]$Instance, [switch]$RequirePerms, [switch]$N
         throw ((@($notes) + "$($current): $($_.Exception.Message)") -join ' | ')
     }
     if (-not (Test-SqlAccess $conn)) {
-        if ($RequirePerms) { $conn.Dispose(); throw "$current has no VIEW SERVER STATE on $Instance" }
-        Write-Step "  WARNING: $current has no VIEW SERVER STATE on $Instance - some checks will be empty." 'Yellow'
+        if ($RequirePerms) { $conn.Dispose(); throw "$current connected to $Instance but has no VIEW SERVER STATE - $($script:LastAccessInfo)" }
+        Write-Step "  WARNING: $current has no VIEW SERVER STATE on $Instance - some checks will be empty ($($script:LastAccessInfo))." 'Yellow'
     }
     return [pscustomobject]@{ Connection = $conn; As = $current }
 }
@@ -813,7 +831,7 @@ if (-not $Inner) {
                 foreach ($r in $ho['retry']) { $script:RetryErrors[[string]$r['Instance']] = [string]$r['Error'] }
                 $script:KeyedUser = [string]$ho['user']
                 Write-Step "`n$($script:KeyedUser) could not check $($script:RetryErrors.Count) instance(s) - retrying them as $rdpUser (fail-safe):" 'Yellow'
-                $script:RetryErrors.Keys | ForEach-Object { Write-Step "  $_" 'Yellow' }
+                $script:RetryErrors.Keys | ForEach-Object { Write-Step "  $_" 'Yellow'; Write-Step "    reason: $($script:RetryErrors[$_])" 'DarkGray' }
                 [void](Connect-AsUser $cred)      # lets the email still be sent as your account
             }
             else {
@@ -902,7 +920,10 @@ try {
         try {
             $oc = Open-SqlConnection $t.Instance -RequirePerms:([bool]$HandOff) -NoImpersonation:([bool]$script:RetryErrors)
             $conn = $oc.Connection; $row.ConnectedAs = $oc.As; $stage = 'collect'
-            Write-Step "Connected as   : $($oc.As)"
+            if ($script:RetryErrors -and $script:RetryErrors.ContainsKey([string]$t.Instance)) {
+                $row.ConnectedAs = "$($oc.As) (fallback: $($script:KeyedUser) - $($script:RetryErrors[[string]$t.Instance]))"
+            }
+            Write-Step "Connected as   : $($oc.As)  [$($script:LastAccessInfo)]"
             $profileName = $null
             try { $profileName = Get-MailProfileName $conn }
             catch { Write-Step "WARNING: could not read Database Mail profiles on $($t.Instance): $($_.Exception.Message)" 'Yellow' }
@@ -1071,7 +1092,10 @@ try {
         }
         catch {
             $row.Outcome = 'FAILED: ' + $_.Exception.Message; $row.State = 'FAILED'
-            if ($HandOff -and $stage -eq 'connect') { $row.State = 'RETRY'; $row.Outcome = $_.Exception.Message }
+            if ($HandOff -and $stage -eq 'connect') {
+                $row.State = 'RETRY'; $row.Outcome = $_.Exception.Message
+                Write-Step "  Handing $($t.Instance) back to the RDP window - reason: $($_.Exception.Message)" 'Yellow'
+            }
             if ($script:RetryErrors -and $stage -eq 'connect') { $row.Outcome = "FAILED: $($script:KeyedUser): $($script:RetryErrors[[string]$t.Instance]) | $($me): $($_.Exception.Message)" }
             $row.ShortHtml = "<h1>$(Enc $t.Instance)</h1><div class='banner' style='background:#f8d7da'>$(Enc $row.Outcome)</div>"
             $row.FullHtml = $row.ShortHtml; $row.BodyHtml = $row.ShortHtml
