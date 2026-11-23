@@ -831,7 +831,7 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
             WHERE (RTRIM(object_name) LIKE N'%:SQL Statistics'     AND counter_name IN (N'Batch Requests/sec', N'SQL Compilations/sec', N'SQL Re-Compilations/sec'))
                OR (RTRIM(object_name) LIKE N'%:General Statistics' AND counter_name IN (N'User Connections', N'Processes blocked'))
                OR (RTRIM(object_name) LIKE N'%:Locks'              AND instance_name = N'_Total'
-                                                                   AND counter_name IN (N'Lock Waits/sec', N'Lock Wait Time (ms)', N'Lock Timeouts/sec', N'Number of Deadlocks/sec'))
+                                                                   AND counter_name IN (N'Lock Waits/sec', N'Lock Wait Time (ms)', N'Lock Timeouts (timeout > 0)/sec', N'Number of Deadlocks/sec'))
                OR (RTRIM(object_name) LIKE N'%:Buffer Manager'     AND counter_name IN (N'Page life expectancy', N'Buffer cache hit ratio', N'Buffer cache hit ratio base'))
                OR (RTRIM(object_name) LIKE N'%:Memory Manager'     AND counter_name IN (N'Memory Grants Pending', N'Target Server Memory (KB)', N'Total Server Memory (KB)'))
                OR (RTRIM(object_name) LIKE N'%:Databases'          AND counter_name IN (N'Transactions/sec', N'Log Flush Wait Time', N'Log Bytes Flushed/sec'))
@@ -1131,7 +1131,7 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
                MAX(CASE WHEN p.ctr = N'User Connections' THEN p.v END) AS user_conn,
                SUM(CASE WHEN p.obj = N'Locks' AND p.ctr = N'Lock Waits/sec' THEN p.d END) AS lw_d,
                SUM(CASE WHEN p.obj = N'Locks' AND p.ctr = N'Lock Wait Time (ms)' THEN p.d END) AS lwt_d,
-               SUM(CASE WHEN p.obj = N'Locks' AND p.ctr = N'Lock Timeouts/sec' THEN p.d END) AS lto_d,
+               SUM(CASE WHEN p.obj = N'Locks' AND p.ctr = N'Lock Timeouts (timeout > 0)/sec' THEN p.d END) AS lto_d,   -- real timeouts only: 'Lock Timeouts/sec' also counts NOWAIT / timeout-0 probes
                SUM(CASE WHEN p.obj = N'Locks' AND p.ctr = N'Number of Deadlocks/sec' THEN p.d END) AS dl_d,
                MAX(CASE WHEN p.ctr = N'Page life expectancy' THEN p.v END) AS ple,
                MAX(CASE WHEN p.ctr = N'Buffer cache hit ratio' THEN p.v END) AS bchr,
@@ -1244,7 +1244,7 @@ WITH (MAX_DISPATCH_LATENCY = 5 SECONDS, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVEN
     INSERT #pissues SELECT 'WARNING', 'Locking', N'Blocking', N'Sessions blocked over ' + CAST(@BlockedThresholdSec AS nvarchar(10)) + N' s: up to ' + CAST(ISNULL(MAX(blocked), 0) AS nvarchar(10))
                          + N' at a time, ' + CAST((SELECT COUNT(*) FROM #x_blocked) AS nvarchar(10)) + N' blocked process report(s), longest ' + CAST(ISNULL(MAX(max_block_s), 0) AS nvarchar(20)) + N' s'
         FROM #iv HAVING MAX(blocked) > 0 OR (SELECT COUNT(*) FROM #x_blocked) > 0;
-    INSERT #pissues SELECT 'WARNING', 'Locking', N'Lock timeouts', CAST(SUM(lock_timeouts) AS nvarchar(20)) + N' lock timeout(s)' FROM #iv HAVING SUM(lock_timeouts) > 0;
+    INSERT #pissues SELECT 'WARNING', 'Locking', N'Lock timeouts', CAST(SUM(lock_timeouts) AS nvarchar(20)) + N' lock timeout(s) - requests that waited and gave up (LOCK_TIMEOUT > 0)' FROM #iv HAVING SUM(lock_timeouts) > 0;
     INSERT #pissues SELECT 'WARNING', 'I/O', N'Data file read latency', N'Average ' + CAST(CAST(AVG(data_read_ms) AS decimal(18, 1)) AS nvarchar(20)) + N' ms (threshold ' + CAST(@DataReadMs AS nvarchar(10)) + N' ms)'
         FROM #iv HAVING AVG(data_read_ms) > @DataReadMs;
     INSERT #pissues SELECT 'WARNING', 'I/O', N'Log file write latency', N'Average ' + CAST(CAST(AVG(log_write_ms) AS decimal(18, 1)) AS nvarchar(20)) + N' ms (threshold ' + CAST(@LogWriteMs AS nvarchar(10)) + N' ms)'
