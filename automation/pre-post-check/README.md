@@ -1,6 +1,6 @@
 # One-click PRE / POST change check
 
-> **Just 3 files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`. Copy them together to a folder on the VM, for example `C:\DBA\PrePostCheck`. The older `automation/health-check` folder (script 44) isn't needed.
+> **Just 3 files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`. Copy them together to a folder on the VM, for example `C:\DBA\PrePostCheck`. Always copy `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql` together: both carry a version number, shown in the report and email footer, and the run warns if they differ.
 
 Double-click `Run-PrePostCheck.bat` and choose:
 
@@ -9,7 +9,8 @@ Double-click `Run-PrePostCheck.bat` and choose:
 | 1 | **PRE** | Snapshot before a change, stored on the VM and emailed |
 | 2 | **POST** | Snapshot after the change, compared with PRE, emailed as SUCCESS or DIFFERENCES |
 | 3 | **HEALTH** | Health check only: one combined report with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject. Nothing is stored for comparison |
-| 4 | **CLEANUP** | Delete old snapshots, reports and logs (this also runs automatically at the start of every check) |
+
+Every run also deletes old snapshots, reports and logs (see [Cleanup](#cleanup)).
 
 Before a change (patching, CU, in-place upgrade, failover test, config change), run it with **PRE**. After the change, run it with **POST**. It checks **every SQL instance on the VM**:
 
@@ -29,7 +30,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
   Both steps need sysadmin. If either one fails, the run carries on and the reason is shown on the `Email :` line of the summary. Turn this off with `AutoSetupDbMail = $false` in `$Config`.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
-Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
+Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `AttachReport = $false` in `$Config` to always put the report in the body.
 
 ## Files
 
@@ -90,7 +91,6 @@ Last-backup *times*, log usage %, queue sizes and CPU are not compared, because 
 
 ```bat
 Run-PrePostCheck.bat -Phase HEALTH
-Run-PrePostCheck.bat -Phase CLEANUP
 ```
 
 ```powershell
@@ -107,13 +107,25 @@ For the SSIS / SSRS / SSAS sections it also needs:
 - **SSRS:** read access to the report server database (for example `ReportServer`). It must be on the same instance; a remote report server catalog isn't seen.
 - **SSAS:** SSAS server administrator rights, and the **MSOLAP OLE DB provider** on the VM (installed with SSAS / SSMS). If either is missing, the SSAS service state is still captured and a warning explains why the databases couldn't be read.
 - SSIS/SSRS/SSAS **services** are read from the VM itself, so they're only captured for instances discovered on this VM, not for `ExtraInstances` entries.
-For other problems (credentials, folder access, `Login failed`, mail stuck as `unsent`/`failed`, execution policy), see the troubleshooting table in [`../health-check/README.md`](../health-check/README.md); the same fixes apply.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| "Could not start … directory name is invalid" | Your account can't read the folder. Move the files to a folder your account can read and write, for example `C:\DBA\PrePostCheck`. |
+| "The user name or password is incorrect" / "logon failure" | Wrong password, a locked account, or the account isn't allowed to log on to the VM. Enter it as `DOMAIN\user`. |
+| `Login failed for user …` | That account has no SQL login on the instance. Use the account you use for SSMS. |
+| "No Database Mail profile" | See the Database Mail notes above (`db_mail_setup.sql`), or set `MailProfile`. |
+| Email status `unsent` | Still in the queue. Check later with `SELECT TOP 5 * FROM msdb.dbo.sysmail_allitems ORDER BY mailitem_id DESC`. |
+| Email status `failed` | The reason is shown in the summary. The full detail is in `msdb.dbo.sysmail_event_log`, usually an SMTP or relay problem. |
+| Execution policy error despite `-ExecutionPolicy Bypass` | Group Policy enforces signing. Sign the script, or ask for an exception for the folder. If the files were downloaded, run `Unblock-File .\*.ps1` once. |
+| Window closes immediately | Run `Run-PrePostCheck.bat` from a `cmd` window to see the error. The log is in `Logs\`. |
 
 ## Cleanup
 
 Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `$Config`.
 
-To clean up without running a check, choose `4` CLEANUP, or schedule `Run-PrePostCheck.bat -Phase CLEANUP` daily in Task Scheduler ("Start in": this folder). Cleanup doesn't ask for credentials or start Secondary Logon.
+There is no separate CLEANUP option. If a Task Scheduler job runs `Run-PrePostCheck.bat -Phase CLEANUP`, remove it: it now stops with a message.
 
 ## AG failover tool (`AG-FailoverTool.ps1`)
 

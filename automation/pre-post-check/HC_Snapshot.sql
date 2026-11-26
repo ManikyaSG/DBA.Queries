@@ -11,6 +11,7 @@
  Tags    : [BOX] 2016 SP2 - 2025 / Azure VM   [MI] (services/disks skipped)
  Note    : Can also be run on its own in SSMS to see every section as a grid.
 *******************************************************************************/
+--@version 1.0.0   (shown in the report footer; keep the same as $ToolVersion in Invoke-PrePostCheck.ps1)
 SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;

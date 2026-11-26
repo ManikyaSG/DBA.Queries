@@ -5,20 +5,16 @@ REM  Double-click while logged in with the generic admin account, then choose:
 REM    1 PRE     - snapshot stored on this VM + emailed (before a change)
 REM    2 POST    - compared with PRE, emails SUCCESS or DIFFERENCES FOUND
 REM    3 HEALTH  - health check report only
-REM    4 CLEANUP - delete old snapshots / reports / logs (also done on every run)
+REM  Every run also deletes old snapshots / reports / logs.
 REM  It starts the Secondary Logon service, asks for YOUR Windows account and
 REM  runs as that account; instances it can't use are retried as the RDP account.
 REM  Command line:  Run-PrePostCheck.bat -Phase HEALTH
-REM                 Run-PrePostCheck.bat -Phase CLEANUP   (e.g. from Task Scheduler)
 REM  Only 3 files, kept together in a folder your account can read and write:
 REM    Run-PrePostCheck.bat, Invoke-PrePostCheck.ps1, HC_Snapshot.sql
 REM ==========================================================================
 setlocal
 title SQL Server PRE-POST / Health Check
 cd /d "%~dp0"
-
-REM Cleanup only: no Secondary Logon / credentials needed
-echo %* | find /i "CLEANUP" >nul && goto :run
 
 REM --- Make sure the Secondary Logon service (needed for "run as different user") is running ---
 sc query seclogon | find /i "RUNNING" >nul
@@ -46,7 +42,6 @@ if errorlevel 1 (
     )
 )
 
-:run
 if not exist "%~dp0Invoke-PrePostCheck.ps1" (
     echo Invoke-PrePostCheck.ps1 not found in %~dp0
     pause
