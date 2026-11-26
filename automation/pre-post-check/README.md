@@ -53,7 +53,7 @@ Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\`
 1. RDP in with the generic admin account and double-click `Run-PrePostCheck.bat`.
 2. Choose `1` PRE, `2` POST or `3` HEALTH, then enter the **change ticket**. The ticket is how PRE and POST get paired, so use the same one for both runs.
 3. Enter **your** Windows account at the credential prompt, the same one you use for SSMS "Run as different user". **This is always the first choice.**
-   - The `.bat` (and the script) start the **Secondary Logon** service if it's stopped or disabled (UAC prompt if the window isn't elevated). The check then runs **as your account** in a new window.
+   - The `.bat` (and the script) start the **Secondary Logon** service if it's stopped or disabled (UAC prompt if the window isn't elevated). The check then runs **as your account** in a **hidden** window, and its progress, summary and result are shown in the window you started from, so you only work in **one window**. A console window may flash for a moment when it starts.
    - **Fail-safe, per instance:** if your account can't log in to an instance, or has no `VIEW SERVER STATE` there, that instance is handed back to the original window and retried as the **logged-in RDP account**. Everything still ends up in one combined report and one email. If both accounts fail, the instance shows *FAILED* with both errors.
    - **Fail-safe, run-as:** if the new window can't start at all (Secondary Logon won't start, or the logon is refused), the script uses your account from the original window instead, still before the RDP account.
    - The summary, report and email have a **ConnectedAs** column, so you can see which account checked each instance.
@@ -62,7 +62,7 @@ Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\`
 
 **When to run POST:** after services are up and the **AG databases are SYNCHRONIZED** again. If they're still catching up, the check will rightly report it as a difference. Also resume any jobs you paused, otherwise jobs left disabled will show up as differences.
 
-If POST finds no PRE for that ticket, it offers the **latest PRE for that instance** and shows its ticket, time and user, then asks you to confirm. If you decline or none exists, it sends the POST report as *NO BASELINE*.
+If POST finds no PRE for that ticket on some instances, it asks you **once, right after you enter the ticket** (before the check starts): it lists those instances with their **latest PRE** (ticket, time, user) and asks whether to use them as the baseline. *N*, or no older PRE at all, sends those instances' POST report as *NO BASELINE*. Nothing else asks for input once the check has started.
 
 ## What is compared
 

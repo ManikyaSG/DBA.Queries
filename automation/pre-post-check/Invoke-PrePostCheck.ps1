@@ -10,7 +10,8 @@
     RDP in with the generic admin account and double-click Run-PrePostCheck.bat:
       1. Choose PRE or POST and enter the change ticket.
       2. Enter YOUR Windows account (as for SSMS "Run as different user"); the script
-         starts the Secondary Logon service if needed and relaunches itself as you.
+         starts the Secondary Logon service if needed and relaunches itself as you in a
+         hidden window; its progress is shown in this window, so there is one window.
          Fail-safe: any instance your account can't log in to (or has no VIEW SERVER
          STATE on) is retried as the logged-in RDP account, and if run-as can't start
          at all, your account is used from this window. Cancel = RDP account only.
@@ -50,7 +51,10 @@ param(
     [string[]] $Instances,
     [string]   $SqlFile,
     [switch]   $Inner,
-    [string]   $HandOff               # internal: result file shared with the original (RDP) window
+    [string]   $HandOff,              # internal: result file shared with the original (RDP) window
+    [string]   $ConsoleFile,          # internal: the hidden run-as window writes its progress here; this window shows it
+    [ValidateSet('Ask', 'Yes', 'No')]
+    [string]   $BaselineFallback = 'Ask'   # POST without a PRE for the ticket: use the instance's latest PRE? (asked before the run)
 )
 
 $ToolVersion = '1.0.0'               # shown in the report / email footer; keep the same as --@version in HC_Snapshot.sql
@@ -169,7 +173,41 @@ function ConvertTo-PlainObject($InputObject) {
     return [string]$base
 }
 
-function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
+$script:ConsoleFile = $ConsoleFile
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+function Write-Step([string]$Text, [string]$Color = 'Cyan') {
+    Write-Host $Text -ForegroundColor $Color
+    # Hidden run-as window: also write the line to the console file; the visible window shows it.
+    if ($script:ConsoleFile) {
+        $lines = @(([string]$Text) -split "`r?`n" | ForEach-Object { "$Color`t$_" })
+        try { [System.IO.File]::AppendAllText($script:ConsoleFile, (($lines -join "`n") + "`n"), $script:Utf8NoBom) } catch { }
+    }
+}
+
+function Show-ConsoleFile([string]$Path, [ref]$Position, [switch]$Final) {
+    # Prints the complete lines added to the console file since $Position (with their colour). -Final also prints a last unfinished line.
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            if ($fs.Length -le $Position.Value) { return }
+            $fs.Position = $Position.Value
+            $buf = New-Object byte[] ([int]($fs.Length - $Position.Value))
+            $n = $fs.Read($buf, 0, $buf.Length)
+        }
+        finally { $fs.Dispose() }
+    }
+    catch { return }
+    $end = if ($Final) { $n } else { [Array]::LastIndexOf($buf, [byte]10, $n - 1) + 1 }   # up to the last complete line
+    if ($end -le 0) { return }
+    $Position.Value += $end
+    foreach ($line in ($script:Utf8NoBom.GetString($buf, 0, $end) -split "`n")) {
+        if ($line -eq '') { continue }
+        $color, $text = $line -split "`t", 2
+        if ($null -eq $text) { $text = $color; $color = 'Gray' }
+        try { Write-Host $text -ForegroundColor $color } catch { Write-Host $text }
+    }
+}
 
 function Start-SecondaryLogonService {
     # "Run as different user" / Start-Process -Credential need the Secondary Logon service (seclogon).
@@ -214,6 +252,21 @@ function Get-Val($Row, [string]$Col) {
     $p = $Row.PSObject.Properties[$Col]
     if ($p -and $null -ne $p.Value) { return ([string]$p.Value).Trim() }
     return ''
+}
+
+function Find-PreSnapshot([string]$Instance) {
+    # PRE snapshot for this ticket (SameTicket = $true), else the instance's latest PRE of any ticket, else $null.
+    $safe = Get-SafeFileName $Instance
+    $f = Get-ChildItem -Path (Join-Path $Config.SnapshotRoot $Ticket) -Filter ("{0}_PRE_*.json" -f $safe) -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+    if ($f) { return [pscustomobject]@{ File = $f; SameTicket = $true } }
+    $c = Get-ChildItem -Path $Config.SnapshotRoot -Recurse -Filter ("{0}_PRE_*.json" -f $safe) -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($c) { return [pscustomobject]@{ File = $c; SameTicket = $false } }
+    return $null
+}
+
+function Get-SnapshotMeta($File) {
+    try { $m = $Json.DeserializeObject([System.IO.File]::ReadAllText($File.FullName))['meta']; if ($m) { return $m } } catch { }
+    return @{ ticket = '?'; taken_at = '?'; taken_by = '?' }
 }
 
 function Get-SqlFilePath {
@@ -791,6 +844,26 @@ if (-not $Inner) {
     $Ticket = ([string]$Ticket).Trim() -replace '[^A-Za-z0-9_-]', ''
     if (-not $Ticket) { $Ticket = if ($Phase -eq 'HEALTH') { 'DAILY' } else { 'NO-TICKET' } }
 
+    # POST: instances without a PRE for this ticket - ask ONCE, now, whether to compare with their latest PRE
+    # (the check itself runs in a hidden window and must not stop to ask)
+    if ($Phase -eq 'POST' -and $BaselineFallback -eq 'Ask') {
+        $other = @()
+        foreach ($t in @(Get-TargetInstances)) {
+            $p = Find-PreSnapshot $t.Instance
+            if ($p -and -not $p.SameTicket) {
+                $m = Get-SnapshotMeta $p.File
+                $other += [pscustomobject]@{ Instance = $t.Instance; 'Latest PRE ticket' = $m['ticket']; Taken = $m['taken_at']; By = $m['taken_by'] }
+            }
+        }
+        $BaselineFallback = 'No'
+        if ($other.Count) {
+            Write-Step "No PRE snapshot for ticket $Ticket on $($other.Count) instance(s). Their latest PRE is:" 'Yellow'
+            $other | Format-Table -AutoSize | Out-String | Write-Host
+            $ans = Read-Host 'Use these as the baseline? (Y = compare with them, N = report these instances as NO BASELINE)'
+            if ($ans -match '^[Yy]') { $BaselineFallback = 'Yes' }
+        }
+    }
+
     $rdpUser = "$env:USERDOMAIN\$env:USERNAME"
     $cred = $null
     if (-not $UseCurrentUser) {
@@ -819,10 +892,12 @@ if (-not $Inner) {
         if (-not (Test-Path $Config.LogsFolder)) { try { New-Item -ItemType Directory -Path $Config.LogsFolder -Force | Out-Null } catch { } }
         $handOffFile = Join-Path $Config.LogsFolder ("handoff_{0}_{1}.json" -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID)
         if (Start-SecondaryLogonService) {
-            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket, '-HandOff', "`"$handOffFile`"")
+            $consoleFile = Join-Path $Config.LogsFolder ("console_{0}_{1}.txt" -f (Get-Date -Format 'yyyyMMddHHmmss'), $PID)
+            $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket,
+                         '-HandOff', "`"$handOffFile`"", '-ConsoleFile', "`"$consoleFile`"", '-BaselineFallback', $BaselineFallback)
             if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
             if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
-            Write-Step "Starting the check as $($cred.UserName) in a new window..." 'Green'
+            Write-Step "Starting the check as $($cred.UserName) (hidden window - its progress is shown here)..." 'Green'
             # No -Wait: with -Credential, Windows PowerShell's -Wait can fail with "Access is denied" AFTER the new
             # window has started. This window then ran the whole check too (two runs, two emails). Wait on the process instead.
             $proc = $null
@@ -839,9 +914,16 @@ if (-not $Inner) {
             }
             if ($proc) {
                 $launched = $true
-                Write-Step "Running in the other window (PID $($proc.Id)) - this window waits for it to finish..." 'DarkGray'
-                try { $proc.WaitForExit() }
-                catch { while (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 2 } }
+                Write-Step "Running as $($cred.UserName) (PID $($proc.Id))`n" 'DarkGray'
+                $pos = [long]0
+                while ($true) {
+                    $done = try { $proc.HasExited } catch { -not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) }
+                    Show-ConsoleFile $consoleFile ([ref]$pos) -Final:$done
+                    if ($done) { break }
+                    Start-Sleep -Milliseconds 500
+                }
+                if ($pos -eq 0) { Write-Step "The check as $($cred.UserName) showed no progress (it could not write to $($Config.LogsFolder)?)." 'Yellow' }
+                Remove-Item -LiteralPath $consoleFile -Force -ErrorAction SilentlyContinue
             }
         }
         if ($launched) {
@@ -850,7 +932,16 @@ if (-not $Inner) {
                 try { $ho = $Json.DeserializeObject([System.IO.File]::ReadAllText($handOffFile)) } catch { }
                 Remove-Item -LiteralPath $handOffFile -Force -ErrorAction SilentlyContinue
             }
-            if ($ho -and $ho['status'] -eq 'done') { exit 0 }
+            if ($ho -and $ho['status'] -eq 'done') {
+                # No email sent: open the combined report here (as the RDP user, in this session)
+                $rep = [string]$ho['report']
+                if ($rep -and [string]$ho['mail'] -notlike 'Queued*' -and (Test-Path -LiteralPath $rep)) {
+                    Write-Step 'Opening the combined report...' 'Yellow'
+                    try { Invoke-Item -LiteralPath $rep } catch { Write-Step "Could not open it: $($_.Exception.Message)" 'Yellow' }
+                }
+                Read-Host "`nPress Enter to close"
+                exit 0
+            }
             if ($ho -and $ho['status'] -eq 'retry') {
                 # FAIL-SAFE: re-check only the instances your account could not use, as the RDP user
                 $script:HandOffRows = @($ho['rows'] | ForEach-Object { New-Object psobject -Property $_ })
@@ -863,7 +954,7 @@ if (-not $Inner) {
                 [void](Connect-AsUser $cred)      # lets the email still be sent as your account
             }
             else {
-                Write-Step "The check as $($cred.UserName) ended without handing back a result. If it already emailed the report, running again here won't send a second copy." 'Yellow'
+                Write-Step "The check as $($cred.UserName) ended without handing back a result (see the newest PrePostCheck_*.log in $($Config.LogsFolder)). If it already emailed the report, running again here won't send a second copy." 'Yellow'
                 $ans = Read-Host "Run it from this window instead ($($cred.UserName) first, then $rdpUser)? (Y/N)"
                 if ($ans -notmatch '^[Yy]') { exit 1 }
                 [void](Connect-AsUser $cred)
@@ -890,10 +981,10 @@ foreach ($key in @('SnapshotRoot', 'ReportsFolder', 'LogsFolder')) {
         $probe = Join-Path $Config[$key] ('.write_test_' + $stamp); [System.IO.File]::WriteAllText($probe, 'x'); Remove-Item $probe -Force
     }
     catch {
-        if ($key -eq 'SnapshotRoot' -and -not $script:RetryErrors) { Write-Step "ERROR: no write access to $($Config[$key]). Snapshots must be stored there - fix folder permissions." 'Red'; Read-Host 'Press Enter to close'; exit 1 }
+        if ($key -eq 'SnapshotRoot' -and -not $script:RetryErrors) { Write-Step "ERROR: no write access to $($Config[$key]). Snapshots must be stored there - fix folder permissions." 'Red'; if (-not $Inner) { Read-Host 'Press Enter to close' }; exit 1 }
         $fallback = Join-Path $env:TEMP ('DBA_PrePostCheck\' + (Split-Path $Config[$key] -Leaf))
         New-Item -ItemType Directory -Path $fallback -Force | Out-Null
-        Write-Warning "No write access to $($Config[$key]) - using $fallback"; $Config[$key] = $fallback
+        Write-Step "WARNING: no write access to $($Config[$key]) - using $fallback" 'Yellow'; $Config[$key] = $fallback
     }
 }
 $logFile = Join-Path $Config.LogsFolder "PrePostCheck_${Phase}_${Ticket}_$stamp.log"
@@ -916,7 +1007,7 @@ try {
     $targets = Get-TargetInstances
     if (-not $targets) { throw 'No SQL Server instances found on this VM and ExtraInstances is empty.' }
     if ($script:RetryErrors) { $targets = @($targets | Where-Object { $script:RetryErrors.ContainsKey([string]$_.Instance) }) }
-    $targets | Format-Table Instance, Service, Status -AutoSize | Out-String | Write-Host
+    Write-Step (($targets | Format-Table Instance, Service, Status -AutoSize | Out-String).TrimEnd()) 'Gray'
     $ticketDir = Join-Path $Config.SnapshotRoot $Ticket
     if ($Phase -ne 'HEALTH' -and -not (Test-Path $ticketDir)) { New-Item -ItemType Directory -Path $ticketDir -Force | Out-Null }
     if ($Phase -eq 'HEALTH') { $Config.ReportTitle = $Config.HealthReportTitle }
@@ -1055,15 +1146,24 @@ try {
             }
             else {
                 # ---- find the PRE baseline -------------------------------------------------
-                $preFile = Get-ChildItem -Path $ticketDir -Filter ("{0}_PRE_*.json" -f $safe) -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-                if (-not $preFile) {
-                    $cand = Get-ChildItem -Path $Config.SnapshotRoot -Recurse -Filter ("{0}_PRE_*.json" -f $safe) -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                    if ($cand) {
-                        $cm = $Json.DeserializeObject([System.IO.File]::ReadAllText($cand.FullName))['meta']
-                        Write-Step "No PRE snapshot for ticket $Ticket on this instance." 'Yellow'
-                        $ans = Read-Host ("Latest PRE is ticket {0}, taken {1} by {2}. Use it as the baseline? (Y/N)" -f $cm['ticket'], $cm['taken_at'], $cm['taken_by'])
-                        if ($ans -match '^[Yy]') { $preFile = $cand }
+                # No PRE for this ticket: the latest PRE is used only if that was agreed before the run
+                # (-BaselineFallback; asked in the visible window). Run directly (no -Inner): asked here.
+                $preFile = $null
+                $found = Find-PreSnapshot $t.Instance
+                if ($found -and $found.SameTicket) { $preFile = $found.File }
+                elseif ($found) {
+                    $cm = Get-SnapshotMeta $found.File
+                    $use = $BaselineFallback
+                    if ($use -eq 'Ask') {
+                        if ($Inner) { $use = 'No' }
+                        else {
+                            Write-Step "No PRE snapshot for ticket $Ticket on this instance." 'Yellow'
+                            $ans = Read-Host ("Latest PRE is ticket {0}, taken {1} by {2}. Use it as the baseline? (Y/N)" -f $cm['ticket'], $cm['taken_at'], $cm['taken_by'])
+                            $use = if ($ans -match '^[Yy]') { 'Yes' } else { 'No' }
+                        }
                     }
+                    if ($use -eq 'Yes') { $preFile = $found.File; Write-Step ("No PRE for ticket {0} - using the latest PRE (ticket {1}, taken {2} by {3}) as agreed." -f $Ticket, $cm['ticket'], $cm['taken_at'], $cm['taken_by']) 'Yellow' }
+                    else { Write-Step ("No PRE for ticket {0} - the latest PRE (ticket {1}, taken {2}) is not used." -f $Ticket, $cm['ticket'], $cm['taken_at']) 'Yellow' }
                 }
                 $pre = $null
                 if ($preFile) {
@@ -1102,7 +1202,7 @@ try {
                     $row.FullHtml = $row.ShortHtml + '<h2>Full POST report</h2>' + $fullReport
                     $row.BodyHtml = $row.ShortHtml + '<h2>Full POST report</h2>' + $bodyReport
                     Write-Step $row.Outcome $(if ($ok) { 'Green' } else { 'Red' })
-                    if (-not $ok) { $cmp.Unexpected | Select-Object -First 25 | Format-Table Section, Item, Attribute, Before, After -AutoSize | Out-String -Width 220 | Write-Host }
+                    if (-not $ok) { Write-Step (($cmp.Unexpected | Select-Object -First 25 | Format-Table Section, Item, Attribute, Before, After -AutoSize | Out-String -Width 220).TrimEnd()) 'Gray' }
                 }
                 else {
                     $row.Outcome = 'NO BASELINE - POST report only'; $row.State = 'NOBASE'
@@ -1262,7 +1362,8 @@ FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
 catch { Write-Step ('ERROR: ' + $_.Exception.Message) 'Red' }
 finally {
     if ($HandOff -and -not $handedOff) {
-        try { [System.IO.File]::WriteAllText($HandOff, '{"status":"done"}') } catch { }
+        $donePayload = @{ status = 'done'; report = [string]$combinedFile; mail = [string]$mailStatus }
+        try { [System.IO.File]::WriteAllText($HandOff, (ConvertTo-Json -InputObject $donePayload -Compress), [System.Text.Encoding]::UTF8) } catch { }
     }
     if ($handedOff) {
         Write-Step 'Handing over to the original window...' 'Yellow'
@@ -1271,18 +1372,18 @@ finally {
     }
     else {
     Write-Step "`n=== SUMMARY ($Phase / $Ticket) ===" 'Green'
-    if ($summary) { $summary | Format-Table Instance, ConnectedAs, Outcome, Unexpected, NewProblems, Expected, Baseline -AutoSize -Wrap | Out-String -Width 250 | Write-Host }
+    if ($summary) { Write-Step (($summary | Format-Table Instance, ConnectedAs, Outcome, Unexpected, NewProblems, Expected, Baseline -AutoSize -Wrap | Out-String -Width 250).TrimEnd()) 'Gray' }
     Write-Step "Email     : $mailStatus"
     Write-Step "Snapshots : $(Join-Path $Config.SnapshotRoot $Ticket)"
     Write-Step "Reports   : $($Config.ReportsFolder)"
     Write-Step "Report    : $combinedFile"
-    # No email sent: open the combined report in the browser
-    if ($combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
+    # No email sent: open the combined report in the browser (the hidden run-as window leaves this to the visible one)
+    if (-not $HandOff -and $combinedFile -and ($mailStatus -notlike 'Queued*') -and (Test-Path -LiteralPath $combinedFile)) {
         Write-Step 'Opening the combined report...' 'Yellow'
         try { Invoke-Item -LiteralPath $combinedFile } catch { Write-Step "Could not open it: $($_.Exception.Message)" 'Yellow' }
     }
     Write-Step "Log       : $logFile"
     try { Stop-Transcript | Out-Null } catch { }
-    Read-Host "`nPress Enter to close"
+    if (-not $Inner) { Read-Host "`nPress Enter to close" }
     }
 }
