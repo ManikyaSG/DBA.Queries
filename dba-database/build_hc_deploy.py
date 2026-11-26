@@ -13,7 +13,7 @@ Views/TVFs fall back to a procedure at deploy time if SQL Server refuses them
 
 Usage:  python3 build_hc_deploy.py <scripts_dir> <output.sql> [report.tsv]
 """
-import re, sys, glob, os
+import re, sys, glob, os, hashlib
 
 FILES = ['00','01','02','03','04','05','06','07','08','09','10','11','12','13','14','15',
          '16','17','18','19','20','21','22','23','24','25','26','31','36','39','40','41']
@@ -177,21 +177,26 @@ def analyse(code):
     tk = tokens(code)
     info = {'stmt_kw': set(), 'selects': 0, 'option': False, 'forxml': False, 'into': False,
             'temp': bool(re.search(r'#\w', code)), 'vars': set(re.findall(r'(?<!@)@\w+', code))}
-    prev = None; in_with = False; main_seen = False
+    info['starts'] = []                         # where each top-level query starts
+    prev = None; in_with = False; main_seen = False; case_depth = 0
     for idx, (t, s, e, d) in enumerate(tk):
         if d == 0:
-            if t in STMT_KW:
+            if t == 'CASE':
+                case_depth += 1
+            elif t == 'END' and case_depth:          # CASE ... END inside a select list is not a statement
+                case_depth -= 1
+            elif t in STMT_KW:
                 # SET inside UPDATE ... SET is not a statement; we never build views from UPDATEs anyway
                 info['stmt_kw'].add(t)
             if t == 'WITH' and (prev in (None, ';') ):
-                in_with = True; main_seen = False; info['selects'] += 1
+                in_with = True; main_seen = False; info['selects'] += 1; info['starts'].append(s)
             elif t == 'SELECT':
                 if prev in ('UNION', 'ALL', 'EXCEPT', 'INTERSECT'):
                     pass
                 elif in_with and not main_seen:
                     main_seen = True
                 else:
-                    in_with = False; info['selects'] += 1
+                    in_with = False; info['selects'] += 1; info['starts'].append(s)
             elif t == 'OPTION': info['option'] = True
             elif t == 'FOR' and idx + 1 < len(tk) and tk[idx+1][0] in ('XML', 'JSON', 'BROWSE'): info['forxml'] = True
             elif t == 'INTO': info['into'] = True
@@ -287,6 +292,102 @@ def slug(title):
     t = re.sub(r'[^A-Za-z0-9]+', '_', t).strip('_').lower()
     return t[:40].rstrip('_')
 
+SAFE_READ = ("SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks\n"
+             "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks\n"
+             "SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check\n")
+
+RESULT_SEP = '\n--#HC_NEXT_RESULT#\n'      # separates the queries of a check that returns several result sets
+
+# self-test: parameters that must point at a real database
+TEST_OVERRIDES = {'@source_db': '@db', '@target_db': '@db'}
+
+def inject_db_column(code, tk):
+    """Add 'DB_NAME() AS database_name,' to the outer SELECT. None if the query shape doesn't allow it."""
+    top0 = [x for x in tk if x[3] == 0]
+    if any(x[0] in ('UNION', 'EXCEPT', 'INTERSECT') for x in top0): return None
+    sels = [i for i, x in enumerate(top0) if x[0] == 'SELECT']
+    if not sels: return None
+    i = sels[-1]; pos = top0[i][2]; j = i + 1
+    if j < len(top0) and top0[j][0] in ('DISTINCT', 'ALL'):
+        pos = top0[j][2]; j += 1
+    if j < len(top0) and top0[j][0] == 'TOP':
+        k = j + 1
+        if top0[k][0] == '(':
+            k += 1
+            while top0[k][0] != ')': k += 1
+        pos = top0[k][2]; k += 1
+        if k < len(top0) and top0[k][0] == 'PERCENT': pos = top0[k][2]; k += 1
+        if k + 1 < len(top0) and top0[k][0] == 'WITH' and top0[k+1][0] == 'TIES': pos = top0[k+1][2]
+    outer = code[top0[i][1]:]
+    if re.search(r'\bAS\s+\[?database_name\b|\bdatabase_name\s*=', outer, re.I):
+        return code                                    # already has the column
+    return code[:pos] + ' DB_NAME() AS database_name,' + code[pos:]
+
+def test_mode_of(code):
+    if re.search(r'\bWAITFOR\s+(DELAY|TIME)\b', code, re.I): return 'skip: waits on purpose (sampling window)'
+    if re.search(r'dm_db_index_physical_stats|\bDBCC\s+CHECK', code, re.I): return 'heavy: reads index pages'
+    if re.search(r'(?<![\w.])cdc\.\w', code, re.I): return 'needs_cdc'
+    return 'run'
+
+def pdb_body(name, header, params, code, all_sql):
+    plist = ["@database_name sysname = NULL"] + [f'{n} {t} = {v}' for n, t, v in params]
+    pdecl = ', '.join(f'{n} {t}' for n, t, v in params)
+    args = (', @hc_params, ' + ', '.join(f'{n} = {n}' for n, t, v in params)) if params else ''
+    lit = lambda x: ("N'" + q(x) + "'") if x else 'NULL'
+    return (
+        f"CREATE OR ALTER PROCEDURE dbo.{name}\n    " + ',\n    '.join(plist) + "\nAS\n" + header +
+        "-- @database_name: one database, or N'*' for every online user database\n"
+        "SET NOCOUNT ON;\n" + SAFE_READ +
+        f"DECLARE @hc_sql     nvarchar(max) = {lit(code)};\n"
+        f"DECLARE @hc_sql_all nvarchar(max) = {lit(all_sql)};   -- same query with a database_name column (NULL: can't combine)\n"
+        f"DECLARE @hc_params  nvarchar(max) = {lit(pdecl)};\n"
+        "DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);\n"
+        "DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),\n"
+        "        @hc_one bit = 0, @hc_err nvarchar(2048);\n"
+        "IF @database_name IS NULL AND CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 SET @database_name = DB_NAME();\n"
+        "INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;\n"
+        "SET @hc_cnt = @@ROWCOUNT;\n"
+        "IF @hc_cnt = 0\n"
+        "BEGIN RAISERROR(N'Pass @database_name = N''YourDB'' (an online database on this instance), or N''*'' for every database.', 16, 1); RETURN; END;\n"
+        "CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);\n"
+        "IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL\n"
+        "BEGIN\n"
+        "    BEGIN TRY\n"
+        "        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;\n"
+        "        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;\n"
+        "        SET @hc_one = 1;                            -- one combined result set\n"
+        "    END TRY\n"
+        "    BEGIN CATCH\n"
+        "        SET @hc_err = ERROR_MESSAGE();\n"
+        "        RAISERROR(N'One result set per database (could not combine: %s)', 10, 1, @hc_err) WITH NOWAIT;\n"
+        "    END CATCH;\n"
+        "END;\n"
+        "WHILE @hc_i <= @hc_cnt\n"
+        "BEGIN\n"
+        "    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;\n"
+        "    SET @hc_exec = QUOTENAME(@hc_db) + N'.sys.sp_executesql';\n"
+        "    BEGIN TRY\n"
+        "        IF @hc_one = 1\n"
+        f"            INSERT #hc_out EXEC @hc_exec @hc_sql_all{args};\n"
+        "        ELSE\n"
+        "        BEGIN\n"
+        "            IF @hc_cnt > 1 RAISERROR(N'--- %s', 0, 1, @hc_db) WITH NOWAIT;\n"
+        f"            EXEC @hc_exec @hc_sql{args};\n"
+        "        END;\n"
+        "    END TRY\n"
+        "    BEGIN CATCH\n"
+        "        IF @hc_cnt = 1 THROW;\n"
+        "        SET @hc_err = ERROR_MESSAGE();\n"
+        "        RAISERROR(N'%s: %s', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database\n"
+        "    END CATCH;\n"
+        "    SET @hc_i += 1;\n"
+        "END;\n"
+        "IF @hc_one = 1\n"
+        "BEGIN\n"
+        "    SET @hc_sql = N'SELECT ' + @hc_cols + N' FROM #hc_out ORDER BY hc_row;';\n"
+        "    EXEC sys.sp_executesql @hc_sql;\n"
+        "END;\n")
+
 def build(sec):
     code = sec['code']
     code, params = extract_params(code)
@@ -301,26 +402,24 @@ def build(sec):
     simple = (info['selects'] == 1 and not info['stmt_kw'] and not info['option'] and not info['forxml']
               and not info['into'] and not info['temp'] and not other_vars)
     name = 'HC_' + NAMES.get(sec['num'], slug(sec['title']))
-    proc_params = list(params)
     header = f"-- Toolkit {sec['file']} section {sec['num']}: {sec['title_clean']}\n"
-    order = None
+    tmode = test_mode_of(code)
+    declares = ''.join(f'DECLARE {n} {t} = {v};\n' for n, t, v in params)
     if dbscoped:
-        kind = 'P_DB'
-        plist = ['@database_name sysname = NULL'] + [f'{n} {t} = {v}' for n, t, v in params]
-        pdecl = ', '.join(f'{n} {t}' for n, t, v in params)
-        passing = ', '.join(f'{n} = {n}' for n, t, v in params)
-        body = (f"CREATE OR ALTER PROCEDURE dbo.{name}\n    " + ',\n    '.join(plist) + "\nAS\n" + header +
-                "SET NOCOUNT ON;\n"
-                "IF @database_name IS NULL AND CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 SET @database_name = DB_NAME();\n"
-                "IF DB_ID(@database_name) IS NULL\n"
-                "BEGIN RAISERROR(N'Pass @database_name = N''YourDB'' (an online database on this instance).', 16, 1); RETURN; END;\n"
-                "DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N'.sys.sp_executesql';\n"
-                f"DECLARE @hc_sql nvarchar(max) = N'{q(code)}';\n"
-                + (f"EXEC @hc_exec @hc_sql, N'{q(pdecl)}', {passing};\n" if params else "EXEC @hc_exec @hc_sql;\n"))
-        return dict(name=name, kind=kind, primary=body, fallback=None, params=params, order=None)
+        all_sql = None
+        if simple:
+            inj = inject_db_column(code.strip().lstrip(';').strip(), analyse(code.strip().lstrip(';').strip())[1])
+            all_sql = inj.rstrip().rstrip(';').rstrip() if inj else None
+        test = f"EXEC dbo.{name} @database_name = @db" + ''.join(
+            f", {n} = {TEST_OVERRIDES[n]}" for n, t, v in params if n in TEST_OVERRIDES) + ';'
+        return dict(name=name, kind='P_DB', primary=pdb_body(name, header, params, code, all_sql), fallback=None,
+                    params=params, order=None, test_call=test, test_mode=tmode,
+                    capture=(declares + all_sql) if all_sql else None, capture_scope='database' if all_sql else None)
     proc_body = (f"CREATE OR ALTER PROCEDURE dbo.{name}" +
                  ("\n    " + ',\n    '.join(f'{n} {t} = {v}' for n, t, v in params) if params else '') +
-                 "\nAS\n" + header + "SET NOCOUNT ON;\n" + code.rstrip().rstrip(';') + ";\n")
+                 "\nAS\n" + header + "SET NOCOUNT ON;\n" + SAFE_READ + code.rstrip().rstrip(';') + ";\n")
+    ptest = f"EXEC dbo.{name}" + (' ' + ', '.join(f"{n} = {TEST_OVERRIDES[n]}" for n, t, v in params if n in TEST_OVERRIDES)
+                                  if any(n in TEST_OVERRIDES for n, t, v in params) else '') + ';'
     if simple:
         vcode, order = strip_order_by(code, tk)
         vcode = vcode.lstrip(';').strip()
@@ -337,12 +436,23 @@ def build(sec):
             primary = (f"CREATE OR ALTER FUNCTION dbo.{name}\n(\n    " +
                        ',\n    '.join(f'{n} {t} = {v}' for n, t, v in params) +
                        "\n)\nRETURNS TABLE\nAS\n" + header + "RETURN\n(\n" + vcode + "\n);\n")
+            call = f"SELECT * FROM dbo.{name}({', '.join('DEFAULT' for _ in params)})"
         else:
             kind = 'V'
             primary = f"CREATE OR ALTER VIEW dbo.{name}\nAS\n" + header + vcode + ";\n"
+            call = f"SELECT * FROM dbo.{name}"
         return dict(name=name, kind=kind, primary=primary, fallback=proc_body, params=params, order=order,
-                    friendly_order=fo)
-    return dict(name=name, kind='P', primary=proc_body, fallback=None, params=params, order=None)
+                    friendly_order=fo, test_call=call.replace('SELECT *', 'SELECT TOP (0) *', 1) + ';',
+                    test_mode=tmode, capture=call, capture_scope='server')
+    capture = None
+    plain = (info['selects'] > 1 and not info['stmt_kw'] and not info['option'] and not info['forxml']
+             and not info['into'] and not info['temp'] and not other_vars)
+    if plain:      # several plain SELECTs: HC_snapshot saves each result set
+        st = info['starts'] + [len(code)]
+        parts = [code[st[k]:st[k+1]].strip().rstrip(';').strip() for k in range(len(st) - 1)]
+        capture = RESULT_SEP.join(declares + x for x in parts)
+    return dict(name=name, kind='P', primary=proc_body, fallback=None, params=params, order=None,
+                test_call=ptest, test_mode=tmode, capture=capture, capture_scope='server' if capture else None)
 
 # ---------------------------------------------------------------------------- parse files
 HDR = re.compile(r'/\*=+\s*\n\s+(\d+\.\d+)\s+(.*?)\n(.*?)=+\*/', re.S)
@@ -403,15 +513,15 @@ def main(src, out, report=None):
         print('BUILD STOPPED - these sections depend on code outside themselves:')
         for p in problems: print('  ' + p)
         sys.exit(1)
-    write_sql(objs, skipped, out)
-    write_index(objs, skipped, os.path.join(os.path.dirname(os.path.abspath(out)), 'HC_OBJECTS.md'))
+    build_id = write_sql(objs, skipped, out)
+    write_index(objs, skipped, os.path.join(os.path.dirname(os.path.abspath(out)), 'HC_OBJECTS.md'), build_id)
     if report:
         with open(report, 'w') as r:
             for o in objs:
                 r.write(f"OBJ\t{o['sec']['num']}\t{o['kind']}\t{o['name']}\t{o['sec']['tags']}\t"
                         f"{','.join(p[0] for p in o['params'])}\t{o['sec']['title_clean']}\n")
             for s in skipped: r.write("SKIP\t" + '\t'.join(s) + '\n')
-    print(len(objs), 'objects,', len(skipped), 'skipped')
+    print(len(objs), 'objects,', len(skipped), 'skipped, build', build_id)
 
 ALLOW_MUTATE = set()
 
@@ -478,24 +588,71 @@ def as_alter(defn):
     assert defn.startswith('CREATE OR ALTER '), defn[:60]
     return 'ALTER ' + defn[len('CREATE OR ALTER '):]
 
+# objects captured by EXEC dbo.HC_snapshot N'change' (pre/post patching, config changes)
+SNAPSHOT_SETS = {
+ 'change': ['HC_version', 'HC_instance_settings', 'HC_trace_flags', 'HC_services', 'HC_host_os',
+            'HC_database_properties', 'HC_db_scoped_config', 'HC_memory_settings', 'HC_numa_maxdop',
+            'HC_tempdb_files', 'HC_autogrowth_settings', 'HC_logins', 'HC_server_role_members',
+            'HC_linked_servers', 'HC_job_inventory', 'HC_agent_alerts_operators', 'HC_ag_replicas',
+            'HC_ag_listeners', 'HC_ag_readonly_routing', 'HC_hadr_endpoint', 'HC_tde_status',
+            'HC_audit_status', 'HC_dbs_not_online', 'HC_iqp_settings', 'HC_resource_governor'],
+}
+
+def lit(x):
+    return ("N'" + q(x) + "'") if x is not None else 'NULL'
+
 def write_sql(objs, skipped, out):
-    L = []
-    L.append(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deploy_header.sql')).read())
+    here = os.path.dirname(os.path.abspath(__file__))
+    header = open(os.path.join(here, 'deploy_header.sql')).read()
+    footer = open(os.path.join(here, 'deploy_footer.sql')).read()
+    B = []
     for o in objs:
         s = o['sec']
-        usage = usage_of(o)
-        L.append(f"\n/* {s['num']}  {s['title_clean']}   ({s['file']}) */\n")
-        L.append("EXEC dbo.HC_usp_deploy\n"
+        B.append(f"\n/* {s['num']}  {s['title_clean']}   ({s['file']}) */\n"
+                 "EXEC dbo.HC_usp_deploy\n"
                  f"    @name = N'{o['name']}', @section = N'{s['num']}', @source_file = N'{s['file']}',\n"
                  f"    @title = N'{q(s['title_clean'])}', @tags = N'{','.join(s['tags'])}',\n"
-                 f"    @usage = N'{q(usage)}',\n"
+                 f"    @usage = N'{q(usage_of(o))}',\n"
                  f"    @min_version = {min_version(s) or 'NULL'},\n"
-                 f"    @sort_hint = {('N' + chr(39) + q(o['order']) + chr(39)) if o['order'] else 'NULL'},\n"
+                 f"    @sort_hint = {lit(o['order'])},\n"
+                 f"    @test_call = {lit(o['test_call'])}, @test_mode = '{o['test_mode']}',\n"
+                 f"    @capture_scope = {lit(o['capture_scope'])},\n"
+                 f"    @capture_sql = {lit(o['capture'])},\n"
                  f"    @definition = N'{q(as_alter(o['primary']))}',\n"
-                 f"    @fallback_definition = {('N' + chr(39) + q(as_alter(o['fallback'])) + chr(39)) if o['fallback'] else 'NULL'};\nGO\n")
-    L.append(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deploy_footer.sql')).read())
+                 f"    @fallback_definition = {lit(as_alter(o['fallback']) if o['fallback'] else None)};\nGO\n")
+    # reference data used by HC_help and HC_snapshot
+    names = {o['name']: o for o in objs}
+    rows = []
+    for set_name, members in SNAPSHOT_SETS.items():
+        for m in members:
+            if m not in names:
+                sys.exit(f'snapshot set {set_name}: {m} is not an object')
+            if not names[m]['capture']:
+                print(f'note: snapshot set {set_name}: {m} has statements that can\'t be saved, left out')
+                continue
+            rows.append(f"(N'{set_name}', N'{m}')")
+    ref = ("\n/*============================================================================\n"
+           "  REFERENCE DATA (refreshed on every run)\n"
+           "============================================================================*/\n"
+           "IF OBJECT_ID(N'dbo.HC_manual_sections', N'U') IS NULL\n"
+           "    CREATE TABLE dbo.HC_manual_sections (section varchar(10) NOT NULL CONSTRAINT PK_HC_manual_sections PRIMARY KEY,\n"
+           "        source_file nvarchar(128) NOT NULL, title nvarchar(400) NOT NULL, reason nvarchar(200) NOT NULL);\n"
+           "IF OBJECT_ID(N'dbo.HC_snapshot_sets', N'U') IS NULL\n"
+           "    CREATE TABLE dbo.HC_snapshot_sets (set_name sysname NOT NULL, object_name sysname NOT NULL,\n"
+           "        CONSTRAINT PK_HC_snapshot_sets PRIMARY KEY (set_name, object_name));\n"
+           "GO\n"
+           "DELETE dbo.HC_manual_sections;\n"
+           "INSERT dbo.HC_manual_sections (section, source_file, title, reason) VALUES\n    " +
+           ',\n    '.join(f"(N'{n}', N'{f}', N'{q(t)}', N'{q(w)}')" for f, n, t, w in skipped) + ";\n"
+           "DELETE dbo.HC_snapshot_sets WHERE set_name IN (" + ', '.join(f"N'{k}'" for k in SNAPSHOT_SETS) + ");\n"
+           "INSERT dbo.HC_snapshot_sets (set_name, object_name) VALUES\n    " + ',\n    '.join(rows) + ";\nGO\n")
+    body = ''.join(B) + ref
+    build_id = hashlib.sha1((header + body + footer).encode('utf-8')).hexdigest()[:12]
+    footer = footer.replace('{{OBJECT_COUNT}}', str(len(objs)))
+    text = header.replace('{{BUILD_ID}}', build_id) + body + footer.replace('{{BUILD_ID}}', build_id)
     with open(out, 'w', encoding='utf-8', newline='\r\n') as fh:
-        fh.write(''.join(L))
+        fh.write(text)
+    return build_id
 
 def friendly_order(order, code):
     """Turn 'ORDER BY r.total_elapsed_time DESC' into 'ORDER BY elapsed_s DESC' using the view's output names.
@@ -539,12 +696,13 @@ def min_version(sec):
     y = next(g for g in m.groups() if g)
     return {'2017': 14, '2019': 15, '2022': 16, '2025': 17}[y]
 
-def write_index(objs, skipped, path):
+def write_index(objs, skipped, path, build_id=''):
     kinds = {'V': 'view', 'IF': 'function', 'P': 'procedure', 'P_DB': 'procedure (per database)'}
     L = ['# HC_ objects in DBAdmin', '',
          'Generated by `build_hc_deploy.py`. On any server: `SELECT * FROM DBAdmin.dbo.HC_catalog;` shows what is',
          'actually installed there (some objects are skipped on older versions or other platforms).', '',
-         f'{len(objs)} objects, built from the toolkit sections listed below.', '']
+         f'{len(objs)} objects, built from the toolkit sections listed below. Build id: `{build_id}` '
+         '(`SELECT * FROM DBAdmin.dbo.HC_version;` shows which build a server has).', '']
     cur = None
     for o in objs:
         s = o['sec']

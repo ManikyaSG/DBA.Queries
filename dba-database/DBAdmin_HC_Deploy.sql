@@ -1,27 +1,33 @@
 /*******************************************************************************
  File    : DBAdmin_HC_Deploy.sql            (GENERATED - do not edit by hand)
+ Build   : 9ba6896fdf20
  Source  : the numbered scripts in this repo, rebuilt with dba-database/build_hc_deploy.py
  Purpose : Installs the toolkit's diagnostic queries as objects in the DBAdmin
            database, so the team can run them without opening the script files:
 
-               SELECT * FROM DBAdmin.dbo.HC_catalog;          -- what is installed + how to call it
+               EXEC DBAdmin.dbo.HC_help N'block';             -- find a check by keyword
                SELECT * FROM DBAdmin.dbo.HC_active_sessions;  -- views
-               SELECT * FROM DBAdmin.dbo.HC_top_queries(DEFAULT, DEFAULT);   -- functions with inputs
                EXEC DBAdmin.dbo.HC_blocking_tree;             -- multi-step checks
-               EXEC DBAdmin.dbo.HC_index_usage @database_name = N'Sales';   -- per-database checks
+               EXEC DBAdmin.dbo.HC_index_usage @database_name = N'Sales';   -- one database
+               EXEC DBAdmin.dbo.HC_index_usage @database_name = N'*';       -- every database
+               EXEC DBAdmin.dbo.HC_snapshot N'change', @label = N'pre-patch';   -- save for a later compare
+               EXEC DBAdmin.dbo.HC_selftest;                  -- run every check once, log pass/fail
 
- Runs on : SQL Server 2016 SP2 - 2025, Azure SQL Managed Instance, Azure SQL Database
+ Runs on : SQL Server 2016 - 2025, Azure SQL Managed Instance, Azure SQL Database
            * Box / Azure VM / MI : creates DBAdmin if missing and installs into it.
              Install on EVERY AG replica (DBAdmin is a local database - keep it out of AGs).
            * Azure SQL Database  : connect to the user database you want it in and run
                                    the script there (the USE below errors harmlessly).
- Safe to  : re-run any number of times. Every object is IF NOT EXISTS -> create placeholder,
-            then ALTER, inside TRY/CATCH (works on every 2016 build), so one
-            failure never stops the rest. Objects that need a newer version or another
-            platform are skipped and listed in dbo.HC_catalog with the reason.
+ Safe to  : re-run any number of times. Everything is checked first (IF EXISTS / IF NOT
+            EXISTS); objects are created as placeholders only when missing and then
+            ALTERed, inside TRY/CATCH, so one failure never stops the rest. Objects that
+            need a newer version or another platform are skipped and listed in
+            dbo.HC_catalog with the reason.
  Security : objects run with the CALLER's permissions. Users still need
             VIEW SERVER STATE (2022+: VIEW SERVER PERFORMANCE STATE / VIEW SERVER SECURITY STATE)
             and access to msdb / the databases they query. Grant example at the end.
+            Every procedure reads with LOCK_TIMEOUT 5 s, READ UNCOMMITTED and
+            DEADLOCK_PRIORITY LOW, so a check never blocks production work.
 *******************************************************************************/
 SET ANSI_NULLS ON;
 SET QUOTED_IDENTIFIER ON;
@@ -47,8 +53,12 @@ BEGIN
 END;
 GO
 
+IF (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()) < 130
+    RAISERROR(N'WARNING: this database is below compatibility level 130. HC_snapshot_show and HC_snapshot_diff need 130+; everything else works.', 10, 1) WITH NOWAIT;
+GO
+
 /*----------------------------------------------------------------------------
-  Registry + deploy helper
+  Registry, deploy history
 ----------------------------------------------------------------------------*/
 IF OBJECT_ID(N'dbo.HC_objects', N'U') IS NULL
 BEGIN
@@ -68,13 +78,111 @@ BEGIN
     PRINT 'Created table dbo.HC_objects.';
 END;
 GO
-
--- Remember when this run started; the end of the script drops objects that an earlier
--- run installed but this version of the toolkit no longer contains.
-DECLARE @hc_run_start datetime2(0) = SYSDATETIME();
-EXEC sys.sp_set_session_context @key = N'hc_run_start', @value = @hc_run_start;
+-- columns added in later builds (existing installs get them without losing anything)
+IF COL_LENGTH(N'dbo.HC_objects', N'test_call')     IS NULL ALTER TABLE dbo.HC_objects ADD test_call     nvarchar(2000) NULL;
+IF COL_LENGTH(N'dbo.HC_objects', N'test_mode')     IS NULL ALTER TABLE dbo.HC_objects ADD test_mode     varchar(100)   NULL;
+IF COL_LENGTH(N'dbo.HC_objects', N'capture_scope') IS NULL ALTER TABLE dbo.HC_objects ADD capture_scope varchar(10)    NULL;
+IF COL_LENGTH(N'dbo.HC_objects', N'capture_sql')   IS NULL ALTER TABLE dbo.HC_objects ADD capture_sql   nvarchar(max)  NULL;
 GO
 
+IF OBJECT_ID(N'dbo.HC_deploy_history', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.HC_deploy_history
+    (
+        deploy_id         int IDENTITY(1,1) NOT NULL CONSTRAINT PK_HC_deploy_history PRIMARY KEY,
+        build_id          varchar(20)    NOT NULL,
+        started_at        datetime2(0)   NOT NULL CONSTRAINT DF_HC_deploy_history_started DEFAULT SYSDATETIME(),
+        finished_at       datetime2(0)   NULL,
+        login_name        nvarchar(128)  NOT NULL CONSTRAINT DF_HC_deploy_history_login DEFAULT ORIGINAL_LOGIN(),
+        host_name         nvarchar(128)  NULL     CONSTRAINT DF_HC_deploy_history_host  DEFAULT HOST_NAME(),
+        product_version   nvarchar(128)  NULL     CONSTRAINT DF_HC_deploy_history_ver   DEFAULT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)),
+        objects_ok        int NULL,
+        objects_failed    int NULL,
+        objects_skipped   int NULL
+    );
+    PRINT 'Created table dbo.HC_deploy_history.';
+END;
+GO
+
+-- Remember this run: the end of the script finishes the history row and drops objects that an
+-- earlier run installed but this build no longer contains.
+DECLARE @hc_run_start datetime2(0) = SYSDATETIME(), @hc_deploy_id int;
+INSERT dbo.HC_deploy_history (build_id) VALUES ('9ba6896fdf20');
+SET @hc_deploy_id = SCOPE_IDENTITY();
+EXEC sys.sp_set_session_context @key = N'hc_run_start', @value = @hc_run_start;
+EXEC sys.sp_set_session_context @key = N'hc_deploy_id', @value = @hc_deploy_id;
+GO
+
+/*----------------------------------------------------------------------------
+  Helpers used by the per-database procedures
+----------------------------------------------------------------------------*/
+-- Databases a per-database check runs in: one name, or N'*' = every online user database
+-- this login can open (Azure SQL Database: only the current one).
+IF OBJECT_ID(N'dbo.HC_fn_databases', N'IF') IS NULL
+    EXEC (N'CREATE FUNCTION dbo.HC_fn_databases() RETURNS TABLE AS RETURN (SELECT 1 AS placeholder);');
+GO
+ALTER FUNCTION dbo.HC_fn_databases (@database_name sysname)
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT d.name
+    FROM sys.databases AS d
+    WHERE d.state = 0
+      AND (   (@database_name = N'*'
+               AND d.database_id > 4
+               AND d.source_database_id IS NULL                      -- not a database snapshot
+               AND HAS_DBACCESS(d.name) = 1                          -- skips non-readable AG secondaries
+               AND (CAST(SERVERPROPERTY('EngineEdition') AS int) <> 5 OR d.name = DB_NAME()))
+           OR (@database_name <> N'*' AND d.name = @database_name))
+);
+GO
+
+-- Adds the columns of a query's result to the caller's #hc_out table, so results from many
+-- databases can be collected into one result set. Raises an error if the shape can't be used.
+IF OBJECT_ID(N'dbo.HC_usp_shape_out', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_usp_shape_out AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_usp_shape_out
+    @database sysname,
+    @sql      nvarchar(max),
+    @params   nvarchar(max) = NULL,
+    @cols     nvarchar(max) OUTPUT
+AS
+SET NOCOUNT ON;
+DECLARE @d TABLE (column_ordinal int, name sysname NULL, system_type_name nvarchar(256) NULL,
+                  is_hidden bit NULL, error_message nvarchar(4000) NULL);
+DECLARE @exec nvarchar(400) = QUOTENAME(@database) + N'.sys.sp_executesql', @alter nvarchar(max), @err nvarchar(4000);
+INSERT @d
+EXEC @exec N'SELECT column_ordinal, name, system_type_name, is_hidden, error_message
+             FROM sys.dm_exec_describe_first_result_set(@t, @p, 0);',
+           N'@t nvarchar(max), @p nvarchar(max)', @t = @sql, @p = @params;
+
+SET @err = (SELECT TOP (1) error_message FROM @d WHERE error_message IS NOT NULL);
+IF @err IS NOT NULL THROW 50001, @err, 1;
+IF NOT EXISTS (SELECT 1 FROM @d WHERE ISNULL(is_hidden, 0) = 0)
+    THROW 50002, N'the query has no result columns', 1;
+IF EXISTS (SELECT 1 FROM @d WHERE ISNULL(is_hidden, 0) = 0 AND name IS NULL)
+    THROW 50003, N'a result column has no name', 1;
+IF EXISTS (SELECT name FROM @d WHERE ISNULL(is_hidden, 0) = 0 GROUP BY name HAVING COUNT(*) > 1)
+    THROW 50004, N'two result columns have the same name', 1;
+
+SET @alter = N'ALTER TABLE #hc_out ADD ' + STUFF((
+        SELECT N', ' + QUOTENAME(name) + N' '
+             + CASE WHEN system_type_name IN (N'timestamp', N'rowversion') THEN N'binary(8)' ELSE system_type_name END
+             + N' NULL'
+        FROM @d WHERE ISNULL(is_hidden, 0) = 0 ORDER BY column_ordinal
+        FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'');
+EXEC sys.sp_executesql @alter;
+SET @cols = STUFF((
+        SELECT N', ' + QUOTENAME(name)
+        FROM @d WHERE ISNULL(is_hidden, 0) = 0 ORDER BY column_ordinal
+        FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'');
+GO
+
+/*----------------------------------------------------------------------------
+  Deploy helper: installs one object and records the outcome
+----------------------------------------------------------------------------*/
 IF OBJECT_ID(N'dbo.HC_usp_deploy', N'P') IS NULL
     EXEC (N'CREATE PROCEDURE dbo.HC_usp_deploy AS RETURN;');
 GO
@@ -88,6 +196,10 @@ ALTER PROCEDURE dbo.HC_usp_deploy
     @usage               nvarchar(1000),
     @sort_hint           nvarchar(1000) = NULL,
     @min_version         int            = NULL,   -- SQL Server major version: 13=2016 14=2017 15=2019 16=2022 17=2025
+    @test_call           nvarchar(2000) = NULL,   -- how HC_selftest runs it (@db = the test database)
+    @test_mode           varchar(100)   = NULL,   -- run | heavy: ... | skip: ... | needs_cdc
+    @capture_scope       varchar(10)    = NULL,   -- server | database | NULL (HC_snapshot can't capture it)
+    @capture_sql         nvarchar(max)  = NULL,   -- query HC_snapshot runs (FOR JSON is appended)
     @definition          nvarchar(max),            -- 'ALTER VIEW|FUNCTION|PROCEDURE dbo.HC_x ...'
     @fallback_definition nvarchar(max)  = NULL
 AS
@@ -168,9 +280,12 @@ END;
 MERGE dbo.HC_objects AS t
 USING (SELECT @name AS name) AS s ON t.name = s.name
 WHEN MATCHED THEN UPDATE SET section = @section, source_file = @source_file, title = @title, tags = @tags,
-     usage = @usage, sort_hint = @sort_hint, status = @status, message = LEFT(@msg, 4000), deployed_at = SYSDATETIME()
-WHEN NOT MATCHED THEN INSERT (name, section, source_file, title, tags, usage, sort_hint, status, message)
-     VALUES (@name, @section, @source_file, @title, @tags, @usage, @sort_hint, @status, LEFT(@msg, 4000));
+     usage = @usage, sort_hint = @sort_hint, status = @status, message = LEFT(@msg, 4000), deployed_at = SYSDATETIME(),
+     test_call = @test_call, test_mode = @test_mode, capture_scope = @capture_scope, capture_sql = @capture_sql
+WHEN NOT MATCHED THEN INSERT (name, section, source_file, title, tags, usage, sort_hint, status, message,
+                              test_call, test_mode, capture_scope, capture_sql)
+     VALUES (@name, @section, @source_file, @title, @tags, @usage, @sort_hint, @status, LEFT(@msg, 4000),
+             @test_call, @test_mode, @capture_scope, @capture_sql);
 GO
 
 /*============================================================================
@@ -184,6 +299,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_version;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_version;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_version',
     @definition = N'ALTER VIEW dbo.HC_version
 AS
 -- Toolkit 00_instance_overview.sql section 0.1: VERSION, EDITION, PATCH LEVEL
@@ -206,6 +324,9 @@ SELECT
 AS
 -- Toolkit 00_instance_overview.sql section 0.1: VERSION, EDITION, PATCH LEVEL
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     SERVERPROPERTY(''ServerName'')             AS server_name,
     SERVERPROPERTY(''MachineName'')            AS machine_name,
@@ -230,6 +351,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_uptime_hardware;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_uptime_hardware;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_uptime_hardware',
     @definition = N'ALTER VIEW dbo.HC_uptime_hardware
 AS
 -- Toolkit 00_instance_overview.sql section 0.2: UPTIME + HARDWARE (CPU / MEMORY / NUMA)
@@ -255,6 +379,9 @@ FROM sys.dm_os_sys_info;
 AS
 -- Toolkit 00_instance_overview.sql section 0.2: UPTIME + HARDWARE (CPU / MEMORY / NUMA)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     sqlserver_start_time,
     DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME())     AS uptime_hours,
@@ -282,6 +409,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_host_os;',
     @min_version = 14,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_host_os;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_host_os',
     @definition = N'ALTER VIEW dbo.HC_host_os
 AS
 -- Toolkit 00_instance_overview.sql section 0.3: HOST OS INFO (2017+)
@@ -292,6 +422,9 @@ FROM sys.dm_os_host_info;
 AS
 -- Toolkit 00_instance_overview.sql section 0.3: HOST OS INFO (2017+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT host_platform, host_distribution, host_release, host_service_pack_level, host_sku
 FROM sys.dm_os_host_info;
 ';
@@ -304,10 +437,31 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_instance_settings;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_instance_settings;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT name, value, value_in_use, is_dynamic, is_advanced
+FROM sys.configurations
+WHERE name IN (
+    N''max server memory (MB)'', N''min server memory (MB)'',
+    N''max degree of parallelism'', N''cost threshold for parallelism'',
+    N''optimize for ad hoc workloads'', N''backup compression default'',
+    N''backup checksum default'', N''remote admin connections'',
+    N''clr enabled'', N''clr strict security'', N''xp_cmdshell'', N''Database Mail XPs'',
+    N''contained database authentication'', N''blocked process threshold (s)'',
+    N''fill factor (%)'', N''priority boost'', N''lightweight pooling'',
+    N''max worker threads'', N''Agent XPs'', N''remote access'')
+ORDER BY name
+--#HC_NEXT_RESULT#
+SELECT name, value, value_in_use
+FROM sys.configurations
+WHERE value <> value_in_use',
     @definition = N'ALTER PROCEDURE dbo.HC_instance_settings
 AS
 -- Toolkit 00_instance_overview.sql section 0.4: KEY INSTANCE SETTINGS (sp_configure)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, value, value_in_use, is_dynamic, is_advanced
 FROM sys.configurations
 WHERE name IN (
@@ -335,19 +489,73 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_db_scoped_config @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_db_scoped_config @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, name, value, value_for_secondary, is_value_default
+FROM sys.database_scoped_configurations
+ORDER BY name',
     @definition = N'ALTER PROCEDURE dbo.HC_db_scoped_config
     @database_name sysname = NULL
 AS
 -- Toolkit 00_instance_overview.sql section 0.5: DATABASE-SCOPED CONFIGURATION (current DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT name, value, value_for_secondary, is_value_default
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT name, value, value_for_secondary, is_value_default
 FROM sys.database_scoped_configurations
 ORDER BY name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, name, value, value_for_secondary, is_value_default
+FROM sys.database_scoped_configurations
+ORDER BY name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -359,10 +567,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_trace_flags;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_trace_flags;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_trace_flags
 AS
 -- Toolkit 00_instance_overview.sql section 0.6: GLOBAL TRACE FLAGS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DBCC TRACESTATUS(-1);
 ',
     @fallback_definition = NULL;
@@ -375,10 +589,23 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_services;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_services;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT servicename, status_desc, startup_type_desc, service_account,
+       last_startup_time, is_clustered, cluster_nodename,
+       instant_file_initialization_enabled
+FROM sys.dm_server_services
+--#HC_NEXT_RESULT#
+SELECT value_name, value_data
+FROM sys.dm_server_registry
+WHERE value_name LIKE N''SQLArg%''',
     @definition = N'ALTER PROCEDURE dbo.HC_services
 AS
 -- Toolkit 00_instance_overview.sql section 0.7: SQL SERVICES, ACCOUNTS, IFI
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT servicename, status_desc, startup_type_desc, service_account,
        last_startup_time, is_clustered, cluster_nodename,
        instant_file_initialization_enabled
@@ -398,6 +625,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_database_properties ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY d.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_database_properties;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_database_properties',
     @definition = N'ALTER VIEW dbo.HC_database_properties
 AS
 -- Toolkit 00_instance_overview.sql section 0.8: ALL DATABASES - PROPERTIES AT A GLANCE
@@ -419,6 +649,9 @@ FROM sys.databases AS d;
 AS
 -- Toolkit 00_instance_overview.sql section 0.8: ALL DATABASES - PROPERTIES AT A GLANCE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     d.name, d.database_id, d.state_desc, d.user_access_desc,
     d.recovery_model_desc, d.compatibility_level, d.collation_name,
@@ -443,6 +676,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_database_sizes ORDER BY total_gb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY total_gb DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_database_sizes;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_database_sizes',
     @definition = N'ALTER VIEW dbo.HC_database_sizes
 AS
 -- Toolkit 00_instance_overview.sql section 0.9: DATABASE SIZES (data / log)
@@ -458,6 +694,9 @@ GROUP BY mf.database_id;
 AS
 -- Toolkit 00_instance_overview.sql section 0.9: DATABASE SIZES (data / log)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     DB_NAME(mf.database_id)                                                     AS database_name,
     CAST(SUM(CASE WHEN mf.type = 0 THEN CAST(mf.size AS bigint) END) * 8 / 1024.0 AS decimal(18,2)) AS data_mb,
@@ -476,6 +715,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_connection_counts ORDER BY sessions DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sessions DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_connection_counts;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_connection_counts',
     @definition = N'ALTER VIEW dbo.HC_connection_counts
 AS
 -- Toolkit 00_instance_overview.sql section 0.10: CONNECTION COUNTS BY DB / LOGIN / HOST / APP
@@ -490,6 +732,9 @@ GROUP BY DB_NAME(s.database_id), s.login_name, s.host_name, s.program_name;
 AS
 -- Toolkit 00_instance_overview.sql section 0.10: CONNECTION COUNTS BY DB / LOGIN / HOST / APP
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(s.database_id) AS database_name, s.login_name, s.host_name, s.program_name,
        COUNT(*)                                          AS sessions,
        SUM(CASE WHEN s.status = ''running'' THEN 1 ELSE 0 END) AS running
@@ -507,6 +752,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_waits;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY w.rn',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_top_waits;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_top_waits',
     @definition = N'ALTER VIEW dbo.HC_top_waits
 AS
 -- Toolkit 01_wait_stats.sql section 1.1: TOP WAITS SINCE RESTART (benign waits filtered)
@@ -568,6 +816,9 @@ WHERE w.rn <= 25;
 AS
 -- Toolkit 01_wait_stats.sql section 1.1: TOP WAITS SINCE RESTART (benign waits filtered)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH waits AS (
     SELECT
         wait_type,
@@ -632,11 +883,17 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_waits_delta @delay = ''00:01:00'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_waits_delta;', @test_mode = 'skip: waits on purpose (sampling window)',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_waits_delta
     @delay char(8) = ''00:01:00''
 AS
 -- Toolkit 01_wait_stats.sql section 1.2: WAITS RIGHT NOW - DELTA OVER N SECONDS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#w1'') IS NOT NULL DROP TABLE #w1;
 SELECT wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms
 INTO #w1 FROM sys.dm_os_wait_stats;
@@ -672,6 +929,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_waiting_tasks ORDER BY wait_duration_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wt.wait_duration_ms DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_waiting_tasks;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_waiting_tasks',
     @definition = N'ALTER VIEW dbo.HC_waiting_tasks
 AS
 -- Toolkit 01_wait_stats.sql section 1.3: WHO IS WAITING ON WHAT - LIVE
@@ -691,6 +951,9 @@ WHERE s.is_user_process = 1;
 AS
 -- Toolkit 01_wait_stats.sql section 1.3: WHO IS WAITING ON WHAT - LIVE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     wt.session_id, wt.exec_context_id, wt.wait_type, wt.wait_duration_ms,
     wt.blocking_session_id, wt.resource_description,
@@ -713,6 +976,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_session_waits(DEFAULT) ORDER BY wait_time_ms DESC;  -- @spid = 55',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wait_time_ms DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_session_waits(DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_session_waits(DEFAULT)',
     @definition = N'ALTER FUNCTION dbo.HC_session_waits
 (
     @spid int = 55
@@ -732,6 +998,9 @@ WHERE session_id = @spid
 AS
 -- Toolkit 01_wait_stats.sql section 1.4: WAIT STATS FOR ONE SESSION (2016+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT session_id, wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms
 FROM sys.dm_exec_session_wait_stats
 WHERE session_id = @spid
@@ -746,6 +1015,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_signal_waits;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_signal_waits;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_signal_waits',
     @definition = N'ALTER VIEW dbo.HC_signal_waits
 AS
 -- Toolkit 01_wait_stats.sql section 1.5: SIGNAL WAIT % (CPU PRESSURE INDICATOR)
@@ -759,6 +1031,9 @@ WHERE wait_time_ms > 0;
 AS
 -- Toolkit 01_wait_stats.sql section 1.5: SIGNAL WAIT % (CPU PRESSURE INDICATOR)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     CAST(100.0 * SUM(signal_wait_time_ms) / SUM(wait_time_ms) AS decimal(5,2))                       AS signal_wait_pct,
     CAST(100.0 * SUM(wait_time_ms - signal_wait_time_ms) / SUM(wait_time_ms) AS decimal(5,2))        AS resource_wait_pct
@@ -774,6 +1049,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_latch_stats ORDER BY wait_time_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_latch_stats;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_latch_stats',
     @definition = N'ALTER VIEW dbo.HC_latch_stats
 AS
 -- Toolkit 01_wait_stats.sql section 1.6: LATCH STATS (non-buffer latches)
@@ -787,6 +1065,9 @@ ORDER BY wait_time_ms DESC;
 AS
 -- Toolkit 01_wait_stats.sql section 1.6: LATCH STATS (non-buffer latches)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (15) latch_class, waiting_requests_count, wait_time_ms, max_wait_time_ms,
        CAST(wait_time_ms * 1.0 / NULLIF(waiting_requests_count,0) AS decimal(18,2)) AS avg_wait_ms
 FROM sys.dm_os_latch_stats
@@ -802,6 +1083,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_active_sessions ORDER BY elapsed_s DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY r.total_elapsed_time DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_active_sessions;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_active_sessions',
     @definition = N'ALTER VIEW dbo.HC_active_sessions
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.1: ACTIVE REQUESTS ("sp_who2 on steroids")
@@ -836,6 +1120,9 @@ WHERE s.is_user_process = 1
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.1: ACTIVE REQUESTS ("sp_who2 on steroids")
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     r.session_id,
     r.blocking_session_id                            AS blocked_by,
@@ -873,11 +1160,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_live_plan @spid = 55;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_live_plan;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'DECLARE @spid int = 55;
+SELECT session_id, query_plan
+FROM sys.dm_exec_query_statistics_xml(@spid)
+--#HC_NEXT_RESULT#
+DECLARE @spid int = 55;
+SELECT session_id, node_id, physical_operator_name, row_count, estimate_row_count,
+       elapsed_time_ms, cpu_time_ms, logical_read_count
+FROM sys.dm_exec_query_profiles
+WHERE session_id = @spid
+ORDER BY node_id',
     @definition = N'ALTER PROCEDURE dbo.HC_live_plan
     @spid int = 55
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.2: LIVE (IN-FLIGHT) ACTUAL PLAN FOR A SESSION 2016 SP1+
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT session_id, query_plan
 FROM sys.dm_exec_query_statistics_xml(@spid);
 
@@ -897,10 +1199,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_blocking_tree;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_blocking_tree;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_blocking_tree
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.3: BLOCKING TREE (head blocker at top, victims indented)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#blk'') IS NOT NULL DROP TABLE #blk;
 
 SELECT
@@ -955,6 +1263,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_blocking_summary ORDER BY sessions_blocked DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sessions_blocked DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_blocking_summary;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_blocking_summary',
     @definition = N'ALTER VIEW dbo.HC_blocking_summary
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.4: QUICK BLOCKING SUMMARY (how many victims per blocker)
@@ -970,6 +1281,9 @@ GROUP BY r.blocking_session_id;
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.4: QUICK BLOCKING SUMMARY (how many victims per blocker)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT r.blocking_session_id      AS blocker,
        COUNT(*)                   AS sessions_blocked,
        MAX(r.wait_time) / 1000    AS longest_wait_s,
@@ -985,13 +1299,44 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_open_transactions', @section = N'2.5', @source_file = N'02_sessions_blocking.sql',
     @title = N'OPEN TRANSACTIONS (oldest first) - log growth / blocking culprits', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_open_transactions;',
+    @usage = N'SELECT * FROM dbo.HC_open_transactions ORDER BY transaction_begin_time;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_open_transactions
+    @sort_hint = N'ORDER BY at.transaction_begin_time',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_open_transactions;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_open_transactions',
+    @definition = N'ALTER VIEW dbo.HC_open_transactions
+AS
+-- Toolkit 02_sessions_blocking.sql section 2.5: OPEN TRANSACTIONS (oldest first) - log growth / blocking culprits
+SELECT
+    st.session_id,
+    s.login_name, s.host_name, s.program_name, s.status AS session_status,
+    at.transaction_id, at.name AS tran_name,
+    at.transaction_begin_time,
+    DATEDIFF(SECOND, at.transaction_begin_time, SYSDATETIME()) AS open_seconds,
+    CASE at.transaction_state
+        WHEN 0 THEN ''Not initialized'' WHEN 1 THEN ''Initialized, not started''
+        WHEN 2 THEN ''Active''          WHEN 3 THEN ''Ended (read-only)''
+        WHEN 4 THEN ''Commit initiated (DTC)'' WHEN 5 THEN ''Prepared''
+        WHEN 6 THEN ''Committed''       WHEN 7 THEN ''Rolling back''
+        WHEN 8 THEN ''Rolled back'' END                  AS tran_state,
+    DB_NAME(dt.database_id)                            AS database_name,
+    dt.database_transaction_log_record_count           AS log_records,
+    dt.database_transaction_log_bytes_used / 1048576.0 AS log_used_mb,
+    ib.event_info                                      AS last_input_buffer
+FROM sys.dm_tran_active_transactions  AS at
+JOIN sys.dm_tran_session_transactions AS st ON st.transaction_id = at.transaction_id
+JOIN sys.dm_exec_sessions             AS s  ON s.session_id = st.session_id
+LEFT JOIN sys.dm_tran_database_transactions AS dt ON dt.transaction_id = at.transaction_id
+OUTER APPLY sys.dm_exec_input_buffer(st.session_id, NULL) AS ib;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_open_transactions
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.5: OPEN TRANSACTIONS (oldest first) - log growth / blocking culprits
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     st.session_id,
     s.login_name, s.host_name, s.program_name, s.status AS session_status,
@@ -1014,8 +1359,7 @@ JOIN sys.dm_exec_sessions             AS s  ON s.session_id = st.session_id
 LEFT JOIN sys.dm_tran_database_transactions AS dt ON dt.transaction_id = at.transaction_id
 OUTER APPLY sys.dm_exec_input_buffer(st.session_id, NULL) AS ib
 ORDER BY at.transaction_begin_time;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 2.6  SLEEPING SESSIONS HOLDING OPEN TRANSACTIONS (forgotten COMMITs)   (02_sessions_blocking.sql) */
@@ -1025,6 +1369,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_sleeping_open_trans ORDER BY last_request_end_time;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY s.last_request_end_time',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_sleeping_open_trans;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_sleeping_open_trans',
     @definition = N'ALTER VIEW dbo.HC_sleeping_open_trans
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.6: SLEEPING SESSIONS HOLDING OPEN TRANSACTIONS (forgotten COMMITs)
@@ -1041,6 +1388,9 @@ WHERE s.status = ''sleeping''
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.6: SLEEPING SESSIONS HOLDING OPEN TRANSACTIONS (forgotten COMMITs)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT s.session_id, s.login_name, s.host_name, s.program_name,
        s.open_transaction_count, s.last_request_end_time,
        DATEDIFF(MINUTE, s.last_request_end_time, SYSDATETIME()) AS idle_minutes,
@@ -1060,6 +1410,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_connection_details ORDER BY connect_time;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY c.connect_time',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_connection_details;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_connection_details',
     @definition = N'ALTER VIEW dbo.HC_connection_details
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.7: CONNECTION DETAILS (IP, protocol, encryption, auth)
@@ -1074,6 +1427,9 @@ JOIN sys.dm_exec_sessions    AS s ON s.session_id = c.session_id;
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.7: CONNECTION DETAILS (IP, protocol, encryption, auth)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT c.session_id, s.login_name, s.host_name, s.program_name,
        c.client_net_address, c.local_net_address, c.local_tcp_port,
        c.net_transport, c.protocol_type, c.encrypt_option, c.auth_scheme,
@@ -1091,6 +1447,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_last_sql_by_session(DEFAULT);  -- @spid = 55',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_last_sql_by_session(DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_last_sql_by_session(DEFAULT)',
     @definition = N'ALTER FUNCTION dbo.HC_last_sql_by_session
 (
     @spid int = 55
@@ -1108,6 +1467,9 @@ SELECT event_type, parameters, event_info FROM sys.dm_exec_input_buffer(@spid, N
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.8: LAST SQL SENT BY A SESSION
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT event_type, parameters, event_info FROM sys.dm_exec_input_buffer(@spid, NULL);
 ';
 GO
@@ -1119,6 +1481,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_rollback_progress;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_rollback_progress;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_rollback_progress',
     @definition = N'ALTER VIEW dbo.HC_rollback_progress
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.9: ROLLBACK / KILL PROGRESS
@@ -1133,6 +1498,9 @@ WHERE command IN (''KILLED/ROLLBACK'', ''ROLLBACK TRANSACTION'')
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.9: ROLLBACK / KILL PROGRESS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT session_id, command, status, percent_complete,
        estimated_completion_time / 60000 AS est_minutes_left,
        total_elapsed_time / 60000        AS elapsed_minutes
@@ -1149,6 +1517,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_generate_kill_head_blockers;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_generate_kill_head_blockers;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_generate_kill_head_blockers',
     @definition = N'ALTER VIEW dbo.HC_generate_kill_head_blockers
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.10: GENERATE KILL FOR HEAD BLOCKERS (review before running!)
@@ -1162,6 +1533,9 @@ WHERE r.blocking_session_id > 0
 AS
 -- Toolkit 02_sessions_blocking.sql section 2.10: GENERATE KILL FOR HEAD BLOCKERS (review before running!)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DISTINCT ''KILL '' + CAST(r.blocking_session_id AS varchar(10)) + '';'' AS kill_cmd
 FROM sys.dm_exec_requests AS r
 WHERE r.blocking_session_id > 0
@@ -1174,15 +1548,66 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_top_queries', @section = N'3.1', @source_file = N'03_query_performance_plan_cache.sql',
     @title = N'TOP N STATEMENTS - CHOOSE THE SORT', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_top_queries @sort_by = ''CPU'', @top = 25;',
+    @usage = N'SELECT * FROM dbo.HC_top_queries(DEFAULT, DEFAULT);  -- @sort_by = ''CPU'', @top = 25',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_top_queries
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_top_queries(DEFAULT, DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_top_queries(DEFAULT, DEFAULT)',
+    @definition = N'ALTER FUNCTION dbo.HC_top_queries
+(
+    @sort_by varchar(10) = ''CPU'',
+    @top int = 25
+)
+RETURNS TABLE
+AS
+-- Toolkit 03_query_performance_plan_cache.sql section 3.1: TOP N STATEMENTS - CHOOSE THE SORT
+RETURN
+(
+SELECT TOP (@top)
+    DB_NAME(t.dbid)                                         AS database_name,
+    OBJECT_SCHEMA_NAME(t.objectid, t.dbid) + N''.'' + OBJECT_NAME(t.objectid, t.dbid) AS object_name,
+    qs.execution_count,
+    qs.total_worker_time / 1000                             AS total_cpu_ms,
+    qs.total_worker_time / qs.execution_count / 1000        AS avg_cpu_ms,
+    qs.total_elapsed_time / qs.execution_count / 1000       AS avg_duration_ms,
+    qs.total_logical_reads / qs.execution_count             AS avg_logical_reads,
+    qs.total_logical_writes / qs.execution_count            AS avg_logical_writes,
+    qs.total_physical_reads / qs.execution_count            AS avg_physical_reads,
+    qs.total_rows / qs.execution_count                      AS avg_rows,
+    qs.total_grant_kb / qs.execution_count / 1024           AS avg_grant_mb,
+    qs.total_spills / qs.execution_count                    AS avg_spills,
+    qs.creation_time                                        AS plan_cached_at,
+    qs.last_execution_time,
+    SUBSTRING(t.text, (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset WHEN -1 THEN DATALENGTH(t.text)
+          ELSE qs.statement_end_offset END - qs.statement_start_offset) / 2) + 1) AS statement_text,
+    qs.query_hash, qs.query_plan_hash, qs.plan_handle,
+    qp.query_plan
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle)      AS t
+OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle)   AS qp
+ORDER BY
+    CASE @sort_by
+        WHEN ''CPU''      THEN qs.total_worker_time
+        WHEN ''READS''    THEN qs.total_logical_reads
+        WHEN ''WRITES''   THEN qs.total_logical_writes
+        WHEN ''DURATION'' THEN qs.total_elapsed_time
+        WHEN ''EXECS''    THEN qs.execution_count
+        WHEN ''GRANT''    THEN qs.total_grant_kb
+        WHEN ''SPILLS''   THEN qs.total_spills
+    END DESC
+);
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_top_queries
     @sort_by varchar(10) = ''CPU'',
     @top int = 25
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.1: TOP N STATEMENTS - CHOOSE THE SORT
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (@top)
     DB_NAME(t.dbid)                                         AS database_name,
     OBJECT_SCHEMA_NAME(t.objectid, t.dbid) + N''.'' + OBJECT_NAME(t.objectid, t.dbid) AS object_name,
@@ -1216,8 +1641,7 @@ ORDER BY
         WHEN ''GRANT''    THEN qs.total_grant_kb
         WHEN ''SPILLS''   THEN qs.total_spills
     END DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 3.2  TOP STORED PROCEDURES   (03_query_performance_plan_cache.sql) */
@@ -1227,6 +1651,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_procedures ORDER BY total_cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_top_procedures;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_top_procedures',
     @definition = N'ALTER VIEW dbo.HC_top_procedures
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.2: TOP STORED PROCEDURES
@@ -1246,6 +1673,9 @@ ORDER BY ps.total_worker_time DESC;
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.2: TOP STORED PROCEDURES
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (25)
     DB_NAME(ps.database_id)                               AS database_name,
     OBJECT_SCHEMA_NAME(ps.object_id, ps.database_id) + N''.'' + OBJECT_NAME(ps.object_id, ps.database_id) AS proc_name,
@@ -1267,6 +1697,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_query_hash ORDER BY total_cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_top_query_hash;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_top_query_hash',
     @definition = N'ALTER VIEW dbo.HC_top_query_hash
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.3: TOP QUERIES AGGREGATED BY query_hash
@@ -1286,6 +1719,9 @@ ORDER BY total_cpu_ms DESC;
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.3: TOP QUERIES AGGREGATED BY query_hash
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (25)
     qs.query_hash,
     COUNT(*)                                      AS cached_plan_entries,
@@ -1307,6 +1743,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_param_sniffing_suspects;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_param_sniffing_suspects;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_param_sniffing_suspects',
     @definition = N'ALTER VIEW dbo.HC_param_sniffing_suspects
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.4: PARAMETER SNIFFING SUSPECTS (large min/max variance)
@@ -1332,6 +1771,9 @@ ORDER BY qs.max_logical_reads - qs.min_logical_reads DESC;
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.4: PARAMETER SNIFFING SUSPECTS (large min/max variance)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (25)
     DB_NAME(t.dbid) AS database_name,
     OBJECT_NAME(t.objectid, t.dbid) AS object_name,
@@ -1359,6 +1801,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_find_query_in_cache(DEFAULT) ORDER BY last_execution_time DESC;  -- @search_text = N''%YourTableOrProcName%''',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_find_query_in_cache(DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_find_query_in_cache(DEFAULT)',
     @definition = N'ALTER FUNCTION dbo.HC_find_query_in_cache
 (
     @search_text nvarchar(200) = N''%YourTableOrProcName%''
@@ -1385,6 +1830,9 @@ ORDER BY qs.last_execution_time DESC
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.5: FIND A QUERY IN CACHE BY TEXT
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (50)
     DB_NAME(t.dbid) AS database_name, qs.execution_count,
     qs.total_worker_time / qs.execution_count / 1000 AS avg_cpu_ms,
@@ -1405,6 +1853,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_plan_cache_bloat ORDER BY total_mb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY total_mb DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_plan_cache_bloat;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_plan_cache_bloat',
     @definition = N'ALTER VIEW dbo.HC_plan_cache_bloat
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.6: PLAN CACHE COMPOSITION & SINGLE-USE PLAN BLOAT
@@ -1420,6 +1871,9 @@ GROUP BY cp.objtype, cp.cacheobjtype;
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.6: PLAN CACHE COMPOSITION & SINGLE-USE PLAN BLOAT
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT cp.objtype, cp.cacheobjtype,
        COUNT(*)                                                    AS plan_count,
        SUM(CAST(cp.size_in_bytes AS bigint)) / 1048576             AS total_mb,
@@ -1438,6 +1892,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_plan_warnings ORDER BY total_cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_plan_warnings;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_plan_warnings',
     @definition = N'ALTER VIEW dbo.HC_plan_warnings
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.7: PLANS WITH IMPLICIT CONVERSIONS / MISSING INDEX / WARNINGS
@@ -1462,6 +1919,9 @@ ORDER BY qs.total_worker_time DESC;
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.7: PLANS WITH IMPLICIT CONVERSIONS / MISSING INDEX / WARNINGS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
 SELECT TOP (50)
     DB_NAME(t.dbid)                                                         AS database_name,
@@ -1488,6 +1948,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_compilations;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_compilations;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_compilations',
     @definition = N'ALTER VIEW dbo.HC_compilations
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.8: RECOMPILES / COMPILATIONS RATE
@@ -1500,6 +1963,9 @@ WHERE object_name LIKE N''%SQL Statistics%''
 AS
 -- Toolkit 03_query_performance_plan_cache.sql section 3.8: RECOMPILES / COMPILATIONS RATE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT counter_name, cntr_value
 FROM sys.dm_os_performance_counters
 WHERE object_name LIKE N''%SQL Statistics%''
@@ -1514,23 +1980,85 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_status @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_status @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME()                     AS database_name,
+       desired_state_desc, actual_state_desc, readonly_reason,
+       current_storage_size_mb, max_storage_size_mb,
+       query_capture_mode_desc, size_based_cleanup_mode_desc,
+       stale_query_threshold_days, interval_length_minutes,
+       flush_interval_seconds, max_plans_per_query, wait_stats_capture_mode_desc
+FROM sys.database_query_store_options',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_status
     @database_name sysname = NULL
 AS
 -- Toolkit 04_query_store.sql section 4.1: QUERY STORE STATUS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT DB_NAME()                     AS database_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT DB_NAME()                     AS database_name,
        desired_state_desc, actual_state_desc, readonly_reason,
        current_storage_size_mb, max_storage_size_mb,
        query_capture_mode_desc, size_based_cleanup_mode_desc,
        stale_query_threshold_days, interval_length_minutes,
        flush_interval_seconds, max_plans_per_query, wait_stats_capture_mode_desc
 FROM sys.database_query_store_options;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME()                     AS database_name,
+       desired_state_desc, actual_state_desc, readonly_reason,
+       current_storage_size_mb, max_storage_size_mb,
+       query_capture_mode_desc, size_based_cleanup_mode_desc,
+       stale_query_threshold_days, interval_length_minutes,
+       flush_interval_seconds, max_plans_per_query, wait_stats_capture_mode_desc
+FROM sys.database_query_store_options'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1542,6 +2070,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_qs_status_all_dbs ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_qs_status_all_dbs;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_qs_status_all_dbs',
     @definition = N'ALTER VIEW dbo.HC_qs_status_all_dbs
 AS
 -- Toolkit 04_query_store.sql section 4.2: QUERY STORE STATUS - ALL DATABASES
@@ -1551,6 +2082,9 @@ SELECT name, is_query_store_on FROM sys.databases WHERE database_id > 4;
 AS
 -- Toolkit 04_query_store.sql section 4.2: QUERY STORE STATUS - ALL DATABASES
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, is_query_store_on FROM sys.databases WHERE database_id > 4 ORDER BY name;
 ';
 GO
@@ -1562,18 +2096,56 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_top_queries @database_name = N''YourDB'', @hours = 24, @metric = ''CPU'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_top_queries @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @hours int = 24;
+DECLARE @metric varchar(10) = ''CPU'';
+WITH agg AS (
+    SELECT
+        q.query_id,
+        SUM(rs.count_executions)                                       AS execs,
+        SUM(rs.avg_cpu_time        * rs.count_executions) / 1000.0     AS total_cpu_ms,
+        SUM(rs.avg_duration        * rs.count_executions) / 1000.0     AS total_duration_ms,
+        SUM(rs.avg_logical_io_reads* rs.count_executions)              AS total_reads,
+        SUM(rs.avg_query_max_used_memory * rs.count_executions) * 8 / 1024.0 AS total_mem_mb,
+        COUNT(DISTINCT p.plan_id)                                      AS plan_count
+    FROM sys.query_store_runtime_stats          AS rs
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    JOIN sys.query_store_plan                   AS p ON p.plan_id = rs.plan_id
+    JOIN sys.query_store_query                  AS q ON q.query_id = p.query_id
+    WHERE i.start_time >= DATEADD(HOUR, -@hours, SYSDATETIMEOFFSET())
+    GROUP BY q.query_id
+)
+SELECT TOP (25) DB_NAME() AS database_name,
+    a.query_id,
+    OBJECT_SCHEMA_NAME(q.object_id) + N''.'' + OBJECT_NAME(q.object_id) AS object_name,
+    a.execs, a.plan_count,
+    CAST(a.total_cpu_ms                AS decimal(18,0)) AS total_cpu_ms,
+    CAST(a.total_cpu_ms / a.execs      AS decimal(18,2)) AS avg_cpu_ms,
+    CAST(a.total_duration_ms / a.execs AS decimal(18,2)) AS avg_duration_ms,
+    CAST(a.total_reads / a.execs       AS decimal(18,0)) AS avg_reads,
+    qt.query_sql_text
+FROM agg AS a
+JOIN sys.query_store_query      AS q  ON q.query_id = a.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+ORDER BY CASE @metric
+            WHEN ''CPU''      THEN a.total_cpu_ms
+            WHEN ''DURATION'' THEN a.total_duration_ms
+            WHEN ''READS''    THEN a.total_reads
+            WHEN ''EXECS''    THEN a.execs
+            WHEN ''MEMORY''   THEN a.total_mem_mb END DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_top_queries
     @database_name sysname = NULL,
     @hours int = 24,
     @metric varchar(10) = ''CPU''
 AS
 -- Toolkit 04_query_store.sql section 4.3: TOP QUERIES IN LAST N HOURS (choose metric)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH agg AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH agg AS (
     SELECT
         q.query_id,
         SUM(rs.count_executions)                                       AS execs,
@@ -1607,7 +2179,87 @@ ORDER BY CASE @metric
             WHEN ''''READS''''    THEN a.total_reads
             WHEN ''''EXECS''''    THEN a.execs
             WHEN ''''MEMORY''''   THEN a.total_mem_mb END DESC;'';
-EXEC @hc_exec @hc_sql, N''@hours int, @metric varchar(10)'', @hours = @hours, @metric = @metric;
+DECLARE @hc_sql_all nvarchar(max) = N''WITH agg AS (
+    SELECT
+        q.query_id,
+        SUM(rs.count_executions)                                       AS execs,
+        SUM(rs.avg_cpu_time        * rs.count_executions) / 1000.0     AS total_cpu_ms,
+        SUM(rs.avg_duration        * rs.count_executions) / 1000.0     AS total_duration_ms,
+        SUM(rs.avg_logical_io_reads* rs.count_executions)              AS total_reads,
+        SUM(rs.avg_query_max_used_memory * rs.count_executions) * 8 / 1024.0 AS total_mem_mb,
+        COUNT(DISTINCT p.plan_id)                                      AS plan_count
+    FROM sys.query_store_runtime_stats          AS rs
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    JOIN sys.query_store_plan                   AS p ON p.plan_id = rs.plan_id
+    JOIN sys.query_store_query                  AS q ON q.query_id = p.query_id
+    WHERE i.start_time >= DATEADD(HOUR, -@hours, SYSDATETIMEOFFSET())
+    GROUP BY q.query_id
+)
+SELECT TOP (25) DB_NAME() AS database_name,
+    a.query_id,
+    OBJECT_SCHEMA_NAME(q.object_id) + N''''.'''' + OBJECT_NAME(q.object_id) AS object_name,
+    a.execs, a.plan_count,
+    CAST(a.total_cpu_ms                AS decimal(18,0)) AS total_cpu_ms,
+    CAST(a.total_cpu_ms / a.execs      AS decimal(18,2)) AS avg_cpu_ms,
+    CAST(a.total_duration_ms / a.execs AS decimal(18,2)) AS avg_duration_ms,
+    CAST(a.total_reads / a.execs       AS decimal(18,0)) AS avg_reads,
+    qt.query_sql_text
+FROM agg AS a
+JOIN sys.query_store_query      AS q  ON q.query_id = a.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+ORDER BY CASE @metric
+            WHEN ''''CPU''''      THEN a.total_cpu_ms
+            WHEN ''''DURATION'''' THEN a.total_duration_ms
+            WHEN ''''READS''''    THEN a.total_reads
+            WHEN ''''EXECS''''    THEN a.execs
+            WHEN ''''MEMORY''''   THEN a.total_mem_mb END DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@hours int, @metric varchar(10)'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @hours = @hours, @metric = @metric;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @hours = @hours, @metric = @metric;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1619,18 +2271,52 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_regressed @database_name = N''YourDB'', @recent_hours = 4, @history_days = 7;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_regressed @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @recent_hours int = 4;
+DECLARE @history_days int = 7;
+WITH recent AS (
+    SELECT p.query_id, SUM(rs.avg_duration * rs.count_executions) / SUM(rs.count_executions) AS avg_dur, SUM(rs.count_executions) AS execs
+    FROM sys.query_store_runtime_stats AS rs
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
+    WHERE i.start_time >= DATEADD(HOUR, -@recent_hours, SYSDATETIMEOFFSET())
+    GROUP BY p.query_id
+), hist AS (
+    SELECT p.query_id, SUM(rs.avg_duration * rs.count_executions) / SUM(rs.count_executions) AS avg_dur, SUM(rs.count_executions) AS execs
+    FROM sys.query_store_runtime_stats AS rs
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
+    WHERE i.start_time >= DATEADD(DAY, -@history_days, SYSDATETIMEOFFSET())
+      AND i.start_time <  DATEADD(HOUR, -@recent_hours, SYSDATETIMEOFFSET())
+    GROUP BY p.query_id
+)
+SELECT TOP (25) DB_NAME() AS database_name,
+    r.query_id,
+    CAST(h.avg_dur / 1000.0 AS decimal(18,2)) AS hist_avg_ms,
+    CAST(r.avg_dur / 1000.0 AS decimal(18,2)) AS recent_avg_ms,
+    CAST(r.avg_dur / NULLIF(h.avg_dur, 0) AS decimal(10,2)) AS times_slower,
+    r.execs AS recent_execs, h.execs AS hist_execs,
+    qt.query_sql_text
+FROM recent AS r
+JOIN hist   AS h ON h.query_id = r.query_id
+JOIN sys.query_store_query      AS q  ON q.query_id = r.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE r.avg_dur > 2 * h.avg_dur
+  AND r.execs >= 5
+ORDER BY (r.avg_dur - h.avg_dur) * r.execs DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_regressed
     @database_name sysname = NULL,
     @recent_hours int = 4,
     @history_days int = 7
 AS
 -- Toolkit 04_query_store.sql section 4.4: REGRESSED QUERIES: RECENT vs HISTORY (avg duration)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH recent AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH recent AS (
     SELECT p.query_id, SUM(rs.avg_duration * rs.count_executions) / SUM(rs.count_executions) AS avg_dur, SUM(rs.count_executions) AS execs
     FROM sys.query_store_runtime_stats AS rs
     JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
@@ -1660,7 +2346,83 @@ JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
 WHERE r.avg_dur > 2 * h.avg_dur
   AND r.execs >= 5
 ORDER BY (r.avg_dur - h.avg_dur) * r.execs DESC;'';
-EXEC @hc_exec @hc_sql, N''@recent_hours int, @history_days int'', @recent_hours = @recent_hours, @history_days = @history_days;
+DECLARE @hc_sql_all nvarchar(max) = N''WITH recent AS (
+    SELECT p.query_id, SUM(rs.avg_duration * rs.count_executions) / SUM(rs.count_executions) AS avg_dur, SUM(rs.count_executions) AS execs
+    FROM sys.query_store_runtime_stats AS rs
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
+    WHERE i.start_time >= DATEADD(HOUR, -@recent_hours, SYSDATETIMEOFFSET())
+    GROUP BY p.query_id
+), hist AS (
+    SELECT p.query_id, SUM(rs.avg_duration * rs.count_executions) / SUM(rs.count_executions) AS avg_dur, SUM(rs.count_executions) AS execs
+    FROM sys.query_store_runtime_stats AS rs
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
+    WHERE i.start_time >= DATEADD(DAY, -@history_days, SYSDATETIMEOFFSET())
+      AND i.start_time <  DATEADD(HOUR, -@recent_hours, SYSDATETIMEOFFSET())
+    GROUP BY p.query_id
+)
+SELECT TOP (25) DB_NAME() AS database_name,
+    r.query_id,
+    CAST(h.avg_dur / 1000.0 AS decimal(18,2)) AS hist_avg_ms,
+    CAST(r.avg_dur / 1000.0 AS decimal(18,2)) AS recent_avg_ms,
+    CAST(r.avg_dur / NULLIF(h.avg_dur, 0) AS decimal(10,2)) AS times_slower,
+    r.execs AS recent_execs, h.execs AS hist_execs,
+    qt.query_sql_text
+FROM recent AS r
+JOIN hist   AS h ON h.query_id = r.query_id
+JOIN sys.query_store_query      AS q  ON q.query_id = r.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE r.avg_dur > 2 * h.avg_dur
+  AND r.execs >= 5
+ORDER BY (r.avg_dur - h.avg_dur) * r.execs DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@recent_hours int, @history_days int'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @recent_hours = @recent_hours, @history_days = @history_days;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @recent_hours = @recent_hours, @history_days = @history_days;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1672,17 +2434,20 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_multi_plan @database_name = N''YourDB'', @query_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_multi_plan @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_qs_multi_plan
     @database_name sysname = NULL,
     @query_id bigint = 1
 AS
 -- Toolkit 04_query_store.sql section 4.5: QUERIES WITH MULTIPLE PLANS (plan instability)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH mp AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH mp AS (
     SELECT q.query_id, q.query_text_id,
            COUNT(DISTINCT p.plan_id)          AS plan_count,
            MAX(CAST(p.is_forced_plan AS int)) AS has_forced_plan
@@ -1716,7 +2481,54 @@ SELECT p.plan_id, p.is_forced_plan, p.last_execution_time, s.execs,
 FROM s
 JOIN sys.query_store_plan AS p ON p.plan_id = s.plan_id
 ORDER BY s.avg_duration_ms;'';
-EXEC @hc_exec @hc_sql, N''@query_id bigint'', @query_id = @query_id;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@query_id bigint'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @query_id = @query_id;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @query_id = @query_id;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1728,23 +2540,85 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_forced_plans @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_forced_plans @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, p.query_id, p.plan_id, p.plan_forcing_type_desc,
+       p.force_failure_count, p.last_force_failure_reason_desc,
+       p.last_execution_time, qt.query_sql_text
+FROM sys.query_store_plan       AS p
+JOIN sys.query_store_query      AS q  ON q.query_id = p.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE p.is_forced_plan = 1',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_forced_plans
     @database_name sysname = NULL
 AS
 -- Toolkit 04_query_store.sql section 4.6: FORCED PLANS & FORCING FAILURES
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT p.query_id, p.plan_id, p.plan_forcing_type_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT p.query_id, p.plan_id, p.plan_forcing_type_desc,
        p.force_failure_count, p.last_force_failure_reason_desc,
        p.last_execution_time, qt.query_sql_text
 FROM sys.query_store_plan       AS p
 JOIN sys.query_store_query      AS q  ON q.query_id = p.query_id
 JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
 WHERE p.is_forced_plan = 1;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, p.query_id, p.plan_id, p.plan_forcing_type_desc,
+       p.force_failure_count, p.last_force_failure_reason_desc,
+       p.last_execution_time, qt.query_sql_text
+FROM sys.query_store_plan       AS p
+JOIN sys.query_store_query      AS q  ON q.query_id = p.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE p.is_forced_plan = 1'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1756,17 +2630,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_wait_categories @database_name = N''YourDB'', @hours = 24;',
     @min_version = 14,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_wait_categories @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @hours int = 24;
+SELECT TOP (25) DB_NAME() AS database_name, p.query_id, ws.wait_category_desc,
+       SUM(ws.total_query_wait_time_ms) AS total_wait_ms
+FROM sys.query_store_wait_stats AS ws
+JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = ws.runtime_stats_interval_id
+JOIN sys.query_store_plan AS p ON p.plan_id = ws.plan_id
+WHERE i.start_time >= DATEADD(HOUR, -@hours, SYSDATETIMEOFFSET())
+GROUP BY p.query_id, ws.wait_category_desc
+ORDER BY total_wait_ms DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_wait_categories
     @database_name sysname = NULL,
     @hours int = 24
 AS
 -- Toolkit 04_query_store.sql section 4.7: WAIT CATEGORIES PER QUERY (2017+)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (25) p.query_id, ws.wait_category_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (25) p.query_id, ws.wait_category_desc,
        SUM(ws.total_query_wait_time_ms) AS total_wait_ms
 FROM sys.query_store_wait_stats AS ws
 JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = ws.runtime_stats_interval_id
@@ -1774,7 +2659,61 @@ JOIN sys.query_store_plan AS p ON p.plan_id = ws.plan_id
 WHERE i.start_time >= DATEADD(HOUR, -@hours, SYSDATETIMEOFFSET())
 GROUP BY p.query_id, ws.wait_category_desc
 ORDER BY total_wait_ms DESC;'';
-EXEC @hc_exec @hc_sql, N''@hours int'', @hours = @hours;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (25) DB_NAME() AS database_name, p.query_id, ws.wait_category_desc,
+       SUM(ws.total_query_wait_time_ms) AS total_wait_ms
+FROM sys.query_store_wait_stats AS ws
+JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = ws.runtime_stats_interval_id
+JOIN sys.query_store_plan AS p ON p.plan_id = ws.plan_id
+WHERE i.start_time >= DATEADD(HOUR, -@hours, SYSDATETIMEOFFSET())
+GROUP BY p.query_id, ws.wait_category_desc
+ORDER BY total_wait_ms DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@hours int'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @hours = @hours;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @hours = @hours;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1786,19 +2725,73 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_hints @database_name = N''YourDB'';',
     @min_version = 16,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_hints @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, query_hint_id, query_id, query_hint_text, last_query_hint_failure_reason_desc,
+       query_hint_failure_count, source_desc
+FROM sys.query_store_query_hints',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_hints
     @database_name sysname = NULL
 AS
 -- Toolkit 04_query_store.sql section 4.8: QUERY STORE HINTS (2022+, Azure SQL DB, MI)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT query_hint_id, query_id, query_hint_text, last_query_hint_failure_reason_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT query_hint_id, query_id, query_hint_text, last_query_hint_failure_reason_desc,
        query_hint_failure_count, source_desc
 FROM sys.query_store_query_hints;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, query_hint_id, query_id, query_hint_text, last_query_hint_failure_reason_desc,
+       query_hint_failure_count, source_desc
+FROM sys.query_store_query_hints'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1810,22 +2803,81 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_qs_find_query @database_name = N''YourDB'', @search_text = N''%YourText%'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_qs_find_query @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @search_text nvarchar(400) = N''%YourText%'';
+SELECT DB_NAME() AS database_name, q.query_id, q.last_execution_time, OBJECT_NAME(q.object_id) AS object_name, qt.query_sql_text
+FROM sys.query_store_query      AS q
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE qt.query_sql_text LIKE @search_text
+ORDER BY q.last_execution_time DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_qs_find_query
     @database_name sysname = NULL,
     @search_text nvarchar(400) = N''%YourText%''
 AS
 -- Toolkit 04_query_store.sql section 4.9: FIND A QUERY IN QUERY STORE BY TEXT
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT q.query_id, q.last_execution_time, OBJECT_NAME(q.object_id) AS object_name, qt.query_sql_text
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT q.query_id, q.last_execution_time, OBJECT_NAME(q.object_id) AS object_name, qt.query_sql_text
 FROM sys.query_store_query      AS q
 JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
 WHERE qt.query_sql_text LIKE @search_text
 ORDER BY q.last_execution_time DESC;'';
-EXEC @hc_exec @hc_sql, N''@search_text nvarchar(400)'', @search_text = @search_text;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, q.query_id, q.last_execution_time, OBJECT_NAME(q.object_id) AS object_name, qt.query_sql_text
+FROM sys.query_store_query      AS q
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE qt.query_sql_text LIKE @search_text
+ORDER BY q.last_execution_time DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@search_text nvarchar(400)'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @search_text = @search_text;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @search_text = @search_text;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1834,13 +2886,15 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_missing_indexes', @section = N'5.1', @source_file = N'05_indexes_statistics.sql',
     @title = N'MISSING INDEXES - ALL DATABASES, WITH CREATE STATEMENT', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_missing_indexes;',
+    @usage = N'SELECT * FROM dbo.HC_missing_indexes ORDER BY improvement_score DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_missing_indexes
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_missing_indexes;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_missing_indexes',
+    @definition = N'ALTER VIEW dbo.HC_missing_indexes
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.1: MISSING INDEXES - ALL DATABASES, WITH CREATE STATEMENT
-SET NOCOUNT ON;
 SELECT TOP (50)
     DB_NAME(mid.database_id)                                        AS database_name,
     mid.statement                                                   AS table_name,
@@ -1860,7 +2914,32 @@ JOIN sys.dm_db_missing_index_group_stats AS migs ON migs.group_handle = mig.inde
 JOIN sys.dm_db_missing_index_details     AS mid  ON mid.index_handle  = mig.index_handle
 ORDER BY improvement_score DESC;
 ',
-    @fallback_definition = NULL;
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_missing_indexes
+AS
+-- Toolkit 05_indexes_statistics.sql section 5.1: MISSING INDEXES - ALL DATABASES, WITH CREATE STATEMENT
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+SELECT TOP (50)
+    DB_NAME(mid.database_id)                                        AS database_name,
+    mid.statement                                                   AS table_name,
+    CAST(migs.avg_total_user_cost * (migs.avg_user_impact / 100.0)
+         * (migs.user_seeks + migs.user_scans) AS decimal(18,0))    AS improvement_score,
+    migs.user_seeks, migs.user_scans, migs.avg_user_impact, migs.last_user_seek,
+    mid.equality_columns, mid.inequality_columns, mid.included_columns,
+    N''CREATE NONCLUSTERED INDEX [IX_'' + OBJECT_NAME(mid.object_id, mid.database_id) + N''_''
+        + CAST(mid.index_handle AS nvarchar(10)) + N''] ON '' + mid.statement + N'' (''
+        + ISNULL(mid.equality_columns, N'''')
+        + CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN N'', '' ELSE N'''' END
+        + ISNULL(mid.inequality_columns, N'''') + N'')''
+        + ISNULL(N'' INCLUDE ('' + mid.included_columns + N'')'', N'''')
+        + N'' WITH (ONLINE = ON);  -- ONLINE needs Enterprise/Azure''  AS create_statement
+FROM sys.dm_db_missing_index_groups      AS mig
+JOIN sys.dm_db_missing_index_group_stats AS migs ON migs.group_handle = mig.index_group_handle
+JOIN sys.dm_db_missing_index_details     AS mid  ON mid.index_handle  = mig.index_handle
+ORDER BY improvement_score DESC;
+';
 GO
 
 /* 5.2  INDEX USAGE - CURRENT DB (reads vs writes, size)   (05_indexes_statistics.sql) */
@@ -1870,16 +2949,36 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_usage @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_index_usage @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(i.object_id) + N''.'' + OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name, i.index_id, i.type_desc, i.is_primary_key, i.is_unique,
+    ISNULL(us.user_seeks, 0)   AS seeks,
+    ISNULL(us.user_scans, 0)   AS scans,
+    ISNULL(us.user_lookups, 0) AS lookups,
+    ISNULL(us.user_updates, 0) AS writes,
+    us.last_user_seek, us.last_user_scan, us.last_user_update,
+    sz.size_mb, sz.row_count
+FROM sys.indexes AS i
+LEFT JOIN sys.dm_db_index_usage_stats AS us
+       ON us.object_id = i.object_id AND us.index_id = i.index_id AND us.database_id = DB_ID()
+OUTER APPLY (SELECT CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
+                    SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END) AS row_count
+             FROM sys.dm_db_partition_stats AS ps
+             WHERE ps.object_id = i.object_id AND ps.index_id = i.index_id) AS sz
+WHERE OBJECTPROPERTY(i.object_id, ''IsUserTable'') = 1
+ORDER BY table_name, i.index_id',
     @definition = N'ALTER PROCEDURE dbo.HC_index_usage
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.2: INDEX USAGE - CURRENT DB (reads vs writes, size)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT
     OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
     i.name AS index_name, i.index_id, i.type_desc, i.is_primary_key, i.is_unique,
     ISNULL(us.user_seeks, 0)   AS seeks,
@@ -1897,7 +2996,71 @@ OUTER APPLY (SELECT CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) 
              WHERE ps.object_id = i.object_id AND ps.index_id = i.index_id) AS sz
 WHERE OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
 ORDER BY table_name, i.index_id;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name, i.index_id, i.type_desc, i.is_primary_key, i.is_unique,
+    ISNULL(us.user_seeks, 0)   AS seeks,
+    ISNULL(us.user_scans, 0)   AS scans,
+    ISNULL(us.user_lookups, 0) AS lookups,
+    ISNULL(us.user_updates, 0) AS writes,
+    us.last_user_seek, us.last_user_scan, us.last_user_update,
+    sz.size_mb, sz.row_count
+FROM sys.indexes AS i
+LEFT JOIN sys.dm_db_index_usage_stats AS us
+       ON us.object_id = i.object_id AND us.index_id = i.index_id AND us.database_id = DB_ID()
+OUTER APPLY (SELECT CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
+                    SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END) AS row_count
+             FROM sys.dm_db_partition_stats AS ps
+             WHERE ps.object_id = i.object_id AND ps.index_id = i.index_id) AS sz
+WHERE OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
+ORDER BY table_name, i.index_id'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1909,16 +3072,36 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_unused_indexes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_unused_indexes @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(i.object_id) + N''.'' + OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name,
+    ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS total_reads,
+    ISNULL(us.user_updates, 0)                                  AS total_writes,
+    CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
+    N''DROP INDEX '' + QUOTENAME(i.name) + N'' ON ''
+        + QUOTENAME(OBJECT_SCHEMA_NAME(i.object_id)) + N''.'' + QUOTENAME(OBJECT_NAME(i.object_id)) + N'';'' AS drop_statement
+FROM sys.indexes AS i
+JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+LEFT JOIN sys.dm_db_index_usage_stats AS us
+       ON us.object_id = i.object_id AND us.index_id = i.index_id AND us.database_id = DB_ID()
+WHERE OBJECTPROPERTY(i.object_id, ''IsUserTable'') = 1
+  AND i.type_desc = ''NONCLUSTERED''
+  AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
+  AND ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) = 0
+GROUP BY i.object_id, i.name, us.user_seeks, us.user_scans, us.user_lookups, us.user_updates
+ORDER BY total_writes DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_unused_indexes
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.3: UNUSED / WRITE-ONLY NONCLUSTERED INDEXES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT
     OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
     i.name AS index_name,
     ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS total_reads,
@@ -1936,7 +3119,71 @@ WHERE OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
   AND ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) = 0
 GROUP BY i.object_id, i.name, us.user_seeks, us.user_scans, us.user_lookups, us.user_updates
 ORDER BY total_writes DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name,
+    ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS total_reads,
+    ISNULL(us.user_updates, 0)                                  AS total_writes,
+    CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
+    N''''DROP INDEX '''' + QUOTENAME(i.name) + N'''' ON ''''
+        + QUOTENAME(OBJECT_SCHEMA_NAME(i.object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(i.object_id)) + N'''';'''' AS drop_statement
+FROM sys.indexes AS i
+JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+LEFT JOIN sys.dm_db_index_usage_stats AS us
+       ON us.object_id = i.object_id AND us.index_id = i.index_id AND us.database_id = DB_ID()
+WHERE OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
+  AND i.type_desc = ''''NONCLUSTERED''''
+  AND i.is_primary_key = 0 AND i.is_unique_constraint = 0
+  AND ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) = 0
+GROUP BY i.object_id, i.name, us.user_seeks, us.user_scans, us.user_lookups, us.user_updates
+ORDER BY total_writes DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -1948,16 +3195,52 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_duplicate_indexes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_duplicate_indexes @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'WITH idx AS (
+    SELECT i.object_id, i.index_id, i.name, i.type_desc, i.is_unique, i.filter_definition,
+        key_cols = STUFF((
+            SELECT N'','' + QUOTENAME(c.name) + CASE WHEN ic.is_descending_key = 1 THEN N'' DESC'' ELSE N'''' END
+            FROM sys.index_columns AS ic
+            JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+            ORDER BY ic.key_ordinal
+            FOR XML PATH(''''), TYPE).value(''.'', ''nvarchar(max)''), 1, 1, N''''),
+        incl_cols = STUFF((
+            SELECT N'','' + QUOTENAME(c.name)
+            FROM sys.index_columns AS ic
+            JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
+            ORDER BY c.name
+            FOR XML PATH(''''), TYPE).value(''.'', ''nvarchar(max)''), 1, 1, N'''')
+    FROM sys.indexes AS i
+    WHERE OBJECTPROPERTY(i.object_id, ''IsUserTable'') = 1 AND i.type IN (1, 2)
+)
+SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(a.object_id) + N''.'' + OBJECT_NAME(a.object_id) AS table_name,
+    a.name AS index_1, a.key_cols AS keys_1, a.incl_cols AS includes_1,
+    b.name AS index_2, b.key_cols AS keys_2, b.incl_cols AS includes_2,
+    CASE WHEN a.key_cols = b.key_cols AND ISNULL(a.incl_cols, N'''') = ISNULL(b.incl_cols, N'''')
+         THEN ''EXACT DUPLICATE''
+         WHEN a.key_cols = b.key_cols THEN ''SAME KEYS, DIFFERENT INCLUDES''
+         ELSE ''OVERLAPPING (left-prefix)'' END AS finding
+FROM idx AS a
+JOIN idx AS b ON b.object_id = a.object_id AND b.index_id > a.index_id
+WHERE ISNULL(a.filter_definition, N'''') = ISNULL(b.filter_definition, N'''')
+  AND (a.key_cols = b.key_cols
+       OR b.key_cols LIKE a.key_cols + N'',%''
+       OR a.key_cols LIKE b.key_cols + N'',%'')
+ORDER BY table_name',
     @definition = N'ALTER PROCEDURE dbo.HC_duplicate_indexes
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.4: DUPLICATE & OVERLAPPING INDEXES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH idx AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH idx AS (
     SELECT i.object_id, i.index_id, i.name, i.type_desc, i.is_unique, i.filter_definition,
         key_cols = STUFF((
             SELECT N'''','''' + QUOTENAME(c.name) + CASE WHEN ic.is_descending_key = 1 THEN N'''' DESC'''' ELSE N'''''''' END
@@ -1991,7 +3274,87 @@ WHERE ISNULL(a.filter_definition, N'''''''') = ISNULL(b.filter_definition, N''''
        OR b.key_cols LIKE a.key_cols + N'''',%''''
        OR a.key_cols LIKE b.key_cols + N'''',%'''')
 ORDER BY table_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''WITH idx AS (
+    SELECT i.object_id, i.index_id, i.name, i.type_desc, i.is_unique, i.filter_definition,
+        key_cols = STUFF((
+            SELECT N'''','''' + QUOTENAME(c.name) + CASE WHEN ic.is_descending_key = 1 THEN N'''' DESC'''' ELSE N'''''''' END
+            FROM sys.index_columns AS ic
+            JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+            ORDER BY ic.key_ordinal
+            FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 1, N''''''''),
+        incl_cols = STUFF((
+            SELECT N'''','''' + QUOTENAME(c.name)
+            FROM sys.index_columns AS ic
+            JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
+            ORDER BY c.name
+            FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 1, N'''''''')
+    FROM sys.indexes AS i
+    WHERE OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1 AND i.type IN (1, 2)
+)
+SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(a.object_id) + N''''.'''' + OBJECT_NAME(a.object_id) AS table_name,
+    a.name AS index_1, a.key_cols AS keys_1, a.incl_cols AS includes_1,
+    b.name AS index_2, b.key_cols AS keys_2, b.incl_cols AS includes_2,
+    CASE WHEN a.key_cols = b.key_cols AND ISNULL(a.incl_cols, N'''''''') = ISNULL(b.incl_cols, N'''''''')
+         THEN ''''EXACT DUPLICATE''''
+         WHEN a.key_cols = b.key_cols THEN ''''SAME KEYS, DIFFERENT INCLUDES''''
+         ELSE ''''OVERLAPPING (left-prefix)'''' END AS finding
+FROM idx AS a
+JOIN idx AS b ON b.object_id = a.object_id AND b.index_id > a.index_id
+WHERE ISNULL(a.filter_definition, N'''''''') = ISNULL(b.filter_definition, N'''''''')
+  AND (a.key_cols = b.key_cols
+       OR b.key_cols LIKE a.key_cols + N'''',%''''
+       OR a.key_cols LIKE b.key_cols + N'''',%'''')
+ORDER BY table_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2003,16 +3366,29 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_fragmentation @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_index_fragmentation @database_name = @db;', @test_mode = 'heavy: reads index pages',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(ips.object_id) + N''.'' + OBJECT_NAME(ips.object_id) AS table_name,
+    i.name AS index_name, ips.index_type_desc, ips.partition_number,
+    CAST(ips.avg_fragmentation_in_percent AS decimal(5,2)) AS frag_pct,
+    ips.page_count, ips.fragment_count, i.fill_factor
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''LIMITED'') AS ips
+JOIN sys.indexes AS i ON i.object_id = ips.object_id AND i.index_id = ips.index_id
+WHERE ips.page_count > 1000
+  AND ips.index_id > 0
+  AND ips.alloc_unit_type_desc = ''IN_ROW_DATA''
+ORDER BY ips.avg_fragmentation_in_percent DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_index_fragmentation
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.5: FRAGMENTATION - CURRENT DB (LIMITED mode, >1000 pages)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT
     OBJECT_SCHEMA_NAME(ips.object_id) + N''''.'''' + OBJECT_NAME(ips.object_id) AS table_name,
     i.name AS index_name, ips.index_type_desc, ips.partition_number,
     CAST(ips.avg_fragmentation_in_percent AS decimal(5,2)) AS frag_pct,
@@ -2023,7 +3399,64 @@ WHERE ips.page_count > 1000
   AND ips.index_id > 0
   AND ips.alloc_unit_type_desc = ''''IN_ROW_DATA''''
 ORDER BY ips.avg_fragmentation_in_percent DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(ips.object_id) + N''''.'''' + OBJECT_NAME(ips.object_id) AS table_name,
+    i.name AS index_name, ips.index_type_desc, ips.partition_number,
+    CAST(ips.avg_fragmentation_in_percent AS decimal(5,2)) AS frag_pct,
+    ips.page_count, ips.fragment_count, i.fill_factor
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''''LIMITED'''') AS ips
+JOIN sys.indexes AS i ON i.object_id = ips.object_id AND i.index_id = ips.index_id
+WHERE ips.page_count > 1000
+  AND ips.index_id > 0
+  AND ips.alloc_unit_type_desc = ''''IN_ROW_DATA''''
+ORDER BY ips.avg_fragmentation_in_percent DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2035,23 +3468,85 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_heaps_forwarded @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_heaps_forwarded @database_name = @db;', @test_mode = 'heavy: reads index pages',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ips.object_id) + N''.'' + OBJECT_NAME(ips.object_id) AS heap_name,
+       ips.page_count, ips.record_count, ips.forwarded_record_count,
+       CAST(100.0 * ips.forwarded_record_count / NULLIF(ips.record_count, 0) AS decimal(5,2)) AS forwarded_pct
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, 0, NULL, ''SAMPLED'') AS ips
+WHERE ips.index_type_desc = ''HEAP''
+  AND ips.page_count > 100
+ORDER BY ips.forwarded_record_count DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_heaps_forwarded
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.6: HEAPS WITH FORWARDED RECORDS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ips.object_id) + N''''.'''' + OBJECT_NAME(ips.object_id) AS heap_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ips.object_id) + N''''.'''' + OBJECT_NAME(ips.object_id) AS heap_name,
        ips.page_count, ips.record_count, ips.forwarded_record_count,
        CAST(100.0 * ips.forwarded_record_count / NULLIF(ips.record_count, 0) AS decimal(5,2)) AS forwarded_pct
 FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, 0, NULL, ''''SAMPLED'''') AS ips
 WHERE ips.index_type_desc = ''''HEAP''''
   AND ips.page_count > 100
 ORDER BY ips.forwarded_record_count DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ips.object_id) + N''''.'''' + OBJECT_NAME(ips.object_id) AS heap_name,
+       ips.page_count, ips.record_count, ips.forwarded_record_count,
+       CAST(100.0 * ips.forwarded_record_count / NULLIF(ips.record_count, 0) AS decimal(5,2)) AS forwarded_pct
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, 0, NULL, ''''SAMPLED'''') AS ips
+WHERE ips.index_type_desc = ''''HEAP''''
+  AND ips.page_count > 100
+ORDER BY ips.forwarded_record_count DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2063,17 +3558,38 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_table_indexes @database_name = N''YourDB'', @table = N''dbo.YourTable'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_table_indexes @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @table sysname = N''dbo.YourTable'';
+SELECT DB_NAME() AS database_name, i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
+       i.has_filter, i.filter_definition, p.data_compression_desc,
+       STUFF((SELECT N'', '' + c.name + CASE WHEN ic.is_descending_key = 1 THEN N'' DESC'' ELSE N'''' END
+              FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+              ORDER BY ic.key_ordinal FOR XML PATH(''''), TYPE).value(''.'', ''nvarchar(max)''), 1, 2, N'''') AS key_columns,
+       STUFF((SELECT N'', '' + c.name
+              FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
+              FOR XML PATH(''''), TYPE).value(''.'', ''nvarchar(max)''), 1, 2, N'''') AS included_columns,
+       CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) AS size_mb
+FROM sys.indexes AS i
+JOIN sys.partitions AS p ON p.object_id = i.object_id AND p.index_id = i.index_id AND p.partition_number = 1
+JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID(@table)
+GROUP BY i.object_id, i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
+         i.has_filter, i.filter_definition, p.data_compression_desc
+ORDER BY i.index_id',
     @definition = N'ALTER PROCEDURE dbo.HC_table_indexes
     @database_name sysname = NULL,
     @table sysname = N''dbo.YourTable''
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.7: ALL INDEXES ON ONE TABLE (better sp_helpindex)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
        i.has_filter, i.filter_definition, p.data_compression_desc,
        STUFF((SELECT N'''', '''' + c.name + CASE WHEN ic.is_descending_key = 1 THEN N'''' DESC'''' ELSE N'''''''' END
               FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
@@ -2091,7 +3607,71 @@ WHERE i.object_id = OBJECT_ID(@table)
 GROUP BY i.object_id, i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
          i.has_filter, i.filter_definition, p.data_compression_desc
 ORDER BY i.index_id;'';
-EXEC @hc_exec @hc_sql, N''@table sysname'', @table = @table;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
+       i.has_filter, i.filter_definition, p.data_compression_desc,
+       STUFF((SELECT N'''', '''' + c.name + CASE WHEN ic.is_descending_key = 1 THEN N'''' DESC'''' ELSE N'''''''' END
+              FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+              ORDER BY ic.key_ordinal FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 2, N'''''''') AS key_columns,
+       STUFF((SELECT N'''', '''' + c.name
+              FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+              WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
+              FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 2, N'''''''') AS included_columns,
+       CAST(SUM(ps.used_page_count) * 8 / 1024.0 AS decimal(18,2)) AS size_mb
+FROM sys.indexes AS i
+JOIN sys.partitions AS p ON p.object_id = i.object_id AND p.index_id = i.index_id AND p.partition_number = 1
+JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID(@table)
+GROUP BY i.object_id, i.index_id, i.name, i.type_desc, i.is_primary_key, i.is_unique, i.fill_factor,
+         i.has_filter, i.filter_definition, p.data_compression_desc
+ORDER BY i.index_id'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@table sysname'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @table = @table;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @table = @table;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2103,16 +3683,31 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stats_health @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_stats_health @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) AS table_name,
+    s.name AS stats_name, s.auto_created, s.user_created, s.no_recompute, s.is_incremental,
+    sp.last_updated, DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) AS days_old,
+    sp.rows, sp.rows_sampled,
+    CAST(100.0 * sp.rows_sampled / NULLIF(sp.rows, 0) AS decimal(5,2)) AS sample_pct,
+    sp.modification_counter,
+    CAST(100.0 * sp.modification_counter / NULLIF(sp.rows, 0) AS decimal(10,2)) AS modified_pct,
+    sp.steps
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE OBJECTPROPERTY(s.object_id, ''IsUserTable'') = 1
+ORDER BY sp.modification_counter DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_stats_health
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.8: STATISTICS HEALTH - CURRENT DB (stale / low sample)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT
     OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name,
     s.name AS stats_name, s.auto_created, s.user_created, s.no_recompute, s.is_incremental,
     sp.last_updated, DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) AS days_old,
@@ -2125,7 +3720,66 @@ FROM sys.stats AS s
 CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
 WHERE OBJECTPROPERTY(s.object_id, ''''IsUserTable'''') = 1
 ORDER BY sp.modification_counter DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name,
+    s.name AS stats_name, s.auto_created, s.user_created, s.no_recompute, s.is_incremental,
+    sp.last_updated, DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) AS days_old,
+    sp.rows, sp.rows_sampled,
+    CAST(100.0 * sp.rows_sampled / NULLIF(sp.rows, 0) AS decimal(5,2)) AS sample_pct,
+    sp.modification_counter,
+    CAST(100.0 * sp.modification_counter / NULLIF(sp.rows, 0) AS decimal(10,2)) AS modified_pct,
+    sp.steps
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE OBJECTPROPERTY(s.object_id, ''''IsUserTable'''') = 1
+ORDER BY sp.modification_counter DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2137,16 +3791,32 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_operational_stats @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_index_operational_stats @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT TOP (25) DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(os.object_id) + N''.'' + OBJECT_NAME(os.object_id) AS table_name,
+    i.name AS index_name,
+    os.leaf_insert_count, os.leaf_update_count, os.leaf_delete_count,
+    os.leaf_allocation_count            AS leaf_page_splits_approx,
+    os.row_lock_wait_count, os.row_lock_wait_in_ms,
+    os.page_lock_wait_count, os.page_lock_wait_in_ms,
+    os.page_latch_wait_count, os.page_latch_wait_in_ms,
+    os.page_io_latch_wait_count, os.page_io_latch_wait_in_ms,
+    os.index_lock_promotion_attempt_count, os.index_lock_promotion_count
+FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
+JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
+WHERE OBJECTPROPERTY(os.object_id, ''IsUserTable'') = 1
+ORDER BY os.row_lock_wait_in_ms + os.page_lock_wait_in_ms DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_index_operational_stats
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.9: INDEX OPERATIONAL STATS (lock/latch waits, splits proxy)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (25)
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (25)
     OBJECT_SCHEMA_NAME(os.object_id) + N''''.'''' + OBJECT_NAME(os.object_id) AS table_name,
     i.name AS index_name,
     os.leaf_insert_count, os.leaf_update_count, os.leaf_delete_count,
@@ -2160,7 +3830,67 @@ FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
 JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
 WHERE OBJECTPROPERTY(os.object_id, ''''IsUserTable'''') = 1
 ORDER BY os.row_lock_wait_in_ms + os.page_lock_wait_in_ms DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (25) DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(os.object_id) + N''''.'''' + OBJECT_NAME(os.object_id) AS table_name,
+    i.name AS index_name,
+    os.leaf_insert_count, os.leaf_update_count, os.leaf_delete_count,
+    os.leaf_allocation_count            AS leaf_page_splits_approx,
+    os.row_lock_wait_count, os.row_lock_wait_in_ms,
+    os.page_lock_wait_count, os.page_lock_wait_in_ms,
+    os.page_latch_wait_count, os.page_latch_wait_in_ms,
+    os.page_io_latch_wait_count, os.page_io_latch_wait_in_ms,
+    os.index_lock_promotion_attempt_count, os.index_lock_promotion_count
+FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
+JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
+WHERE OBJECTPROPERTY(os.object_id, ''''IsUserTable'''') = 1
+ORDER BY os.row_lock_wait_in_ms + os.page_lock_wait_in_ms DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2172,16 +3902,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_columnstore_health @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_columnstore_health @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_NAME(rg.object_id) AS table_name, i.name AS index_name,
+       rg.state_desc, COUNT(*) AS rowgroups,
+       SUM(rg.total_rows) AS total_rows, SUM(rg.deleted_rows) AS deleted_rows,
+       CAST(100.0 * SUM(rg.deleted_rows) / NULLIF(SUM(rg.total_rows), 0) AS decimal(5,2)) AS deleted_pct,
+       MIN(rg.trim_reason_desc) AS sample_trim_reason
+FROM sys.dm_db_column_store_row_group_physical_stats AS rg
+JOIN sys.indexes AS i ON i.object_id = rg.object_id AND i.index_id = rg.index_id
+GROUP BY rg.object_id, i.name, rg.state_desc
+ORDER BY table_name, rg.state_desc',
     @definition = N'ALTER PROCEDURE dbo.HC_columnstore_health
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.10: COLUMNSTORE ROWGROUP HEALTH - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_NAME(rg.object_id) AS table_name, i.name AS index_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_NAME(rg.object_id) AS table_name, i.name AS index_name,
        rg.state_desc, COUNT(*) AS rowgroups,
        SUM(rg.total_rows) AS total_rows, SUM(rg.deleted_rows) AS deleted_rows,
        CAST(100.0 * SUM(rg.deleted_rows) / NULLIF(SUM(rg.total_rows), 0) AS decimal(5,2)) AS deleted_pct,
@@ -2190,7 +3931,62 @@ FROM sys.dm_db_column_store_row_group_physical_stats AS rg
 JOIN sys.indexes AS i ON i.object_id = rg.object_id AND i.index_id = rg.index_id
 GROUP BY rg.object_id, i.name, rg.state_desc
 ORDER BY table_name, rg.state_desc;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_NAME(rg.object_id) AS table_name, i.name AS index_name,
+       rg.state_desc, COUNT(*) AS rowgroups,
+       SUM(rg.total_rows) AS total_rows, SUM(rg.deleted_rows) AS deleted_rows,
+       CAST(100.0 * SUM(rg.deleted_rows) / NULLIF(SUM(rg.total_rows), 0) AS decimal(5,2)) AS deleted_pct,
+       MIN(rg.trim_reason_desc) AS sample_trim_reason
+FROM sys.dm_db_column_store_row_group_physical_stats AS rg
+JOIN sys.indexes AS i ON i.object_id = rg.object_id AND i.index_id = rg.index_id
+GROUP BY rg.object_id, i.name, rg.state_desc
+ORDER BY table_name, rg.state_desc'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2202,16 +3998,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tables_without_ci_pk @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_tables_without_ci_pk @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(t.object_id) + N''.'' + t.name AS table_name,
+       OBJECTPROPERTY(t.object_id, ''TableHasClustIndex'') AS has_clustered,
+       OBJECTPROPERTY(t.object_id, ''TableHasPrimaryKey'') AS has_pk,
+       (SELECT SUM(row_count) FROM sys.dm_db_partition_stats ps WHERE ps.object_id = t.object_id AND ps.index_id IN (0,1)) AS row_count
+FROM sys.tables AS t
+WHERE t.is_ms_shipped = 0
+  AND (OBJECTPROPERTY(t.object_id, ''TableHasClustIndex'') = 0 OR OBJECTPROPERTY(t.object_id, ''TableHasPrimaryKey'') = 0)
+ORDER BY row_count DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_tables_without_ci_pk
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.11: TABLES WITHOUT A CLUSTERED INDEX / PRIMARY KEY
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + t.name AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + t.name AS table_name,
        OBJECTPROPERTY(t.object_id, ''''TableHasClustIndex'''') AS has_clustered,
        OBJECTPROPERTY(t.object_id, ''''TableHasPrimaryKey'''') AS has_pk,
        (SELECT SUM(row_count) FROM sys.dm_db_partition_stats ps WHERE ps.object_id = t.object_id AND ps.index_id IN (0,1)) AS row_count
@@ -2219,7 +4025,61 @@ FROM sys.tables AS t
 WHERE t.is_ms_shipped = 0
   AND (OBJECTPROPERTY(t.object_id, ''''TableHasClustIndex'''') = 0 OR OBJECTPROPERTY(t.object_id, ''''TableHasPrimaryKey'''') = 0)
 ORDER BY row_count DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + t.name AS table_name,
+       OBJECTPROPERTY(t.object_id, ''''TableHasClustIndex'''') AS has_clustered,
+       OBJECTPROPERTY(t.object_id, ''''TableHasPrimaryKey'''') AS has_pk,
+       (SELECT SUM(row_count) FROM sys.dm_db_partition_stats ps WHERE ps.object_id = t.object_id AND ps.index_id IN (0,1)) AS row_count
+FROM sys.tables AS t
+WHERE t.is_ms_shipped = 0
+  AND (OBJECTPROPERTY(t.object_id, ''''TableHasClustIndex'''') = 0 OR OBJECTPROPERTY(t.object_id, ''''TableHasPrimaryKey'''') = 0)
+ORDER BY row_count DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2231,19 +4091,73 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_resumable_index_ops @database_name = N''YourDB'';',
     @min_version = 14,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_resumable_index_ops @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_NAME(object_id) AS table_name, index_id, name, state_desc,
+       percent_complete, start_time, last_pause_time, total_execution_time, sql_text
+FROM sys.index_resumable_operations',
     @definition = N'ALTER PROCEDURE dbo.HC_resumable_index_ops
     @database_name sysname = NULL
 AS
 -- Toolkit 05_indexes_statistics.sql section 5.12: RESUMABLE INDEX OPERATIONS IN PROGRESS (2017+)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_NAME(object_id) AS table_name, index_id, name, state_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_NAME(object_id) AS table_name, index_id, name, state_desc,
        percent_complete, start_time, last_pause_time, total_execution_time, sql_text
 FROM sys.index_resumable_operations;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_NAME(object_id) AS table_name, index_id, name, state_desc,
+       percent_complete, start_time, last_pause_time, total_execution_time, sql_text
+FROM sys.index_resumable_operations'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2255,10 +4169,29 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_memory_overview;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_memory_overview;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT total_physical_memory_kb / 1024     AS os_total_mb,
+       available_physical_memory_kb / 1024 AS os_available_mb,
+       total_page_file_kb / 1024           AS page_file_mb,
+       system_memory_state_desc
+FROM sys.dm_os_sys_memory
+--#HC_NEXT_RESULT#
+SELECT physical_memory_in_use_kb / 1024     AS sql_physical_in_use_mb,
+       locked_page_allocations_kb / 1024    AS locked_pages_mb,
+       large_page_allocations_kb / 1024     AS large_pages_mb,
+       memory_utilization_percentage,
+       available_commit_limit_kb / 1024     AS available_commit_mb,
+       process_physical_memory_low, process_virtual_memory_low,
+       page_fault_count
+FROM sys.dm_os_process_memory',
     @definition = N'ALTER PROCEDURE dbo.HC_memory_overview
 AS
 -- Toolkit 06_memory.sql section 6.1: OS + SQL PROCESS MEMORY OVERVIEW
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT total_physical_memory_kb / 1024     AS os_total_mb,
        available_physical_memory_kb / 1024 AS os_available_mb,
        total_page_file_kb / 1024           AS page_file_mb,
@@ -2284,6 +4217,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_memory_counters ORDER BY object_name, counter_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY object_name, counter_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_memory_counters;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_memory_counters',
     @definition = N'ALTER VIEW dbo.HC_memory_counters
 AS
 -- Toolkit 06_memory.sql section 6.2: KEY MEMORY COUNTERS
@@ -2301,6 +4237,9 @@ WHERE (object_name LIKE N''%Memory Manager%'' AND counter_name IN (
 AS
 -- Toolkit 06_memory.sql section 6.2: KEY MEMORY COUNTERS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT RTRIM(object_name) AS object_name, RTRIM(counter_name) AS counter_name,
        RTRIM(instance_name) AS instance_name, cntr_value
 FROM sys.dm_os_performance_counters
@@ -2321,6 +4260,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ple_per_numa;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ple_per_numa;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ple_per_numa',
     @definition = N'ALTER VIEW dbo.HC_ple_per_numa
 AS
 -- Toolkit 06_memory.sql section 6.3: PAGE LIFE EXPECTANCY PER NUMA NODE
@@ -2332,6 +4274,9 @@ WHERE counter_name = N''Page life expectancy'';
 AS
 -- Toolkit 06_memory.sql section 6.3: PAGE LIFE EXPECTANCY PER NUMA NODE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT RTRIM(object_name) AS object_name, RTRIM(instance_name) AS numa_node, cntr_value AS ple_seconds
 FROM sys.dm_os_performance_counters
 WHERE counter_name = N''Page life expectancy'';
@@ -2342,13 +4287,30 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_buffer_pool_by_db', @section = N'6.4', @source_file = N'06_memory.sql',
     @title = N'BUFFER POOL USAGE BY DATABASE', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_buffer_pool_by_db;',
+    @usage = N'SELECT * FROM dbo.HC_buffer_pool_by_db ORDER BY cached_mb DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_buffer_pool_by_db
+    @sort_hint = N'ORDER BY cached_mb DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_buffer_pool_by_db;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_buffer_pool_by_db',
+    @definition = N'ALTER VIEW dbo.HC_buffer_pool_by_db
+AS
+-- Toolkit 06_memory.sql section 6.4: BUFFER POOL USAGE BY DATABASE
+SELECT
+    CASE database_id WHEN 32767 THEN ''ResourceDb'' ELSE DB_NAME(database_id) END AS database_name,
+    COUNT_BIG(*) * 8 / 1024                                       AS cached_mb,
+    SUM(CAST(is_modified AS int)) * 8 / 1024                      AS dirty_mb,
+    CAST(100.0 * COUNT_BIG(*) / SUM(COUNT_BIG(*)) OVER () AS decimal(5,2)) AS pct_of_bp
+FROM sys.dm_os_buffer_descriptors
+GROUP BY database_id;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_buffer_pool_by_db
 AS
 -- Toolkit 06_memory.sql section 6.4: BUFFER POOL USAGE BY DATABASE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     CASE database_id WHEN 32767 THEN ''ResourceDb'' ELSE DB_NAME(database_id) END AS database_name,
     COUNT_BIG(*) * 8 / 1024                                       AS cached_mb,
@@ -2357,8 +4319,7 @@ SELECT
 FROM sys.dm_os_buffer_descriptors
 GROUP BY database_id
 ORDER BY cached_mb DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 6.5  BUFFER POOL USAGE BY OBJECT - CURRENT DB   (06_memory.sql) */
@@ -2368,16 +4329,32 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_buffer_pool_by_object @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_buffer_pool_by_object @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT TOP (25) DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(p.object_id) + N''.'' + OBJECT_NAME(p.object_id) AS object_name,
+    i.name AS index_name,
+    COUNT_BIG(*) * 8 / 1024 AS cached_mb,
+    SUM(CAST(bd.is_modified AS int)) * 8 / 1024 AS dirty_mb
+FROM sys.dm_os_buffer_descriptors AS bd
+JOIN sys.allocation_units AS au ON au.allocation_unit_id = bd.allocation_unit_id
+JOIN sys.partitions       AS p  ON (au.type IN (1, 3) AND au.container_id = p.hobt_id)
+                                OR (au.type = 2      AND au.container_id = p.partition_id)
+LEFT JOIN sys.indexes     AS i  ON i.object_id = p.object_id AND i.index_id = p.index_id
+WHERE bd.database_id = DB_ID()
+  AND OBJECTPROPERTY(p.object_id, ''IsMSShipped'') = 0
+GROUP BY p.object_id, i.name
+ORDER BY cached_mb DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_buffer_pool_by_object
     @database_name sysname = NULL
 AS
 -- Toolkit 06_memory.sql section 6.5: BUFFER POOL USAGE BY OBJECT - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (25)
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (25)
     OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id) AS object_name,
     i.name AS index_name,
     COUNT_BIG(*) * 8 / 1024 AS cached_mb,
@@ -2391,7 +4368,67 @@ WHERE bd.database_id = DB_ID()
   AND OBJECTPROPERTY(p.object_id, ''''IsMSShipped'''') = 0
 GROUP BY p.object_id, i.name
 ORDER BY cached_mb DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (25) DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id) AS object_name,
+    i.name AS index_name,
+    COUNT_BIG(*) * 8 / 1024 AS cached_mb,
+    SUM(CAST(bd.is_modified AS int)) * 8 / 1024 AS dirty_mb
+FROM sys.dm_os_buffer_descriptors AS bd
+JOIN sys.allocation_units AS au ON au.allocation_unit_id = bd.allocation_unit_id
+JOIN sys.partitions       AS p  ON (au.type IN (1, 3) AND au.container_id = p.hobt_id)
+                                OR (au.type = 2      AND au.container_id = p.partition_id)
+LEFT JOIN sys.indexes     AS i  ON i.object_id = p.object_id AND i.index_id = p.index_id
+WHERE bd.database_id = DB_ID()
+  AND OBJECTPROPERTY(p.object_id, ''''IsMSShipped'''') = 0
+GROUP BY p.object_id, i.name
+ORDER BY cached_mb DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2403,6 +4440,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_memory_clerks ORDER BY memory_mb DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_memory_clerks;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_memory_clerks',
     @definition = N'ALTER VIEW dbo.HC_memory_clerks
 AS
 -- Toolkit 06_memory.sql section 6.6: TOP MEMORY CLERKS (who is using non-buffer memory)
@@ -2416,6 +4456,9 @@ ORDER BY memory_mb DESC;
 AS
 -- Toolkit 06_memory.sql section 6.6: TOP MEMORY CLERKS (who is using non-buffer memory)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (20) [type] AS clerk_type, name,
        SUM(pages_kb) / 1024 AS memory_mb
 FROM sys.dm_os_memory_clerks
@@ -2431,10 +4474,31 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_memory_grants;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_memory_grants;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT mg.session_id, mg.request_time, mg.grant_time,
+       mg.requested_memory_kb / 1024 AS requested_mb,
+       mg.granted_memory_kb / 1024   AS granted_mb,
+       mg.used_memory_kb / 1024      AS used_mb,
+       mg.ideal_memory_kb / 1024     AS ideal_mb,
+       mg.wait_time_ms, mg.dop, mg.query_cost, mg.resource_semaphore_id,
+       t.text AS sql_text, qp.query_plan
+FROM sys.dm_exec_query_memory_grants AS mg
+OUTER APPLY sys.dm_exec_sql_text(mg.sql_handle)    AS t
+OUTER APPLY sys.dm_exec_query_plan(mg.plan_handle) AS qp
+ORDER BY mg.requested_memory_kb DESC
+--#HC_NEXT_RESULT#
+SELECT resource_semaphore_id, pool_id, target_memory_kb / 1024 AS target_mb,
+       total_memory_kb / 1024 AS total_mb, available_memory_kb / 1024 AS available_mb,
+       granted_memory_kb / 1024 AS granted_mb, grantee_count, waiter_count, timeout_error_count
+FROM sys.dm_exec_query_resource_semaphores',
     @definition = N'ALTER PROCEDURE dbo.HC_memory_grants
 AS
 -- Toolkit 06_memory.sql section 6.7: MEMORY GRANTS - WAITING AND RUNNING
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT mg.session_id, mg.request_time, mg.grant_time,
        mg.requested_memory_kb / 1024 AS requested_mb,
        mg.granted_memory_kb / 1024   AS granted_mb,
@@ -2462,10 +4526,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_low_memory_events;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_low_memory_events;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_low_memory_events
 AS
 -- Toolkit 06_memory.sql section 6.8: LOW MEMORY NOTIFICATIONS FROM RING BUFFER
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @ms_now bigint = (SELECT ms_ticks FROM sys.dm_os_sys_info);
 SELECT TOP (50)
     DATEADD(MILLISECOND, -1 * (@ms_now - rb.[timestamp]), SYSDATETIME()) AS event_time,
@@ -2488,6 +4558,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_oom_events;',
     @min_version = 16,
     @sort_hint = N'ORDER BY event_time DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_oom_events;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_oom_events',
     @definition = N'ALTER VIEW dbo.HC_oom_events
 AS
 -- Toolkit 06_memory.sql section 6.9: OUT-OF-MEMORY EVENTS (2022+, Azure SQL DB, MI)
@@ -2498,6 +4571,9 @@ FROM sys.dm_os_out_of_memory_events;
 AS
 -- Toolkit 06_memory.sql section 6.9: OUT-OF-MEMORY EVENTS (2022+, Azure SQL DB, MI)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT *
 FROM sys.dm_os_out_of_memory_events
 ORDER BY event_time DESC;
@@ -2511,6 +4587,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_memory_settings;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_memory_settings;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_memory_settings',
     @definition = N'ALTER VIEW dbo.HC_memory_settings
 AS
 -- Toolkit 06_memory.sql section 6.10: MEMORY SETTINGS CHECK
@@ -2524,6 +4603,9 @@ SELECT
 AS
 -- Toolkit 06_memory.sql section 6.10: MEMORY SETTINGS CHECK
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N''max server memory (MB)'') AS max_server_memory_mb,
     (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N''min server memory (MB)'') AS min_server_memory_mb,
@@ -2539,10 +4621,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cpu_history;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cpu_history;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_cpu_history
 AS
 -- Toolkit 07_cpu.sql section 7.1: CPU % - LAST ~256 MINUTES (1-minute samples)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @ms_now bigint = (SELECT ms_ticks FROM sys.dm_os_sys_info);
 
 SELECT TOP (256)
@@ -2572,10 +4660,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_scheduler_pressure;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_scheduler_pressure;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT scheduler_id, cpu_id, parent_node_id, status, is_online,
+       current_tasks_count, runnable_tasks_count, current_workers_count,
+       active_workers_count, work_queue_count, pending_disk_io_count, load_factor
+FROM sys.dm_os_schedulers
+WHERE status = N''VISIBLE ONLINE''
+ORDER BY runnable_tasks_count DESC
+--#HC_NEXT_RESULT#
+SELECT SUM(runnable_tasks_count) AS total_runnable,
+       AVG(runnable_tasks_count * 1.0) AS avg_runnable_per_scheduler,
+       SUM(work_queue_count) AS tasks_waiting_for_worker
+FROM sys.dm_os_schedulers
+WHERE status = N''VISIBLE ONLINE''',
     @definition = N'ALTER PROCEDURE dbo.HC_scheduler_pressure
 AS
 -- Toolkit 07_cpu.sql section 7.2: SCHEDULER PRESSURE (runnable queue)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT scheduler_id, cpu_id, parent_node_id, status, is_online,
        current_tasks_count, runnable_tasks_count, current_workers_count,
        active_workers_count, work_queue_count, pending_disk_io_count, load_factor
@@ -2599,6 +4704,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_worker_threads;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_worker_threads;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_worker_threads',
     @definition = N'ALTER VIEW dbo.HC_worker_threads
 AS
 -- Toolkit 07_cpu.sql section 7.3: WORKER THREAD USAGE (THREADPOOL risk)
@@ -2612,6 +4720,9 @@ SELECT
 AS
 -- Toolkit 07_cpu.sql section 7.3: WORKER THREAD USAGE (THREADPOOL risk)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     (SELECT max_workers_count FROM sys.dm_os_sys_info)                                AS max_workers,
     (SELECT SUM(current_workers_count) FROM sys.dm_os_schedulers WHERE status = N''VISIBLE ONLINE'') AS current_workers,
@@ -2627,6 +4738,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_top_cpu_now ORDER BY cpu_ms DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_top_cpu_now;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_top_cpu_now',
     @definition = N'ALTER VIEW dbo.HC_top_cpu_now
 AS
 -- Toolkit 07_cpu.sql section 7.4: TOP CPU CONSUMERS RIGHT NOW
@@ -2647,6 +4761,9 @@ ORDER BY r.cpu_time DESC;
 AS
 -- Toolkit 07_cpu.sql section 7.4: TOP CPU CONSUMERS RIGHT NOW
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (20)
     r.session_id, s.login_name, s.host_name, s.program_name, DB_NAME(r.database_id) AS database_name,
     r.cpu_time AS cpu_ms, r.total_elapsed_time / 1000 AS elapsed_s, r.dop,
@@ -2666,13 +4783,34 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_cpu_by_database', @section = N'7.5', @source_file = N'07_cpu.sql',
     @title = N'CPU USAGE BY DATABASE (from plan cache - approximate)', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_cpu_by_database;',
+    @usage = N'SELECT * FROM dbo.HC_cpu_by_database ORDER BY cpu_ms DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_cpu_by_database
+    @sort_hint = N'ORDER BY cpu_us DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_cpu_by_database;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_cpu_by_database',
+    @definition = N'ALTER VIEW dbo.HC_cpu_by_database
+AS
+-- Toolkit 07_cpu.sql section 7.5: CPU USAGE BY DATABASE (from plan cache - approximate)
+WITH db_cpu AS (
+    SELECT CAST(pa.value AS int) AS database_id, SUM(qs.total_worker_time) AS cpu_us
+    FROM sys.dm_exec_query_stats AS qs
+    CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
+    WHERE pa.attribute = N''dbid''
+    GROUP BY CAST(pa.value AS int)
+)
+SELECT CASE database_id WHEN 32767 THEN ''ResourceDb'' ELSE DB_NAME(database_id) END AS database_name,
+       cpu_us / 1000 AS cpu_ms,
+       CAST(100.0 * cpu_us / SUM(cpu_us) OVER () AS decimal(5,2)) AS cpu_pct
+FROM db_cpu;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_cpu_by_database
 AS
 -- Toolkit 07_cpu.sql section 7.5: CPU USAGE BY DATABASE (from plan cache - approximate)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH db_cpu AS (
     SELECT CAST(pa.value AS int) AS database_id, SUM(qs.total_worker_time) AS cpu_us
     FROM sys.dm_exec_query_stats AS qs
@@ -2685,8 +4823,7 @@ SELECT CASE database_id WHEN 32767 THEN ''ResourceDb'' ELSE DB_NAME(database_id)
        CAST(100.0 * cpu_us / SUM(cpu_us) OVER () AS decimal(5,2)) AS cpu_pct
 FROM db_cpu
 ORDER BY cpu_us DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 7.6  NUMA NODES & PARALLELISM SETTINGS   (07_cpu.sql) */
@@ -2696,16 +4833,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_numa_maxdop @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_numa_maxdop @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_numa_maxdop
     @database_name sysname = NULL
 AS
 -- Toolkit 07_cpu.sql section 7.6: NUMA NODES & PARALLELISM SETTINGS
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT node_id, node_state_desc, memory_node_id, online_scheduler_count,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT node_id, node_state_desc, memory_node_id, online_scheduler_count,
        active_worker_count, avg_load_balance, cpu_affinity_mask
 FROM sys.dm_os_nodes
 WHERE node_state_desc NOT LIKE N''''%DAC%'''';
@@ -2714,7 +4854,54 @@ SELECT name, value_in_use FROM sys.configurations
 WHERE name IN (N''''max degree of parallelism'''', N''''cost threshold for parallelism'''');
 
 SELECT name, value FROM sys.database_scoped_configurations WHERE name = N''''MAXDOP'''';'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2726,6 +4913,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_file_latency ORDER BY avg_io_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY avg_io_ms DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_file_latency;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_file_latency',
     @definition = N'ALTER VIEW dbo.HC_file_latency
 AS
 -- Toolkit 08_storage_io_files.sql section 8.1: FILE I/O LATENCY - ALL DATABASES (since restart)
@@ -2746,6 +4936,9 @@ JOIN sys.master_files AS mf ON mf.database_id = vfs.database_id AND mf.file_id =
 AS
 -- Toolkit 08_storage_io_files.sql section 8.1: FILE I/O LATENCY - ALL DATABASES (since restart)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     DB_NAME(vfs.database_id)                                                AS database_name,
     mf.name AS logical_name, mf.type_desc, mf.physical_name,
@@ -2769,11 +4962,17 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_file_latency_delta @delay = ''00:00:30'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_file_latency_delta;', @test_mode = 'skip: waits on purpose (sampling window)',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_file_latency_delta
     @delay char(8) = ''00:00:30''
 AS
 -- Toolkit 08_storage_io_files.sql section 8.2: FILE I/O LATENCY - DELTA OVER N SECONDS (live)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#io1'') IS NOT NULL DROP TABLE #io1;
 SELECT database_id, file_id, num_of_reads, num_of_writes, io_stall_read_ms, io_stall_write_ms
 INTO #io1 FROM sys.dm_io_virtual_file_stats(NULL, NULL);
@@ -2799,6 +4998,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_pending_io ORDER BY io_pending_ms_ticks DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY pio.io_pending_ms_ticks DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_pending_io;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_pending_io',
     @definition = N'ALTER VIEW dbo.HC_pending_io
 AS
 -- Toolkit 08_storage_io_files.sql section 8.3: PENDING I/O REQUESTS RIGHT NOW
@@ -2812,6 +5014,9 @@ JOIN sys.master_files AS mf ON mf.database_id = vfs.database_id AND mf.file_id =
 AS
 -- Toolkit 08_storage_io_files.sql section 8.3: PENDING I/O REQUESTS RIGHT NOW
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(vfs.database_id) AS database_name, mf.physical_name,
        pio.io_type, pio.io_pending, pio.io_pending_ms_ticks
 FROM sys.dm_io_pending_io_requests AS pio
@@ -2828,6 +5033,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_volume_space ORDER BY free_pct;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY free_pct',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_volume_space;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_volume_space',
     @definition = N'ALTER VIEW dbo.HC_volume_space
 AS
 -- Toolkit 08_storage_io_files.sql section 8.4: DRIVE / VOLUME FREE SPACE
@@ -2843,6 +5051,9 @@ CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs;
 AS
 -- Toolkit 08_storage_io_files.sql section 8.4: DRIVE / VOLUME FREE SPACE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DISTINCT
     vs.volume_mount_point, vs.logical_volume_name, vs.file_system_type,
     vs.total_bytes / 1073741824     AS total_gb,
@@ -2861,16 +5072,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_file_space @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_file_space @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, name AS logical_name, type_desc, physical_name,
+       CAST(size / 128.0 AS decimal(18,2))                                         AS size_mb,
+       CAST(FILEPROPERTY(name, ''SpaceUsed'') / 128.0 AS decimal(18,2))              AS used_mb,
+       CAST((size - FILEPROPERTY(name, ''SpaceUsed'')) / 128.0 AS decimal(18,2))     AS free_mb,
+       CAST(100.0 * (size - FILEPROPERTY(name, ''SpaceUsed'')) / NULLIF(size, 0) AS decimal(5,2)) AS free_pct,
+       CASE WHEN is_percent_growth = 1 THEN CAST(growth AS varchar(10)) + ''%''
+            ELSE CAST(growth / 128 AS varchar(10)) + '' MB'' END                    AS growth,
+       CASE max_size WHEN -1 THEN ''Unlimited'' WHEN 0 THEN ''No growth''
+            ELSE CAST(CAST(max_size AS bigint) / 128 AS varchar(20)) + '' MB'' END   AS max_size
+FROM sys.database_files',
     @definition = N'ALTER PROCEDURE dbo.HC_file_space
     @database_name sysname = NULL
 AS
 -- Toolkit 08_storage_io_files.sql section 8.5: FILE SIZE & FREE SPACE - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT name AS logical_name, type_desc, physical_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT name AS logical_name, type_desc, physical_name,
        CAST(size / 128.0 AS decimal(18,2))                                         AS size_mb,
        CAST(FILEPROPERTY(name, ''''SpaceUsed'''') / 128.0 AS decimal(18,2))              AS used_mb,
        CAST((size - FILEPROPERTY(name, ''''SpaceUsed'''')) / 128.0 AS decimal(18,2))     AS free_mb,
@@ -2880,7 +5103,63 @@ DECLARE @hc_sql nvarchar(max) = N''SELECT name AS logical_name, type_desc, physi
        CASE max_size WHEN -1 THEN ''''Unlimited'''' WHEN 0 THEN ''''No growth''''
             ELSE CAST(CAST(max_size AS bigint) / 128 AS varchar(20)) + '''' MB'''' END   AS max_size
 FROM sys.database_files;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, name AS logical_name, type_desc, physical_name,
+       CAST(size / 128.0 AS decimal(18,2))                                         AS size_mb,
+       CAST(FILEPROPERTY(name, ''''SpaceUsed'''') / 128.0 AS decimal(18,2))              AS used_mb,
+       CAST((size - FILEPROPERTY(name, ''''SpaceUsed'''')) / 128.0 AS decimal(18,2))     AS free_mb,
+       CAST(100.0 * (size - FILEPROPERTY(name, ''''SpaceUsed'''')) / NULLIF(size, 0) AS decimal(5,2)) AS free_pct,
+       CASE WHEN is_percent_growth = 1 THEN CAST(growth AS varchar(10)) + ''''%''''
+            ELSE CAST(growth / 128 AS varchar(10)) + '''' MB'''' END                    AS growth,
+       CASE max_size WHEN -1 THEN ''''Unlimited'''' WHEN 0 THEN ''''No growth''''
+            ELSE CAST(CAST(max_size AS bigint) / 128 AS varchar(20)) + '''' MB'''' END   AS max_size
+FROM sys.database_files'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -2892,10 +5171,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_file_space_all_dbs;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_file_space_all_dbs;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_file_space_all_dbs
 AS
 -- Toolkit 08_storage_io_files.sql section 8.6: FILE SIZE & FREE SPACE - ALL ONLINE DATABASES
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#files'') IS NOT NULL DROP TABLE #files;
 CREATE TABLE #files (database_name sysname, logical_name sysname, type_desc nvarchar(60),
                      size_mb decimal(18,2), used_mb decimal(18,2), physical_name nvarchar(260));
@@ -2921,10 +5206,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_log_space;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_log_space;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_log_space
 AS
 -- Toolkit 08_storage_io_files.sql section 8.7: LOG SPACE - ALL DATABASES + WHY LOG CAN''T TRUNCATE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DBCC SQLPERF(LOGSPACE);
 
 SELECT name, recovery_model_desc, log_reuse_wait_desc
@@ -2942,6 +5233,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_log_stats ORDER BY total_log_size_mb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ls.total_log_size_mb DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_log_stats;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_log_stats',
     @definition = N'ALTER VIEW dbo.HC_log_stats
 AS
 -- Toolkit 08_storage_io_files.sql section 8.8: LOG STATS PER DATABASE (2016 SP2+)
@@ -2958,6 +5252,9 @@ WHERE d.state_desc = N''ONLINE'';
 AS
 -- Toolkit 08_storage_io_files.sql section 8.8: LOG STATS PER DATABASE (2016 SP2+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name, d.recovery_model_desc,
        ls.total_log_size_mb, ls.active_log_size_mb,
        ls.log_since_last_log_backup_mb, ls.log_backup_time,
@@ -2977,6 +5274,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_vlf_counts ORDER BY vlf_count DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY vlf_count DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_vlf_counts;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_vlf_counts',
     @definition = N'ALTER VIEW dbo.HC_vlf_counts
 AS
 -- Toolkit 08_storage_io_files.sql section 8.9: VLF COUNT PER DATABASE (2016 SP2+)
@@ -2992,6 +5292,9 @@ GROUP BY d.name;
 AS
 -- Toolkit 08_storage_io_files.sql section 8.9: VLF COUNT PER DATABASE (2016 SP2+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name AS database_name, COUNT(li.database_id) AS vlf_count,
        SUM(CASE WHEN li.vlf_active = 1 THEN 1 ELSE 0 END) AS active_vlfs,
        CAST(SUM(li.vlf_size_mb) AS decimal(18,2)) AS log_size_mb
@@ -3007,13 +5310,32 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_autogrowth_settings', @section = N'8.10', @source_file = N'08_storage_io_files.sql',
     @title = N'AUTOGROWTH SETTINGS - FLAG % GROWTH & TINY INCREMENTS', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_autogrowth_settings;',
+    @usage = N'SELECT * FROM dbo.HC_autogrowth_settings ORDER BY finding DESC, database_name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_autogrowth_settings
+    @sort_hint = N'ORDER BY finding DESC, database_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_autogrowth_settings;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_autogrowth_settings',
+    @definition = N'ALTER VIEW dbo.HC_autogrowth_settings
+AS
+-- Toolkit 08_storage_io_files.sql section 8.10: AUTOGROWTH SETTINGS - FLAG % GROWTH & TINY INCREMENTS
+SELECT DB_NAME(database_id) AS database_name, name AS logical_name, type_desc,
+       CAST(CAST(size AS bigint) * 8 / 1024 AS bigint) AS size_mb,
+       CASE WHEN is_percent_growth = 1 THEN CAST(growth AS varchar(10)) + '' %''
+            ELSE CAST(growth * 8 / 1024 AS varchar(10)) + '' MB'' END AS growth_setting,
+       CASE WHEN is_percent_growth = 1 THEN ''WARN: percent growth''
+            WHEN growth * 8 / 1024 < 64 AND growth <> 0 THEN ''WARN: growth < 64 MB''
+            WHEN growth = 0 THEN ''WARN: autogrowth disabled''
+            ELSE ''OK'' END AS finding
+FROM sys.master_files;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_autogrowth_settings
 AS
 -- Toolkit 08_storage_io_files.sql section 8.10: AUTOGROWTH SETTINGS - FLAG % GROWTH & TINY INCREMENTS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, name AS logical_name, type_desc,
        CAST(CAST(size AS bigint) * 8 / 1024 AS bigint) AS size_mb,
        CASE WHEN is_percent_growth = 1 THEN CAST(growth AS varchar(10)) + '' %''
@@ -3024,8 +5346,7 @@ SELECT DB_NAME(database_id) AS database_name, name AS logical_name, type_desc,
             ELSE ''OK'' END AS finding
 FROM sys.master_files
 ORDER BY finding DESC, database_name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 8.11  RECENT AUTOGROWTH / SHRINK EVENTS (default trace)   (08_storage_io_files.sql) */
@@ -3035,10 +5356,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_autogrowth_events;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_autogrowth_events;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_autogrowth_events
 AS
 -- Toolkit 08_storage_io_files.sql section 8.11: RECENT AUTOGROWTH / SHRINK EVENTS (default trace)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @trc nvarchar(260);
 SELECT @trc = REVERSE(SUBSTRING(REVERSE(path), CHARINDEX(N''\'', REVERSE(path)), 260)) + N''log.trc''
 FROM sys.traces WHERE is_default = 1;
@@ -3062,16 +5389,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_largest_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_largest_tables @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT TOP (50) DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(ps.object_id) + N''.'' + OBJECT_NAME(ps.object_id) AS table_name,
+    SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END)          AS row_count,
+    CAST(SUM(ps.reserved_page_count) * 8 / 1024.0 AS decimal(18,2))      AS reserved_mb,
+    CAST(SUM(CASE WHEN ps.index_id < 2 THEN ps.used_page_count ELSE 0 END) * 8 / 1024.0 AS decimal(18,2)) AS data_mb,
+    CAST(SUM(CASE WHEN ps.index_id > 1 THEN ps.used_page_count ELSE 0 END) * 8 / 1024.0 AS decimal(18,2)) AS index_mb
+FROM sys.dm_db_partition_stats AS ps
+WHERE OBJECTPROPERTY(ps.object_id, ''IsMSShipped'') = 0
+GROUP BY ps.object_id
+ORDER BY reserved_mb DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_largest_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 08_storage_io_files.sql section 8.12: LARGEST TABLES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (50)
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (50)
     OBJECT_SCHEMA_NAME(ps.object_id) + N''''.'''' + OBJECT_NAME(ps.object_id) AS table_name,
     SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END)          AS row_count,
     CAST(SUM(ps.reserved_page_count) * 8 / 1024.0 AS decimal(18,2))      AS reserved_mb,
@@ -3081,7 +5420,63 @@ FROM sys.dm_db_partition_stats AS ps
 WHERE OBJECTPROPERTY(ps.object_id, ''''IsMSShipped'''') = 0
 GROUP BY ps.object_id
 ORDER BY reserved_mb DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (50) DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(ps.object_id) + N''''.'''' + OBJECT_NAME(ps.object_id) AS table_name,
+    SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END)          AS row_count,
+    CAST(SUM(ps.reserved_page_count) * 8 / 1024.0 AS decimal(18,2))      AS reserved_mb,
+    CAST(SUM(CASE WHEN ps.index_id < 2 THEN ps.used_page_count ELSE 0 END) * 8 / 1024.0 AS decimal(18,2)) AS data_mb,
+    CAST(SUM(CASE WHEN ps.index_id > 1 THEN ps.used_page_count ELSE 0 END) * 8 / 1024.0 AS decimal(18,2)) AS index_mb
+FROM sys.dm_db_partition_stats AS ps
+WHERE OBJECTPROPERTY(ps.object_id, ''''IsMSShipped'''') = 0
+GROUP BY ps.object_id
+ORDER BY reserved_mb DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -3093,10 +5488,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tempdb_files;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_tempdb_files;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT name, type_desc, physical_name,
+       CAST(CAST(size AS bigint) * 8 / 1024 AS bigint) AS size_mb,
+       CASE WHEN is_percent_growth = 1 THEN CAST(growth AS varchar(10)) + '' %''
+            ELSE CAST(growth * 8 / 1024 AS varchar(10)) + '' MB'' END AS growth
+FROM sys.master_files
+WHERE database_id = 2
+ORDER BY type_desc DESC, file_id
+--#HC_NEXT_RESULT#
+SELECT (SELECT COUNT(*) FROM sys.master_files WHERE database_id = 2 AND type = 0) AS tempdb_data_files,
+       (SELECT cpu_count FROM sys.dm_os_sys_info)                                AS logical_cpus,
+       (SELECT COUNT(DISTINCT size) FROM sys.master_files WHERE database_id = 2 AND type = 0) AS distinct_sizes',
     @definition = N'ALTER PROCEDURE dbo.HC_tempdb_files
 AS
 -- Toolkit 09_tempdb.sql section 9.1: TEMPDB FILE LAYOUT (equal sizes? equal growth? # files vs cores)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, type_desc, physical_name,
        CAST(CAST(size AS bigint) * 8 / 1024 AS bigint) AS size_mb,
        CASE WHEN is_percent_growth = 1 THEN CAST(growth AS varchar(10)) + '' %''
@@ -3119,6 +5530,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_space;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tempdb_space;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tempdb_space',
     @definition = N'ALTER VIEW dbo.HC_tempdb_space
 AS
 -- Toolkit 09_tempdb.sql section 9.2: TEMPDB SPACE BY CATEGORY
@@ -3135,6 +5549,9 @@ FROM tempdb.sys.dm_db_file_space_usage;
 AS
 -- Toolkit 09_tempdb.sql section 9.2: TEMPDB SPACE BY CATEGORY
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     SUM(total_page_count)                 * 8 / 1024 AS total_mb,
     SUM(unallocated_extent_page_count)    * 8 / 1024 AS free_mb,
@@ -3153,6 +5570,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_by_session;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tempdb_by_session;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tempdb_by_session',
     @definition = N'ALTER VIEW dbo.HC_tempdb_by_session
 AS
 -- Toolkit 09_tempdb.sql section 9.3: TEMPDB USAGE BY SESSION (allocated incl. running tasks)
@@ -3179,6 +5599,9 @@ ORDER BY user_obj_mb + internal_obj_mb DESC;
 AS
 -- Toolkit 09_tempdb.sql section 9.3: TEMPDB USAGE BY SESSION (allocated incl. running tasks)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH task AS (
     SELECT session_id,
            SUM(user_objects_alloc_page_count - user_objects_dealloc_page_count)         AS task_user_pages,
@@ -3207,6 +5630,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_version_store ORDER BY version_store_mb DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY reserved_page_count DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_version_store;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_version_store',
     @definition = N'ALTER VIEW dbo.HC_version_store
 AS
 -- Toolkit 09_tempdb.sql section 9.4: VERSION STORE BY DATABASE (2016 SP2+ / 2017+)
@@ -3219,6 +5645,9 @@ FROM sys.dm_tran_version_store_space_usage;
 AS
 -- Toolkit 09_tempdb.sql section 9.4: VERSION STORE BY DATABASE (2016 SP2+ / 2017+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name,
        reserved_page_count * 8 / 1024 AS version_store_mb,
        reserved_space_kb / 1024       AS reserved_mb
@@ -3234,6 +5663,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_snapshot_transactions ORDER BY elapsed_time_seconds DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_snapshot_transactions;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_snapshot_transactions',
     @definition = N'ALTER VIEW dbo.HC_snapshot_transactions
 AS
 -- Toolkit 09_tempdb.sql section 9.5: LONG-RUNNING SNAPSHOT TRANSACTIONS (hold version store)
@@ -3248,6 +5680,9 @@ ORDER BY ast.elapsed_time_seconds DESC;
 AS
 -- Toolkit 09_tempdb.sql section 9.5: LONG-RUNNING SNAPSHOT TRANSACTIONS (hold version store)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (20) ast.session_id, ast.transaction_id, ast.elapsed_time_seconds,
        ast.is_snapshot, s.login_name, s.host_name, s.program_name, ib.event_info AS last_sql
 FROM sys.dm_tran_active_snapshot_database_transactions AS ast
@@ -3264,6 +5699,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_contention;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tempdb_contention;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tempdb_contention',
     @definition = N'ALTER VIEW dbo.HC_tempdb_contention
 AS
 -- Toolkit 09_tempdb.sql section 9.6: TEMPDB ALLOCATION CONTENTION (PAGELATCH on db 2)
@@ -3276,6 +5714,9 @@ WHERE wait_type LIKE N''PAGELATCH%''
 AS
 -- Toolkit 09_tempdb.sql section 9.6: TEMPDB ALLOCATION CONTENTION (PAGELATCH on db 2)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT session_id, wait_type, wait_duration_ms, resource_description
 FROM sys.dm_os_waiting_tasks
 WHERE wait_type LIKE N''PAGELATCH%''
@@ -3290,6 +5731,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tempdb_metadata;',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tempdb_metadata;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tempdb_metadata',
     @definition = N'ALTER VIEW dbo.HC_tempdb_metadata
 AS
 -- Toolkit 09_tempdb.sql section 9.7: MEMORY-OPTIMIZED TEMPDB METADATA (2019+)
@@ -3299,6 +5743,9 @@ SELECT SERVERPROPERTY(''IsTempdbMetadataMemoryOptimized'') AS is_tempdb_metadata
 AS
 -- Toolkit 09_tempdb.sql section 9.7: MEMORY-OPTIMIZED TEMPDB METADATA (2019+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT SERVERPROPERTY(''IsTempdbMetadataMemoryOptimized'') AS is_tempdb_metadata_memory_optimized;
 ';
 GO
@@ -3307,13 +5754,47 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_last_backup', @section = N'10.1', @source_file = N'10_backup_restore.sql',
     @title = N'LAST BACKUP PER DATABASE + RPO FLAGS', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_last_backup;',
+    @usage = N'SELECT * FROM dbo.HC_last_backup ORDER BY finding, name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_last_backup
+    @sort_hint = N'ORDER BY finding, d.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_last_backup;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_last_backup',
+    @definition = N'ALTER VIEW dbo.HC_last_backup
+AS
+-- Toolkit 10_backup_restore.sql section 10.1: LAST BACKUP PER DATABASE + RPO FLAGS
+WITH last_bk AS (
+    SELECT database_name,
+           MAX(CASE WHEN type = ''D'' THEN backup_finish_date END) AS last_full,
+           MAX(CASE WHEN type = ''I'' THEN backup_finish_date END) AS last_diff,
+           MAX(CASE WHEN type = ''L'' THEN backup_finish_date END) AS last_log
+    FROM msdb.dbo.backupset
+    WHERE is_copy_only = 0
+    GROUP BY database_name
+)
+SELECT d.name, d.recovery_model_desc, d.state_desc,
+       b.last_full, b.last_diff, b.last_log,
+       DATEDIFF(HOUR,   b.last_full, GETDATE()) AS hours_since_full,
+       DATEDIFF(MINUTE, b.last_log,  GETDATE()) AS minutes_since_log,
+       CASE
+           WHEN b.last_full IS NULL                                          THEN ''CRITICAL: never had a full backup''
+           WHEN DATEDIFF(DAY, b.last_full, GETDATE()) > 7
+            AND (b.last_diff IS NULL OR DATEDIFF(DAY, b.last_diff, GETDATE()) > 1) THEN ''WARN: full > 7 days and no recent diff''
+           WHEN d.recovery_model_desc <> ''SIMPLE'' AND b.last_log IS NULL      THEN ''CRITICAL: FULL recovery but no log backup''
+           WHEN d.recovery_model_desc <> ''SIMPLE''
+            AND DATEDIFF(MINUTE, b.last_log, GETDATE()) > 60                  THEN ''WARN: log backup > 60 min old''
+           ELSE ''OK'' END AS finding
+FROM sys.databases AS d
+LEFT JOIN last_bk  AS b ON b.database_name = d.name
+WHERE d.database_id <> 2;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_last_backup
 AS
 -- Toolkit 10_backup_restore.sql section 10.1: LAST BACKUP PER DATABASE + RPO FLAGS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH last_bk AS (
     SELECT database_name,
            MAX(CASE WHEN type = ''D'' THEN backup_finish_date END) AS last_full,
@@ -3339,22 +5820,54 @@ FROM sys.databases AS d
 LEFT JOIN last_bk  AS b ON b.database_name = d.name
 WHERE d.database_id <> 2
 ORDER BY finding, d.name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 10.2  BACKUP HISTORY - LAST N DAYS (size, speed, location)   (10_backup_restore.sql) */
 EXEC dbo.HC_usp_deploy
     @name = N'HC_backup_history', @section = N'10.2', @source_file = N'10_backup_restore.sql',
     @title = N'BACKUP HISTORY - LAST N DAYS (size, speed, location)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_backup_history @days = 7;',
+    @usage = N'SELECT * FROM dbo.HC_backup_history(DEFAULT) ORDER BY backup_start_date DESC;  -- @days = 7',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_backup_history
+    @sort_hint = N'ORDER BY bs.backup_start_date DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_backup_history(DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_backup_history(DEFAULT)',
+    @definition = N'ALTER FUNCTION dbo.HC_backup_history
+(
+    @days int = 7
+)
+RETURNS TABLE
+AS
+-- Toolkit 10_backup_restore.sql section 10.2: BACKUP HISTORY - LAST N DAYS (size, speed, location)
+RETURN
+(
+SELECT
+    bs.database_name,
+    CASE bs.type WHEN ''D'' THEN ''FULL'' WHEN ''I'' THEN ''DIFF'' WHEN ''L'' THEN ''LOG''
+                 WHEN ''F'' THEN ''FILE'' WHEN ''G'' THEN ''DIFF FILE'' ELSE bs.type END AS backup_type,
+    bs.backup_start_date, bs.backup_finish_date,
+    DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date)            AS duration_s,
+    CAST(bs.backup_size / 1048576.0 AS decimal(18,2))                         AS size_mb,
+    CAST(bs.compressed_backup_size / 1048576.0 AS decimal(18,2))              AS compressed_mb,
+    CAST(bs.backup_size / 1048576.0
+         / NULLIF(DATEDIFF(SECOND, bs.backup_start_date, bs.backup_finish_date), 0) AS decimal(18,2)) AS mb_per_sec,
+    bs.is_copy_only, bs.has_backup_checksums, bs.is_damaged,
+    bs.encryptor_type, bs.key_algorithm,
+    bs.server_name, bs.user_name, bmf.physical_device_name
+FROM msdb.dbo.backupset AS bs
+JOIN msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
+WHERE bs.backup_start_date >= DATEADD(DAY, -@days, GETDATE())
+);
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_backup_history
     @days int = 7
 AS
 -- Toolkit 10_backup_restore.sql section 10.2: BACKUP HISTORY - LAST N DAYS (size, speed, location)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     bs.database_name,
     CASE bs.type WHEN ''D'' THEN ''FULL'' WHEN ''I'' THEN ''DIFF'' WHEN ''L'' THEN ''LOG''
@@ -3372,8 +5885,7 @@ FROM msdb.dbo.backupset AS bs
 JOIN msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
 WHERE bs.backup_start_date >= DATEADD(DAY, -@days, GETDATE())
 ORDER BY bs.backup_start_date DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 10.3  BACKUP / RESTORE / DBCC PROGRESS (live)   (10_backup_restore.sql) */
@@ -3383,6 +5895,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_backup_restore_progress;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_backup_restore_progress;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_backup_restore_progress',
     @definition = N'ALTER VIEW dbo.HC_backup_restore_progress
 AS
 -- Toolkit 10_backup_restore.sql section 10.3: BACKUP / RESTORE / DBCC PROGRESS (live)
@@ -3401,6 +5916,9 @@ WHERE r.command LIKE N''BACKUP%'' OR r.command LIKE N''RESTORE%'' OR r.command L
 AS
 -- Toolkit 10_backup_restore.sql section 10.3: BACKUP / RESTORE / DBCC PROGRESS (live)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT r.session_id, r.command, DB_NAME(r.database_id) AS database_name,
        r.percent_complete,
        DATEADD(MILLISECOND, r.estimated_completion_time, SYSDATETIME()) AS est_finish_time,
@@ -3418,13 +5936,15 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_restore_history', @section = N'10.4', @source_file = N'10_backup_restore.sql',
     @title = N'RESTORE HISTORY', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_restore_history;',
+    @usage = N'SELECT * FROM dbo.HC_restore_history ORDER BY restore_date DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_restore_history
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_restore_history;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_restore_history',
+    @definition = N'ALTER VIEW dbo.HC_restore_history
 AS
 -- Toolkit 10_backup_restore.sql section 10.4: RESTORE HISTORY
-SET NOCOUNT ON;
 SELECT TOP (100)
     rh.destination_database_name, rh.restore_date,
     CASE rh.restore_type WHEN ''D'' THEN ''FULL'' WHEN ''I'' THEN ''DIFF'' WHEN ''L'' THEN ''LOG'' ELSE rh.restore_type END AS restore_type,
@@ -3436,7 +5956,24 @@ JOIN msdb.dbo.backupset       AS bs  ON bs.backup_set_id = rh.backup_set_id
 JOIN msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
 ORDER BY rh.restore_date DESC;
 ',
-    @fallback_definition = NULL;
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_restore_history
+AS
+-- Toolkit 10_backup_restore.sql section 10.4: RESTORE HISTORY
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+SELECT TOP (100)
+    rh.destination_database_name, rh.restore_date,
+    CASE rh.restore_type WHEN ''D'' THEN ''FULL'' WHEN ''I'' THEN ''DIFF'' WHEN ''L'' THEN ''LOG'' ELSE rh.restore_type END AS restore_type,
+    rh.user_name, rh.replace, rh.recovery,
+    bs.database_name AS source_database, bs.server_name AS source_server,
+    bs.backup_finish_date AS backup_taken, bmf.physical_device_name
+FROM msdb.dbo.restorehistory AS rh
+JOIN msdb.dbo.backupset       AS bs  ON bs.backup_set_id = rh.backup_set_id
+JOIN msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
+ORDER BY rh.restore_date DESC;
+';
 GO
 
 /* 10.5  GENERATE RESTORE SCRIPT (latest FULL + DIFF + LOG chain)   (10_backup_restore.sql) */
@@ -3446,11 +5983,17 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_generate_restore_script @database = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_generate_restore_script;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_generate_restore_script
     @database sysname = N''YourDB''
 AS
 -- Toolkit 10_backup_restore.sql section 10.5: GENERATE RESTORE SCRIPT (latest FULL + DIFF + LOG chain)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @full_id int, @full_lsn numeric(25,0), @base_last_lsn numeric(25,0), @diff_id int;
 
 SELECT TOP (1) @full_id = backup_set_id, @full_lsn = checkpoint_lsn, @base_last_lsn = last_lsn
@@ -3495,6 +6038,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_backup_size_trend ORDER BY database_name, month_start;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY database_name, month_start',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_backup_size_trend;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_backup_size_trend',
     @definition = N'ALTER VIEW dbo.HC_backup_size_trend
 AS
 -- Toolkit 10_backup_restore.sql section 10.6: BACKUP SIZE TREND (monthly FULL size per DB)
@@ -3510,6 +6056,9 @@ GROUP BY database_name, DATEFROMPARTS(YEAR(backup_start_date), MONTH(backup_star
 AS
 -- Toolkit 10_backup_restore.sql section 10.6: BACKUP SIZE TREND (monthly FULL size per DB)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT database_name,
        DATEFROMPARTS(YEAR(backup_start_date), MONTH(backup_start_date), 1) AS month_start,
        CAST(AVG(backup_size) / 1073741824.0 AS decimal(18,2))            AS avg_full_gb,
@@ -3528,6 +6077,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_backup_url_credentials;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_backup_url_credentials;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_backup_url_credentials',
     @definition = N'ALTER VIEW dbo.HC_backup_url_credentials
 AS
 -- Toolkit 10_backup_restore.sql section 10.7: BACKUP TO URL CREDENTIALS (Azure blob)
@@ -3537,6 +6089,9 @@ SELECT name, credential_identity, create_date, modify_date FROM sys.credentials;
 AS
 -- Toolkit 10_backup_restore.sql section 10.7: BACKUP TO URL CREDENTIALS (Azure blob)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, credential_identity, create_date, modify_date FROM sys.credentials;
 ';
 GO
@@ -3548,6 +6103,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_dashboard;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_dashboard;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_dashboard',
     @definition = N'ALTER VIEW dbo.HC_ag_dashboard
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.1: AG DASHBOARD - ONE ROW PER AG
@@ -3564,6 +6122,9 @@ JOIN sys.dm_hadr_availability_group_states AS ags ON ags.group_id = ag.group_id;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.1: AG DASHBOARD - ONE ROW PER AG
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, ags.primary_replica, ags.primary_recovery_health_desc,
        ags.synchronization_health_desc,
        ag.automated_backup_preference_desc,
@@ -3582,6 +6143,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_replicas ORDER BY ag_name, role_desc, replica_server_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, ars.role_desc, ar.replica_server_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_replicas;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_replicas',
     @definition = N'ALTER VIEW dbo.HC_ag_replicas
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.2: REPLICA STATE & CONFIGURATION
@@ -3601,6 +6165,9 @@ LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.2: REPLICA STATE & CONFIGURATION
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, ar.replica_server_name,
        ars.role_desc, ars.operational_state_desc, ars.connected_state_desc,
        ars.synchronization_health_desc, ars.recovery_health_desc,
@@ -3623,6 +6190,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_db_sync ORDER BY ag_name, database_name, is_primary_replica DESC, replica_server_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, database_name, drs.is_primary_replica DESC, ar.replica_server_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_db_sync;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_db_sync',
     @definition = N'ALTER VIEW dbo.HC_ag_db_sync
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.3: DATABASE SYNC STATE, LAG, RPO / RTO ESTIMATES
@@ -3650,6 +6220,9 @@ JOIN sys.availability_groups    AS ag ON ag.group_id = drs.group_id;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.3: DATABASE SYNC STATE, LAG, RPO / RTO ESTIMATES
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     ag.name AS ag_name, ar.replica_server_name,
     DB_NAME(drs.database_id) AS database_name,
@@ -3680,6 +6253,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_data_loss_window ORDER BY potential_data_loss_s DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY potential_data_loss_s DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_data_loss_window;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_data_loss_window',
     @definition = N'ALTER VIEW dbo.HC_ag_data_loss_window
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.4: DATA LOSS WINDOW: primary vs secondary last_commit_time
@@ -3699,6 +6275,9 @@ WHERE p.is_primary_replica = 1;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.4: DATA LOSS WINDOW: primary vs secondary last_commit_time
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, DB_NAME(s.database_id) AS database_name,
        ar.replica_server_name AS secondary_replica,
        p.last_commit_time AS primary_last_commit,
@@ -3721,6 +6300,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_failover_readiness ORDER BY ag_name, database_name, replica_server_name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, dcs.database_name, ar.replica_server_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_failover_readiness;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_failover_readiness',
     @definition = N'ALTER VIEW dbo.HC_ag_failover_readiness
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.5: FAILOVER READINESS (is_failover_ready must be 1 on sync targets)
@@ -3735,6 +6317,9 @@ JOIN sys.availability_groups   AS ag ON ag.group_id = ar.group_id;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.5: FAILOVER READINESS (is_failover_ready must be 1 on sync targets)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, ar.replica_server_name, dcs.database_name,
        dcs.is_failover_ready, dcs.is_pending_secondary_suspend, dcs.is_database_joined,
        dcs.recovery_lsn, dcs.truncation_lsn
@@ -3752,6 +6337,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_helper_functions;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_helper_functions;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_helper_functions',
     @definition = N'ALTER VIEW dbo.HC_ag_helper_functions
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.6: HELPER FUNCTIONS (per database)
@@ -3766,6 +6354,9 @@ WHERE d.replica_id IS NOT NULL;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.6: HELPER FUNCTIONS (per database)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name,
        sys.fn_hadr_is_primary_replica(d.name)          AS is_primary_here,
        sys.fn_hadr_backup_is_preferred_replica(d.name) AS is_preferred_backup_replica,
@@ -3782,6 +6373,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_dbs_not_in_ag ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_dbs_not_in_ag;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_dbs_not_in_ag',
     @definition = N'ALTER VIEW dbo.HC_dbs_not_in_ag
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.7: DATABASES NOT IN ANY AG (on an AG-enabled server)
@@ -3793,6 +6387,9 @@ WHERE database_id > 4 AND replica_id IS NULL;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.7: DATABASES NOT IN ANY AG (on an AG-enabled server)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, recovery_model_desc, state_desc
 FROM sys.databases
 WHERE database_id > 4 AND replica_id IS NULL
@@ -3807,6 +6404,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_listeners;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_listeners;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_listeners',
     @definition = N'ALTER VIEW dbo.HC_ag_listeners
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.8: LISTENERS (Azure VM: check ILB probe port / DNN)
@@ -3821,6 +6421,9 @@ LEFT JOIN sys.availability_group_listener_ip_addresses AS lip ON lip.listener_id
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.8: LISTENERS (Azure VM: check ILB probe port / DNN)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, agl.dns_name, agl.port, agl.is_conformant,
        agl.ip_configuration_string_from_cluster,
        lip.ip_address, lip.ip_subnet_mask, lip.state_desc, lip.network_subnet_ip
@@ -3837,6 +6440,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_readonly_routing ORDER BY ag_name, when_primary_is, routing_priority;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ag.name, src.replica_server_name, rl.routing_priority',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_readonly_routing;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_readonly_routing',
     @definition = N'ALTER VIEW dbo.HC_ag_readonly_routing
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.9: READ-ONLY ROUTING
@@ -3851,6 +6457,9 @@ JOIN sys.availability_groups   AS ag  ON ag.group_id = src.group_id;
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.9: READ-ONLY ROUTING
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, src.replica_server_name AS when_primary_is,
        rl.routing_priority, dst.replica_server_name AS route_reads_to, dst.read_only_routing_url
 FROM sys.availability_read_only_routing_lists AS rl
@@ -3868,10 +6477,25 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_hadr_endpoint;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_hadr_endpoint;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT e.name, e.state_desc, e.role_desc, e.connection_auth_desc,
+       e.encryption_algorithm_desc, t.port, SUSER_NAME(e.principal_id) AS endpoint_owner
+FROM sys.database_mirroring_endpoints AS e
+JOIN sys.tcp_endpoints AS t ON t.endpoint_id = e.endpoint_id
+--#HC_NEXT_RESULT#
+SELECT ep.name AS endpoint_name, SUSER_NAME(sp.grantee_principal_id) AS grantee,
+       sp.permission_name, sp.state_desc
+FROM sys.server_permissions AS sp
+JOIN sys.endpoints AS ep ON ep.endpoint_id = sp.major_id
+WHERE sp.class_desc = ''ENDPOINT''',
     @definition = N'ALTER PROCEDURE dbo.HC_hadr_endpoint
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.10: HADR ENDPOINT (state, port, encryption, connect permission)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT e.name, e.state_desc, e.role_desc, e.connection_auth_desc,
        e.encryption_algorithm_desc, t.port, SUSER_NAME(e.principal_id) AS endpoint_owner
 FROM sys.database_mirroring_endpoints AS e
@@ -3893,10 +6517,30 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_seeding;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ag_seeding;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT ag.name AS ag_name, adc.database_name,
+       s.start_time, s.completion_time, s.current_state, s.performed_seeding,
+       s.failure_state_desc, s.error_code, s.number_of_attempts
+FROM sys.dm_hadr_automatic_seeding AS s
+JOIN sys.availability_groups AS ag ON ag.group_id = s.ag_id
+LEFT JOIN sys.availability_databases_cluster AS adc ON adc.group_database_id = s.ag_db_id
+ORDER BY s.start_time DESC
+--#HC_NEXT_RESULT#
+SELECT local_database_name, remote_machine_name, role_desc, internal_state_desc,
+       transfer_rate_bytes_per_second / 1048576.0 AS transfer_mb_s,
+       transferred_size_bytes / 1048576 AS transferred_mb,
+       database_size_bytes / 1048576    AS database_mb,
+       CAST(100.0 * transferred_size_bytes / NULLIF(database_size_bytes, 0) AS decimal(5,2)) AS pct_done,
+       start_time_utc, estimate_time_complete_utc, failure_message
+FROM sys.dm_hadr_physical_seeding_stats',
     @definition = N'ALTER PROCEDURE dbo.HC_ag_seeding
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.11: AUTOMATIC SEEDING PROGRESS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, adc.database_name,
        s.start_time, s.completion_time, s.current_state, s.performed_seeding,
        s.failure_state_desc, s.error_code, s.number_of_attempts
@@ -3923,10 +6567,20 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_wsfc;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_wsfc;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT cluster_name, quorum_type_desc, quorum_state_desc FROM sys.dm_hadr_cluster
+--#HC_NEXT_RESULT#
+SELECT member_name, member_type_desc, member_state_desc, number_of_quorum_votes FROM sys.dm_hadr_cluster_members
+--#HC_NEXT_RESULT#
+SELECT member_name, network_subnet_ip, network_subnet_prefix_length, is_public, is_ipv4 FROM sys.dm_hadr_cluster_networks',
     @definition = N'ALTER PROCEDURE dbo.HC_wsfc
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.12: WSFC CLUSTER, NODES, NETWORKS, QUORUM
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT cluster_name, quorum_type_desc, quorum_state_desc FROM sys.dm_hadr_cluster;
 SELECT member_name, member_type_desc, member_state_desc, number_of_quorum_votes FROM sys.dm_hadr_cluster_members;
 SELECT member_name, network_subnet_ip, network_subnet_prefix_length, is_public, is_ipv4 FROM sys.dm_hadr_cluster_networks;
@@ -3941,10 +6595,30 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_waits;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ag_waits;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT wait_type, waiting_tasks_count, wait_time_ms,
+       CAST(wait_time_ms * 1.0 / NULLIF(waiting_tasks_count, 0) AS decimal(10,2)) AS avg_wait_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (N''HADR_SYNC_COMMIT'', N''HADR_GROUP_COMMIT'', N''HADR_LOGCAPTURE_SYNC'',
+                    N''HADR_DATABASE_FLOW_CONTROL'', N''HADR_TRANSPORT_FLOW_CONTROL'',
+                    N''HADR_SEND_QUEUE'', N''PARALLEL_REDO_FLOW_CONTROL'', N''WRITELOG'')
+ORDER BY wait_time_ms DESC
+--#HC_NEXT_RESULT#
+SELECT RTRIM(object_name) AS object_name, RTRIM(counter_name) AS counter_name,
+       RTRIM(instance_name) AS database_name, cntr_value
+FROM sys.dm_os_performance_counters
+WHERE object_name LIKE N''%Database Replica%''
+  AND counter_name IN (N''Redo blocked/sec'', N''Redone Bytes/sec'', N''Log Send Queue'',
+                       N''Recovery Queue'', N''Transaction Delay'', N''Mirrored Write Transactions/sec'')
+ORDER BY database_name, counter_name',
     @definition = N'ALTER PROCEDURE dbo.HC_ag_waits
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.13: AG-RELATED WAITS (commit latency on sync replicas)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT wait_type, waiting_tasks_count, wait_time_ms,
        CAST(wait_time_ms * 1.0 / NULLIF(waiting_tasks_count, 0) AS decimal(10,2)) AS avg_wait_ms
 FROM sys.dm_os_wait_stats
@@ -3971,10 +6645,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_failover_history;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ag_failover_history;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_ag_failover_history
 AS
 -- Toolkit 11_alwayson_ag.sql section 11.14: FAILOVER / ROLE CHANGE HISTORY (AlwaysOn_health XE)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @logdir nvarchar(260) = (
     SELECT LEFT(CAST(SERVERPROPERTY(''ErrorLogFileName'') AS nvarchar(260)),
                 LEN(CAST(SERVERPROPERTY(''ErrorLogFileName'') AS nvarchar(260)))
@@ -4005,6 +6685,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_lock_summary ORDER BY lock_count DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY lock_count DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_lock_summary;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_lock_summary',
     @definition = N'ALTER VIEW dbo.HC_lock_summary
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.1: LOCK SUMMARY BY SESSION
@@ -4018,6 +6701,9 @@ GROUP BY tl.request_session_id, tl.resource_database_id, tl.resource_type, tl.re
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.1: LOCK SUMMARY BY SESSION
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT tl.request_session_id AS session_id, DB_NAME(tl.resource_database_id) AS database_name,
        tl.resource_type, tl.request_mode, tl.request_status, COUNT(*) AS lock_count
 FROM sys.dm_tran_locks AS tl
@@ -4034,16 +6720,31 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_waiting_locks @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_waiting_locks @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, tl.request_session_id AS waiting_session, wt.blocking_session_id,
+       tl.resource_type, tl.request_mode, tl.resource_description,
+       wt.wait_duration_ms,
+       COALESCE(OBJECT_SCHEMA_NAME(p.object_id) + N''.'' + OBJECT_NAME(p.object_id),
+                OBJECT_SCHEMA_NAME(tl.resource_associated_entity_id) + N''.'' + OBJECT_NAME(tl.resource_associated_entity_id)) AS object_name,
+       i.name AS index_name
+FROM sys.dm_tran_locks AS tl
+JOIN sys.dm_os_waiting_tasks AS wt ON wt.resource_address = tl.lock_owner_address
+LEFT JOIN sys.partitions AS p
+       ON tl.resource_type IN (N''KEY'', N''PAGE'', N''RID'', N''HOBT'') AND p.hobt_id = tl.resource_associated_entity_id
+LEFT JOIN sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
+WHERE tl.request_status = N''WAIT''
+  AND tl.resource_database_id = DB_ID()',
     @definition = N'ALTER PROCEDURE dbo.HC_waiting_locks
     @database_name sysname = NULL
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.2: WAITING LOCKS WITH OBJECT NAMES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT tl.request_session_id AS waiting_session, wt.blocking_session_id,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT tl.request_session_id AS waiting_session, wt.blocking_session_id,
        tl.resource_type, tl.request_mode, tl.resource_description,
        wt.wait_duration_ms,
        COALESCE(OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id),
@@ -4056,7 +6757,66 @@ LEFT JOIN sys.partitions AS p
 LEFT JOIN sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
 WHERE tl.request_status = N''''WAIT''''
   AND tl.resource_database_id = DB_ID();'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, tl.request_session_id AS waiting_session, wt.blocking_session_id,
+       tl.resource_type, tl.request_mode, tl.resource_description,
+       wt.wait_duration_ms,
+       COALESCE(OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id),
+                OBJECT_SCHEMA_NAME(tl.resource_associated_entity_id) + N''''.'''' + OBJECT_NAME(tl.resource_associated_entity_id)) AS object_name,
+       i.name AS index_name
+FROM sys.dm_tran_locks AS tl
+JOIN sys.dm_os_waiting_tasks AS wt ON wt.resource_address = tl.lock_owner_address
+LEFT JOIN sys.partitions AS p
+       ON tl.resource_type IN (N''''KEY'''', N''''PAGE'''', N''''RID'''', N''''HOBT'''') AND p.hobt_id = tl.resource_associated_entity_id
+LEFT JOIN sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
+WHERE tl.request_status = N''''WAIT''''
+  AND tl.resource_database_id = DB_ID()'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -4068,17 +6828,30 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_session_locks @database_name = N''YourDB'', @spid = 55;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_session_locks @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @spid int = 55;
+SELECT DB_NAME() AS database_name, tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
+       CASE WHEN tl.resource_type = N''OBJECT'' THEN OBJECT_NAME(tl.resource_associated_entity_id)
+            ELSE OBJECT_NAME(p.object_id) END AS object_name,
+       COUNT(*) AS locks
+FROM sys.dm_tran_locks AS tl
+LEFT JOIN sys.partitions AS p ON p.hobt_id = tl.resource_associated_entity_id
+WHERE tl.request_session_id = @spid AND tl.resource_database_id = DB_ID()
+GROUP BY tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
+         tl.resource_associated_entity_id, p.object_id
+ORDER BY locks DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_session_locks
     @database_name sysname = NULL,
     @spid int = 55
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.3: ALL LOCKS HELD BY ONE SESSION - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
        CASE WHEN tl.resource_type = N''''OBJECT'''' THEN OBJECT_NAME(tl.resource_associated_entity_id)
             ELSE OBJECT_NAME(p.object_id) END AS object_name,
        COUNT(*) AS locks
@@ -4088,7 +6861,63 @@ WHERE tl.request_session_id = @spid AND tl.resource_database_id = DB_ID()
 GROUP BY tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
          tl.resource_associated_entity_id, p.object_id
 ORDER BY locks DESC;'';
-EXEC @hc_exec @hc_sql, N''@spid int'', @spid = @spid;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
+       CASE WHEN tl.resource_type = N''''OBJECT'''' THEN OBJECT_NAME(tl.resource_associated_entity_id)
+            ELSE OBJECT_NAME(p.object_id) END AS object_name,
+       COUNT(*) AS locks
+FROM sys.dm_tran_locks AS tl
+LEFT JOIN sys.partitions AS p ON p.hobt_id = tl.resource_associated_entity_id
+WHERE tl.request_session_id = @spid AND tl.resource_database_id = DB_ID()
+GROUP BY tl.resource_type, tl.request_mode, tl.request_status, tl.resource_description,
+         tl.resource_associated_entity_id, p.object_id
+ORDER BY locks DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@spid int'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @spid = @spid;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @spid = @spid;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -4100,16 +6929,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_lock_escalation @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_lock_escalation @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(os.object_id) + N''.'' + OBJECT_NAME(os.object_id) AS table_name,
+       i.name AS index_name, t.lock_escalation_desc,
+       os.index_lock_promotion_attempt_count, os.index_lock_promotion_count,
+       os.row_lock_wait_count, os.row_lock_wait_in_ms, os.page_lock_wait_count, os.page_lock_wait_in_ms
+FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
+JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
+JOIN sys.tables  AS t ON t.object_id = os.object_id
+WHERE os.index_lock_promotion_count > 0
+ORDER BY os.index_lock_promotion_count DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_lock_escalation
     @database_name sysname = NULL
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.4: LOCK ESCALATION HOTSPOTS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(os.object_id) + N''''.'''' + OBJECT_NAME(os.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(os.object_id) + N''''.'''' + OBJECT_NAME(os.object_id) AS table_name,
        i.name AS index_name, t.lock_escalation_desc,
        os.index_lock_promotion_attempt_count, os.index_lock_promotion_count,
        os.row_lock_wait_count, os.row_lock_wait_in_ms, os.page_lock_wait_count, os.page_lock_wait_in_ms
@@ -4118,7 +6958,62 @@ JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
 JOIN sys.tables  AS t ON t.object_id = os.object_id
 WHERE os.index_lock_promotion_count > 0
 ORDER BY os.index_lock_promotion_count DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(os.object_id) + N''''.'''' + OBJECT_NAME(os.object_id) AS table_name,
+       i.name AS index_name, t.lock_escalation_desc,
+       os.index_lock_promotion_attempt_count, os.index_lock_promotion_count,
+       os.row_lock_wait_count, os.row_lock_wait_in_ms, os.page_lock_wait_count, os.page_lock_wait_in_ms
+FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
+JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
+JOIN sys.tables  AS t ON t.object_id = os.object_id
+WHERE os.index_lock_promotion_count > 0
+ORDER BY os.index_lock_promotion_count DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -4130,10 +7025,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_deadlocks;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_deadlocks;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_deadlocks
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.5: DEADLOCKS FROM system_health (event_file)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     x.ev.value(''(event/@timestamp)[1]'', ''datetime2'')  AS deadlock_time_utc,
     x.ev.query(''(event/data/value/deadlock)[1]'')      AS deadlock_graph,
@@ -4153,10 +7054,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_deadlock_detail;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_deadlock_detail;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_deadlock_detail
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.6: DEADLOCK DETAIL - SHRED PROCESSES (who, what statement)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH dl AS (
     SELECT CAST(f.event_data AS xml) AS ev
     FROM sys.fn_xe_file_target_read_file(N''system_health*.xel'', NULL, NULL, NULL) AS f
@@ -4191,6 +7098,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_deadlock_count;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_deadlock_count;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_deadlock_count',
     @definition = N'ALTER VIEW dbo.HC_deadlock_count
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.7: DEADLOCK COUNTER SINCE RESTART
@@ -4202,6 +7112,9 @@ WHERE counter_name = N''Number of Deadlocks/sec'' AND cntr_value > 0;
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.7: DEADLOCK COUNTER SINCE RESTART
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT RTRIM(instance_name) AS lock_type, cntr_value AS deadlocks
 FROM sys.dm_os_performance_counters
 WHERE counter_name = N''Number of Deadlocks/sec'' AND cntr_value > 0;
@@ -4212,13 +7125,29 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_isolation_levels', @section = N'12.9', @source_file = N'12_locking_deadlocks.sql',
     @title = N'ISOLATION LEVEL OF ACTIVE SESSIONS', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_isolation_levels;',
+    @usage = N'SELECT * FROM dbo.HC_isolation_levels ORDER BY transaction_isolation_level DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_isolation_levels
+    @sort_hint = N'ORDER BY transaction_isolation_level DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_isolation_levels;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_isolation_levels',
+    @definition = N'ALTER VIEW dbo.HC_isolation_levels
+AS
+-- Toolkit 12_locking_deadlocks.sql section 12.9: ISOLATION LEVEL OF ACTIVE SESSIONS
+SELECT session_id, login_name, program_name,
+       CASE transaction_isolation_level
+           WHEN 0 THEN ''Unspecified'' WHEN 1 THEN ''ReadUncommitted'' WHEN 2 THEN ''ReadCommitted''
+           WHEN 3 THEN ''RepeatableRead'' WHEN 4 THEN ''Serializable'' WHEN 5 THEN ''Snapshot'' END AS isolation_level
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_isolation_levels
 AS
 -- Toolkit 12_locking_deadlocks.sql section 12.9: ISOLATION LEVEL OF ACTIVE SESSIONS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT session_id, login_name, program_name,
        CASE transaction_isolation_level
            WHEN 0 THEN ''Unspecified'' WHEN 1 THEN ''ReadUncommitted'' WHEN 2 THEN ''ReadCommitted''
@@ -4226,29 +7155,42 @@ SELECT session_id, login_name, program_name,
 FROM sys.dm_exec_sessions
 WHERE is_user_process = 1
 ORDER BY transaction_isolation_level DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 13.1  SERVER ROLE MEMBERS (who is sysadmin etc.)   (13_security.sql) */
 EXEC dbo.HC_usp_deploy
     @name = N'HC_server_role_members', @section = N'13.1', @source_file = N'13_security.sql',
     @title = N'SERVER ROLE MEMBERS (who is sysadmin etc.)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_server_role_members;',
+    @usage = N'SELECT * FROM dbo.HC_server_role_members;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_server_role_members
+    @sort_hint = N'ORDER BY CASE r.name WHEN N''sysadmin'' THEN 0 ELSE 1 END, r.name, m.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_server_role_members;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_server_role_members',
+    @definition = N'ALTER VIEW dbo.HC_server_role_members
+AS
+-- Toolkit 13_security.sql section 13.1: SERVER ROLE MEMBERS (who is sysadmin etc.)
+SELECT r.name AS server_role, m.name AS member_name, m.type_desc, m.is_disabled,
+       m.create_date, m.modify_date
+FROM sys.server_role_members AS rm
+JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
+JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_server_role_members
 AS
 -- Toolkit 13_security.sql section 13.1: SERVER ROLE MEMBERS (who is sysadmin etc.)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT r.name AS server_role, m.name AS member_name, m.type_desc, m.is_disabled,
        m.create_date, m.modify_date
 FROM sys.server_role_members AS rm
 JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
 JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
 ORDER BY CASE r.name WHEN N''sysadmin'' THEN 0 ELSE 1 END, r.name, m.name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 13.2  LOGINS - STATUS, POLICY, LAST PASSWORD CHANGE   (13_security.sql) */
@@ -4258,6 +7200,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_logins ORDER BY type_desc, name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sp.type_desc, sp.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_logins;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_logins',
     @definition = N'ALTER VIEW dbo.HC_logins
 AS
 -- Toolkit 13_security.sql section 13.2: LOGINS - STATUS, POLICY, LAST PASSWORD CHANGE
@@ -4277,6 +7222,9 @@ WHERE sp.type IN (''S'', ''U'', ''G'', ''E'', ''X'')
 AS
 -- Toolkit 13_security.sql section 13.2: LOGINS - STATUS, POLICY, LAST PASSWORD CHANGE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT sp.name, sp.type_desc, sp.is_disabled, sp.default_database_name,
        sl.is_policy_checked, sl.is_expiration_checked,
        LOGINPROPERTY(sp.name, ''PasswordLastSetTime'') AS password_last_set,
@@ -4296,13 +7244,15 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_weak_passwords', @section = N'13.3', @source_file = N'13_security.sql',
     @title = N'WEAK SQL LOGIN PASSWORDS (blank or = login name)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_weak_passwords;',
+    @usage = N'SELECT * FROM dbo.HC_weak_passwords;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_weak_passwords
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_weak_passwords;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_weak_passwords',
+    @definition = N'ALTER VIEW dbo.HC_weak_passwords
 AS
 -- Toolkit 13_security.sql section 13.3: WEAK SQL LOGIN PASSWORDS (blank or = login name)
-SET NOCOUNT ON;
 SELECT name,
        CASE WHEN PWDCOMPARE(N'''', password_hash) = 1 THEN ''BLANK PASSWORD''
             WHEN PWDCOMPARE(name, password_hash) = 1 THEN ''PASSWORD = LOGIN NAME'' END AS finding
@@ -4310,7 +7260,20 @@ FROM sys.sql_logins
 WHERE PWDCOMPARE(N'''', password_hash) = 1
    OR PWDCOMPARE(name, password_hash) = 1;
 ',
-    @fallback_definition = NULL;
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_weak_passwords
+AS
+-- Toolkit 13_security.sql section 13.3: WEAK SQL LOGIN PASSWORDS (blank or = login name)
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+SELECT name,
+       CASE WHEN PWDCOMPARE(N'''', password_hash) = 1 THEN ''BLANK PASSWORD''
+            WHEN PWDCOMPARE(name, password_hash) = 1 THEN ''PASSWORD = LOGIN NAME'' END AS finding
+FROM sys.sql_logins
+WHERE PWDCOMPARE(N'''', password_hash) = 1
+   OR PWDCOMPARE(name, password_hash) = 1;
+';
 GO
 
 /* 13.4  HIGH-RISK SERVER PERMISSIONS (CONTROL SERVER, IMPERSONATE...)   (13_security.sql) */
@@ -4320,6 +7283,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_risky_server_perms ORDER BY permission_name, grantee;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY sp.permission_name, grantee',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_risky_server_perms;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_risky_server_perms',
     @definition = N'ALTER VIEW dbo.HC_risky_server_perms
 AS
 -- Toolkit 13_security.sql section 13.4: HIGH-RISK SERVER PERMISSIONS (CONTROL SERVER, IMPERSONATE...)
@@ -4335,6 +7301,9 @@ WHERE sp.permission_name IN (N''CONTROL SERVER'', N''IMPERSONATE'', N''ALTER ANY
 AS
 -- Toolkit 13_security.sql section 13.4: HIGH-RISK SERVER PERMISSIONS (CONTROL SERVER, IMPERSONATE...)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT SUSER_NAME(sp.grantee_principal_id) AS grantee, sp.permission_name, sp.state_desc,
        sp.class_desc, SUSER_NAME(sp.grantor_principal_id) AS grantor
 FROM sys.server_permissions AS sp
@@ -4353,16 +7322,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_orphaned_users @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_orphaned_users @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, dp.name AS user_name, dp.type_desc, dp.sid,
+       N''ALTER USER '' + QUOTENAME(dp.name) + N'' WITH LOGIN = '' + QUOTENAME(dp.name) + N'';'' AS fix_if_login_exists
+FROM sys.database_principals AS dp
+LEFT JOIN sys.server_principals AS sp ON sp.sid = dp.sid
+WHERE sp.sid IS NULL
+  AND dp.type IN (''S'', ''U'', ''G'')
+  AND dp.authentication_type_desc IN (N''INSTANCE'', N''WINDOWS'')
+  AND dp.name NOT IN (N''dbo'', N''guest'', N''INFORMATION_SCHEMA'', N''sys'')
+  AND dp.principal_id > 4',
     @definition = N'ALTER PROCEDURE dbo.HC_orphaned_users
     @database_name sysname = NULL
 AS
 -- Toolkit 13_security.sql section 13.5: ORPHANED USERS - CURRENT DB (+ fix statement)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT dp.name AS user_name, dp.type_desc, dp.sid,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT dp.name AS user_name, dp.type_desc, dp.sid,
        N''''ALTER USER '''' + QUOTENAME(dp.name) + N'''' WITH LOGIN = '''' + QUOTENAME(dp.name) + N'''';'''' AS fix_if_login_exists
 FROM sys.database_principals AS dp
 LEFT JOIN sys.server_principals AS sp ON sp.sid = dp.sid
@@ -4371,7 +7351,62 @@ WHERE sp.sid IS NULL
   AND dp.authentication_type_desc IN (N''''INSTANCE'''', N''''WINDOWS'''')
   AND dp.name NOT IN (N''''dbo'''', N''''guest'''', N''''INFORMATION_SCHEMA'''', N''''sys'''')
   AND dp.principal_id > 4;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, dp.name AS user_name, dp.type_desc, dp.sid,
+       N''''ALTER USER '''' + QUOTENAME(dp.name) + N'''' WITH LOGIN = '''' + QUOTENAME(dp.name) + N'''';'''' AS fix_if_login_exists
+FROM sys.database_principals AS dp
+LEFT JOIN sys.server_principals AS sp ON sp.sid = dp.sid
+WHERE sp.sid IS NULL
+  AND dp.type IN (''''S'''', ''''U'''', ''''G'''')
+  AND dp.authentication_type_desc IN (N''''INSTANCE'''', N''''WINDOWS'''')
+  AND dp.name NOT IN (N''''dbo'''', N''''guest'''', N''''INFORMATION_SCHEMA'''', N''''sys'''')
+  AND dp.principal_id > 4'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -4383,21 +7418,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_db_role_members @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_db_role_members @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, r.name AS db_role, m.name AS member_name, m.type_desc, m.authentication_type_desc
+FROM sys.database_role_members AS drm
+JOIN sys.database_principals AS r ON r.principal_id = drm.role_principal_id
+JOIN sys.database_principals AS m ON m.principal_id = drm.member_principal_id
+ORDER BY CASE r.name WHEN N''db_owner'' THEN 0 ELSE 1 END, r.name, m.name',
     @definition = N'ALTER PROCEDURE dbo.HC_db_role_members
     @database_name sysname = NULL
 AS
 -- Toolkit 13_security.sql section 13.6: DATABASE ROLE MEMBERS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT r.name AS db_role, m.name AS member_name, m.type_desc, m.authentication_type_desc
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT r.name AS db_role, m.name AS member_name, m.type_desc, m.authentication_type_desc
 FROM sys.database_role_members AS drm
 JOIN sys.database_principals AS r ON r.principal_id = drm.role_principal_id
 JOIN sys.database_principals AS m ON m.principal_id = drm.member_principal_id
 ORDER BY CASE r.name WHEN N''''db_owner'''' THEN 0 ELSE 1 END, r.name, m.name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, r.name AS db_role, m.name AS member_name, m.type_desc, m.authentication_type_desc
+FROM sys.database_role_members AS drm
+JOIN sys.database_principals AS r ON r.principal_id = drm.role_principal_id
+JOIN sys.database_principals AS m ON m.principal_id = drm.member_principal_id
+ORDER BY CASE r.name WHEN N''''db_owner'''' THEN 0 ELSE 1 END, r.name, m.name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -4409,16 +7502,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_db_permissions @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_db_permissions @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, pr.name AS principal_name, pr.type_desc, pe.state_desc, pe.permission_name,
+       pe.class_desc,
+       CASE pe.class WHEN 0 THEN DB_NAME()
+                     WHEN 1 THEN OBJECT_SCHEMA_NAME(pe.major_id) + N''.'' + OBJECT_NAME(pe.major_id)
+                     WHEN 3 THEN SCHEMA_NAME(pe.major_id) END AS securable,
+       COL_NAME(pe.major_id, pe.minor_id) AS column_name
+FROM sys.database_permissions AS pe
+JOIN sys.database_principals  AS pr ON pr.principal_id = pe.grantee_principal_id
+WHERE pr.name NOT IN (N''public'', N''guest'') OR pe.permission_name <> N''CONNECT''
+ORDER BY principal_name, securable',
     @definition = N'ALTER PROCEDURE dbo.HC_db_permissions
     @database_name sysname = NULL
 AS
 -- Toolkit 13_security.sql section 13.7: EXPLICIT PERMISSIONS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT pr.name AS principal_name, pr.type_desc, pe.state_desc, pe.permission_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT pr.name AS principal_name, pr.type_desc, pe.state_desc, pe.permission_name,
        pe.class_desc,
        CASE pe.class WHEN 0 THEN DB_NAME()
                      WHEN 1 THEN OBJECT_SCHEMA_NAME(pe.major_id) + N''''.'''' + OBJECT_NAME(pe.major_id)
@@ -4428,7 +7533,63 @@ FROM sys.database_permissions AS pe
 JOIN sys.database_principals  AS pr ON pr.principal_id = pe.grantee_principal_id
 WHERE pr.name NOT IN (N''''public'''', N''''guest'''') OR pe.permission_name <> N''''CONNECT''''
 ORDER BY principal_name, securable;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, pr.name AS principal_name, pr.type_desc, pe.state_desc, pe.permission_name,
+       pe.class_desc,
+       CASE pe.class WHEN 0 THEN DB_NAME()
+                     WHEN 1 THEN OBJECT_SCHEMA_NAME(pe.major_id) + N''''.'''' + OBJECT_NAME(pe.major_id)
+                     WHEN 3 THEN SCHEMA_NAME(pe.major_id) END AS securable,
+       COL_NAME(pe.major_id, pe.minor_id) AS column_name
+FROM sys.database_permissions AS pe
+JOIN sys.database_principals  AS pr ON pr.principal_id = pe.grantee_principal_id
+WHERE pr.name NOT IN (N''''public'''', N''''guest'''') OR pe.permission_name <> N''''CONNECT''''
+ORDER BY principal_name, securable'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -4440,10 +7601,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_guest_enabled;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_guest_enabled;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_guest_enabled
 AS
 -- Toolkit 13_security.sql section 13.9: GUEST ENABLED IN USER DATABASES (should be off)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#guest'') IS NOT NULL DROP TABLE #guest;
 CREATE TABLE #guest (database_name sysname, guest_has_connect bit);
 DECLARE @sql nvarchar(max) = N'''';
@@ -4464,6 +7631,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_risky_db_settings ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_risky_db_settings;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_risky_db_settings',
     @definition = N'ALTER VIEW dbo.HC_risky_db_settings
 AS
 -- Toolkit 13_security.sql section 13.10: RISKY DATABASE SETTINGS (TRUSTWORTHY, odd owners, chaining)
@@ -4478,6 +7648,9 @@ WHERE (is_trustworthy_on = 1 AND name <> N''msdb'')
 AS
 -- Toolkit 13_security.sql section 13.10: RISKY DATABASE SETTINGS (TRUSTWORTHY, odd owners, chaining)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, SUSER_SNAME(owner_sid) AS owner_name, is_trustworthy_on, is_db_chaining_on,
        containment_desc
 FROM sys.databases
@@ -4495,10 +7668,30 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_tde_cert_expiry;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_tde_cert_expiry;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT DB_NAME(dek.database_id) AS database_name, dek.encryption_state,
+       CASE dek.encryption_state WHEN 0 THEN ''No key'' WHEN 1 THEN ''Unencrypted''
+            WHEN 2 THEN ''Encryption in progress'' WHEN 3 THEN ''Encrypted''
+            WHEN 4 THEN ''Key change in progress'' WHEN 5 THEN ''Decryption in progress''
+            WHEN 6 THEN ''Protection change in progress'' END AS state_desc,
+       dek.percent_complete, dek.key_algorithm, dek.key_length,
+       dek.encryptor_type, dek.encryptor_thumbprint
+FROM sys.dm_database_encryption_keys AS dek
+--#HC_NEXT_RESULT#
+SELECT name, subject, start_date, expiry_date, thumbprint, pvt_key_encryption_type_desc,
+       pvt_key_last_backup_date,
+       DATEDIFF(DAY, GETDATE(), expiry_date) AS days_to_expiry
+FROM master.sys.certificates
+WHERE name NOT LIKE N''##%''
+ORDER BY expiry_date',
     @definition = N'ALTER PROCEDURE dbo.HC_tde_cert_expiry
 AS
 -- Toolkit 13_security.sql section 13.11: TDE STATUS & CERTIFICATE EXPIRY
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(dek.database_id) AS database_name, dek.encryption_state,
        CASE dek.encryption_state WHEN 0 THEN ''No key'' WHEN 1 THEN ''Unencrypted''
             WHEN 2 THEN ''Encryption in progress'' WHEN 3 THEN ''Encrypted''
@@ -4525,6 +7718,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_unencrypted_connections;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_unencrypted_connections;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_unencrypted_connections',
     @definition = N'ALTER VIEW dbo.HC_unencrypted_connections
 AS
 -- Toolkit 13_security.sql section 13.12: UNENCRYPTED CONNECTIONS
@@ -4536,6 +7732,9 @@ GROUP BY c.encrypt_option, c.auth_scheme, c.net_transport;
 AS
 -- Toolkit 13_security.sql section 13.12: UNENCRYPTED CONNECTIONS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT c.encrypt_option, c.auth_scheme, c.net_transport, COUNT(*) AS connections
 FROM sys.dm_exec_connections AS c
 GROUP BY c.encrypt_option, c.auth_scheme, c.net_transport;
@@ -4549,11 +7748,17 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_failed_logins @log_number = 0;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_failed_logins;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_failed_logins
     @log_number int = 0
 AS
 -- Toolkit 13_security.sql section 13.13: FAILED LOGINS FROM ERROR LOG
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 EXEC sys.xp_readerrorlog @log_number, 1, N''Login failed'';
 ',
     @fallback_definition = NULL;
@@ -4566,10 +7771,22 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_audit_status;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_audit_status;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT a.name, a.type_desc, a.on_failure_desc, a.is_state_enabled, s.status_desc, s.audit_file_path
+FROM sys.server_audits AS a
+LEFT JOIN sys.dm_server_audit_status AS s ON s.audit_id = a.audit_id
+--#HC_NEXT_RESULT#
+SELECT sas.name AS server_audit_spec, sas.is_state_enabled, sasd.audit_action_name
+FROM sys.server_audit_specifications AS sas
+JOIN sys.server_audit_specification_details AS sasd ON sasd.server_specification_id = sas.server_specification_id',
     @definition = N'ALTER PROCEDURE dbo.HC_audit_status
 AS
 -- Toolkit 13_security.sql section 13.14: SQL SERVER AUDIT STATUS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT a.name, a.type_desc, a.on_failure_desc, a.is_state_enabled, s.status_desc, s.audit_file_path
 FROM sys.server_audits AS a
 LEFT JOIN sys.dm_server_audit_status AS s ON s.audit_id = a.audit_id;
@@ -4588,6 +7805,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_linked_servers;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_linked_servers;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_linked_servers',
     @definition = N'ALTER VIEW dbo.HC_linked_servers
 AS
 -- Toolkit 13_security.sql section 13.15: LINKED SERVERS & THEIR LOGIN MAPPINGS
@@ -4601,6 +7821,9 @@ WHERE s.is_linked = 1;
 AS
 -- Toolkit 13_security.sql section 13.15: LINKED SERVERS & THEIR LOGIN MAPPINGS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT s.name, s.product, s.provider, s.data_source, s.is_rpc_out_enabled, s.is_data_access_enabled,
        ll.uses_self_credential, ll.remote_name, SUSER_NAME(ll.local_principal_id) AS local_login
 FROM sys.servers AS s
@@ -4616,6 +7839,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_failed_jobs(DEFAULT) ORDER BY run_datetime DESC;  -- @hours = 24',
     @min_version = NULL,
     @sort_hint = N'ORDER BY run_datetime DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_failed_jobs(DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_failed_jobs(DEFAULT)',
     @definition = N'ALTER FUNCTION dbo.HC_failed_jobs
 (
     @hours int = 24
@@ -4640,6 +7866,9 @@ WHERE h.run_status = 0
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.1: FAILED JOB STEPS - LAST N HOURS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT j.name AS job_name, h.step_id, h.step_name,
        msdb.dbo.agent_datetime(h.run_date, h.run_time) AS run_datetime,
        STUFF(STUFF(RIGHT(''000000'' + CAST(h.run_duration AS varchar(10)), 6), 5, 0, '':''), 3, 0, '':'') AS duration_hhmmss,
@@ -4659,6 +7888,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_running_jobs ORDER BY start_execution_date;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY ja.start_execution_date',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_running_jobs;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_running_jobs',
     @definition = N'ALTER VIEW dbo.HC_running_jobs
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.2: CURRENTLY RUNNING JOBS
@@ -4677,6 +7909,9 @@ WHERE ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.2: CURRENTLY RUNNING JOBS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT j.name AS job_name, ja.start_execution_date,
        DATEDIFF(MINUTE, ja.start_execution_date, GETDATE()) AS running_minutes,
        ISNULL(ja.last_executed_step_id, 0) + 1              AS current_step_id,
@@ -4695,13 +7930,35 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_job_inventory', @section = N'14.3', @source_file = N'14_agent_jobs_dbmail.sql',
     @title = N'JOB INVENTORY - OWNER, ENABLED, LAST OUTCOME, NEXT RUN', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_job_inventory;',
+    @usage = N'SELECT * FROM dbo.HC_job_inventory ORDER BY job_name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_job_inventory
+    @sort_hint = N'ORDER BY j.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_job_inventory;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_job_inventory',
+    @definition = N'ALTER VIEW dbo.HC_job_inventory
+AS
+-- Toolkit 14_agent_jobs_dbmail.sql section 14.3: JOB INVENTORY - OWNER, ENABLED, LAST OUTCOME, NEXT RUN
+SELECT j.name AS job_name, j.enabled, SUSER_SNAME(j.owner_sid) AS owner_name,
+       c.name AS category,
+       CASE js.last_run_outcome WHEN 0 THEN ''Failed'' WHEN 1 THEN ''Succeeded''
+            WHEN 3 THEN ''Canceled'' WHEN 5 THEN ''Unknown'' END AS last_outcome,
+       CASE WHEN js.last_run_date > 0 THEN msdb.dbo.agent_datetime(js.last_run_date, js.last_run_time) END AS last_run,
+       (SELECT MIN(msdb.dbo.agent_datetime(s.next_run_date, s.next_run_time))
+        FROM msdb.dbo.sysjobschedules AS s WHERE s.job_id = j.job_id AND s.next_run_date > 0) AS next_run,
+       j.date_created, j.date_modified,
+       CASE WHEN j.notify_level_email > 0 THEN ''Yes'' ELSE ''No'' END AS emails_on_failure
+FROM msdb.dbo.sysjobs AS j
+LEFT JOIN msdb.dbo.sysjobservers AS js ON js.job_id = j.job_id
+LEFT JOIN msdb.dbo.syscategories AS c  ON c.category_id = j.category_id;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_job_inventory
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.3: JOB INVENTORY - OWNER, ENABLED, LAST OUTCOME, NEXT RUN
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT j.name AS job_name, j.enabled, SUSER_SNAME(j.owner_sid) AS owner_name,
        c.name AS category,
        CASE js.last_run_outcome WHEN 0 THEN ''Failed'' WHEN 1 THEN ''Succeeded''
@@ -4715,8 +7972,7 @@ FROM msdb.dbo.sysjobs AS j
 LEFT JOIN msdb.dbo.sysjobservers AS js ON js.job_id = j.job_id
 LEFT JOIN msdb.dbo.syscategories AS c  ON c.category_id = j.category_id
 ORDER BY j.name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 14.4  JOBS RUNNING LONGER THAN THEIR AVERAGE   (14_agent_jobs_dbmail.sql) */
@@ -4726,6 +7982,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_long_running_jobs ORDER BY times_avg DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY times_avg DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_long_running_jobs;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_long_running_jobs',
     @definition = N'ALTER VIEW dbo.HC_long_running_jobs
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.4: JOBS RUNNING LONGER THAN THEIR AVERAGE
@@ -4750,6 +8009,9 @@ WHERE ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.4: JOBS RUNNING LONGER THAN THEIR AVERAGE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH avg_run AS (
     SELECT job_id,
            AVG((run_duration / 10000) * 3600 + (run_duration / 100 % 100) * 60 + run_duration % 100) AS avg_seconds
@@ -4777,6 +8039,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_job_steps(DEFAULT) ORDER BY job_name, step_id;  -- @job_name = N''%''',
     @min_version = NULL,
     @sort_hint = N'ORDER BY j.name, s.step_id',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_job_steps(DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_job_steps(DEFAULT)',
     @definition = N'ALTER FUNCTION dbo.HC_job_steps
 (
     @job_name sysname = N''%''
@@ -4800,6 +8065,9 @@ WHERE j.name LIKE @job_name
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.5: JOB STEP DETAILS (command, subsystem, proxy, database)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT j.name AS job_name, s.step_id, s.step_name, s.subsystem, s.database_name,
        s.command, s.on_success_action, s.on_fail_action, s.retry_attempts,
        p.name AS proxy_name, s.output_file_name
@@ -4818,10 +8086,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_jobs_owned_by_people;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_jobs_owned_by_people;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_jobs_owned_by_people
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.6: JOBS OWNED BY INDIVIDUAL ACCOUNTS (break when person leaves)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT j.name AS job_name, SUSER_SNAME(j.owner_sid) AS owner_name,
        N''EXEC msdb.dbo.sp_update_job @job_name = N'''''' + REPLACE(j.name, '''''''', '''''''''''') + N'''''', @owner_login_name = N''''sa'''';'' AS fix
 FROM msdb.dbo.sysjobs AS j
@@ -4837,10 +8111,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_agent_alerts_operators;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_agent_alerts_operators;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT name, enabled, email_address, last_email_date FROM msdb.dbo.sysoperators
+--#HC_NEXT_RESULT#
+SELECT name, enabled, message_id, severity, last_occurrence_date, occurrence_count, has_notification
+FROM msdb.dbo.sysalerts ORDER BY severity, message_id',
     @definition = N'ALTER PROCEDURE dbo.HC_agent_alerts_operators
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.7: AGENT SERVICE / ALERTS / OPERATORS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, enabled, email_address, last_email_date FROM msdb.dbo.sysoperators;
 SELECT name, enabled, message_id, severity, last_occurrence_date, occurrence_count, has_notification
 FROM msdb.dbo.sysalerts ORDER BY severity, message_id;
@@ -4855,10 +8138,24 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_dbmail_failures;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_dbmail_failures;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT TOP (50) mailitem_id, recipients, subject, sent_status, send_request_date, sent_date
+FROM msdb.dbo.sysmail_allitems
+WHERE sent_status <> ''sent''
+ORDER BY send_request_date DESC
+--#HC_NEXT_RESULT#
+SELECT TOP (50) log_id, event_type, log_date, description, mailitem_id
+FROM msdb.dbo.sysmail_event_log
+WHERE event_type IN (''error'', ''warning'')
+ORDER BY log_date DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_dbmail_failures
 AS
 -- Toolkit 14_agent_jobs_dbmail.sql section 14.8: DATABASE MAIL - FAILURES & QUEUE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (50) mailitem_id, recipients, subject, sent_status, send_request_date, sent_date
 FROM msdb.dbo.sysmail_allitems
 WHERE sent_status <> ''sent''
@@ -4879,6 +8176,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_dbs_not_online;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_dbs_not_online;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_dbs_not_online',
     @definition = N'ALTER VIEW dbo.HC_dbs_not_online
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.1: DATABASES NOT ONLINE / NOT MULTI_USER
@@ -4890,6 +8190,9 @@ WHERE state_desc <> N''ONLINE'' OR user_access_desc <> N''MULTI_USER'';
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.1: DATABASES NOT ONLINE / NOT MULTI_USER
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, state_desc, user_access_desc, is_read_only, is_in_standby
 FROM sys.databases
 WHERE state_desc <> N''ONLINE'' OR user_access_desc <> N''MULTI_USER'';
@@ -4903,6 +8206,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_last_good_checkdb ORDER BY days_ago DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY days_ago DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_last_good_checkdb;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_last_good_checkdb',
     @definition = N'ALTER VIEW dbo.HC_last_good_checkdb
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.2: LAST KNOWN GOOD CHECKDB (2016 SP2+)
@@ -4916,6 +8222,9 @@ WHERE database_id <> 2 AND state_desc = N''ONLINE'';
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.2: LAST KNOWN GOOD CHECKDB (2016 SP2+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name,
        DATABASEPROPERTYEX(name, ''LastGoodCheckDbTime'') AS last_good_checkdb,
        DATEDIFF(DAY, CAST(DATABASEPROPERTYEX(name, ''LastGoodCheckDbTime'') AS datetime), GETDATE()) AS days_ago
@@ -4929,21 +8238,35 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_suspect_pages', @section = N'15.3', @source_file = N'15_database_health_errorlog.sql',
     @title = N'SUSPECT PAGES (823/824 errors recorded in msdb)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_suspect_pages;',
+    @usage = N'SELECT * FROM dbo.HC_suspect_pages ORDER BY last_update_date DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_suspect_pages
+    @sort_hint = N'ORDER BY last_update_date DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_suspect_pages;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_suspect_pages',
+    @definition = N'ALTER VIEW dbo.HC_suspect_pages
+AS
+-- Toolkit 15_database_health_errorlog.sql section 15.3: SUSPECT PAGES (823/824 errors recorded in msdb)
+SELECT DB_NAME(database_id) AS database_name, file_id, page_id,
+       CASE event_type WHEN 1 THEN ''823/824 error'' WHEN 2 THEN ''Bad checksum'' WHEN 3 THEN ''Torn page''
+            WHEN 4 THEN ''Restored'' WHEN 5 THEN ''Repaired'' WHEN 7 THEN ''Deallocated by DBCC'' END AS event_desc,
+       error_count, last_update_date
+FROM msdb.dbo.suspect_pages;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_suspect_pages
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.3: SUSPECT PAGES (823/824 errors recorded in msdb)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, file_id, page_id,
        CASE event_type WHEN 1 THEN ''823/824 error'' WHEN 2 THEN ''Bad checksum'' WHEN 3 THEN ''Torn page''
             WHEN 4 THEN ''Restored'' WHEN 5 THEN ''Repaired'' WHEN 7 THEN ''Deallocated by DBCC'' END AS event_desc,
        error_count, last_update_date
 FROM msdb.dbo.suspect_pages
 ORDER BY last_update_date DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 15.4  AG AUTOMATIC PAGE REPAIR HISTORY   (15_database_health_errorlog.sql) */
@@ -4953,6 +8276,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_page_repair ORDER BY modification_time DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY modification_time DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_page_repair;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_page_repair',
     @definition = N'ALTER VIEW dbo.HC_ag_page_repair
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.4: AG AUTOMATIC PAGE REPAIR HISTORY
@@ -4963,6 +8289,9 @@ FROM sys.dm_hadr_auto_page_repair;
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.4: AG AUTOMATIC PAGE REPAIR HISTORY
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, file_id, page_id, error_type, page_status, modification_time
 FROM sys.dm_hadr_auto_page_repair
 ORDER BY modification_time DESC;
@@ -4976,6 +8305,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_config_antipatterns;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name, finding',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_config_antipatterns;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_config_antipatterns',
     @definition = N'ALTER VIEW dbo.HC_config_antipatterns
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.5: CONFIGURATION ANTI-PATTERNS
@@ -4996,6 +8328,9 @@ SELECT name, finding FROM (
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.5: CONFIGURATION ANTI-PATTERNS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, finding FROM (
     SELECT name, ''AUTO_CLOSE is ON'' AS finding FROM sys.databases WHERE is_auto_close_on = 1
     UNION ALL SELECT name, ''AUTO_SHRINK is ON'' FROM sys.databases WHERE is_auto_shrink_on = 1
@@ -5019,6 +8354,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_errorlog_search @log_number = 0, @search_text = N''error'', @search_text2 = N'''';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_errorlog_search;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_errorlog_search
     @log_number int = 0,
     @search_text nvarchar(200) = N''error'',
@@ -5026,6 +8364,9 @@ EXEC dbo.HC_usp_deploy
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.6: ERROR LOG - SEARCH
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 EXEC sys.xp_readerrorlog @log_number, 1, @search_text, @search_text2;
 ',
     @fallback_definition = NULL;
@@ -5038,10 +8379,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_errorlog_files;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_errorlog_files;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_errorlog_files
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.7: ERROR LOG FILE LIST (sizes / dates)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 EXEC sys.sp_enumerrorlogs;
 ',
     @fallback_definition = NULL;
@@ -5054,10 +8401,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_high_severity_errors;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_high_severity_errors;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_high_severity_errors
 AS
 -- Toolkit 15_database_health_errorlog.sql section 15.8: HIGH SEVERITY ERRORS FROM system_health (XE)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     x.ev.value(''(event/@timestamp)[1]'', ''datetime2'')                     AS event_time_utc,
     x.ev.value(''(event/data[@name="error_number"]/value)[1]'', ''int'')     AS error_number,
@@ -5078,16 +8431,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_tier @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_tier @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_tier
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.1: SERVICE TIER / SIZE / LIMITS (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT DB_NAME() AS database_name,
        DATABASEPROPERTYEX(DB_NAME(), ''''Edition'''')          AS edition,
        DATABASEPROPERTYEX(DB_NAME(), ''''ServiceObjective'''') AS service_objective,
        CAST(DATABASEPROPERTYEX(DB_NAME(), ''''MaxSizeInBytes'''') AS bigint) / 1073741824 AS max_size_gb,
@@ -5096,7 +8452,54 @@ DECLARE @hc_sql nvarchar(max) = N''SELECT DB_NAME() AS database_name,
 SELECT * FROM sys.database_service_objectives;
 
 SELECT * FROM sys.dm_user_db_resource_governance;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5108,16 +8511,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_resource_1h @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_resource_1h @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_resource_1h
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.2: RESOURCE USAGE - LAST HOUR (15-second samples) (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT end_time,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT end_time,
        avg_cpu_percent, avg_data_io_percent, avg_log_write_percent,
        avg_memory_usage_percent, max_worker_percent, max_session_percent,
        xtp_storage_percent, avg_instance_cpu_percent, avg_instance_memory_percent
@@ -5131,7 +8537,54 @@ SELECT MAX(avg_cpu_percent)        AS max_cpu,  AVG(avg_cpu_percent)        AS a
        MAX(max_worker_percent)     AS max_workers,
        MAX(max_session_percent)    AS max_sessions
 FROM sys.dm_db_resource_stats;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5143,22 +8596,82 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_waits @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_waits @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT TOP (20) DB_NAME() AS database_name, wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms,
+       CAST(wait_time_ms * 1.0 / NULLIF(waiting_tasks_count, 0) AS decimal(10,2)) AS avg_wait_ms
+FROM sys.dm_db_wait_stats
+WHERE wait_type NOT LIKE N''%SLEEP%'' AND wait_type NOT LIKE N''%IDLE%'' AND wait_type NOT LIKE N''%QUEUE%''
+  AND wait_type NOT IN (N''XE_TIMER_EVENT'', N''WAITFOR'', N''BROKER_TASK_STOP'', N''CXCONSUMER'')
+ORDER BY wait_time_ms DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_waits
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.5: WAIT STATS - THIS DATABASE (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (20) wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (20) wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms,
        CAST(wait_time_ms * 1.0 / NULLIF(waiting_tasks_count, 0) AS decimal(10,2)) AS avg_wait_ms
 FROM sys.dm_db_wait_stats
 WHERE wait_type NOT LIKE N''''%SLEEP%'''' AND wait_type NOT LIKE N''''%IDLE%'''' AND wait_type NOT LIKE N''''%QUEUE%''''
   AND wait_type NOT IN (N''''XE_TIMER_EVENT'''', N''''WAITFOR'''', N''''BROKER_TASK_STOP'''', N''''CXCONSUMER'''')
 ORDER BY wait_time_ms DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (20) DB_NAME() AS database_name, wait_type, waiting_tasks_count, wait_time_ms, signal_wait_time_ms,
+       CAST(wait_time_ms * 1.0 / NULLIF(waiting_tasks_count, 0) AS decimal(10,2)) AS avg_wait_ms
+FROM sys.dm_db_wait_stats
+WHERE wait_type NOT LIKE N''''%SLEEP%'''' AND wait_type NOT LIKE N''''%IDLE%'''' AND wait_type NOT LIKE N''''%QUEUE%''''
+  AND wait_type NOT IN (N''''XE_TIMER_EVENT'''', N''''WAITFOR'''', N''''BROKER_TASK_STOP'''', N''''CXCONSUMER'''')
+ORDER BY wait_time_ms DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5170,21 +8683,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_space @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_space @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, file_id, name, type_desc,
+       CAST(size / 128.0 AS decimal(18,2))                            AS allocated_mb,
+       CAST(FILEPROPERTY(name, ''SpaceUsed'') / 128.0 AS decimal(18,2)) AS used_mb,
+       CAST(max_size / 128.0 AS decimal(18,2))                        AS max_mb
+FROM sys.database_files',
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_space
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.6: SPACE USED vs ALLOCATED vs MAX (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT file_id, name, type_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT file_id, name, type_desc,
        CAST(size / 128.0 AS decimal(18,2))                            AS allocated_mb,
        CAST(FILEPROPERTY(name, ''''SpaceUsed'''') / 128.0 AS decimal(18,2)) AS used_mb,
        CAST(max_size / 128.0 AS decimal(18,2))                        AS max_mb
 FROM sys.database_files;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, file_id, name, type_desc,
+       CAST(size / 128.0 AS decimal(18,2))                            AS allocated_mb,
+       CAST(FILEPROPERTY(name, ''''SpaceUsed'''') / 128.0 AS decimal(18,2)) AS used_mb,
+       CAST(max_size / 128.0 AS decimal(18,2))                        AS max_mb
+FROM sys.database_files'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5196,19 +8767,73 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_geo_repl @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_geo_repl @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, link_guid, partner_server, partner_database, replication_state_desc,
+       role_desc, secondary_allow_connections_desc, last_replication, replication_lag_sec
+FROM sys.dm_geo_replication_link_status',
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_geo_repl
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.7: GEO-REPLICATION / FAILOVER GROUP LINK STATUS (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT link_guid, partner_server, partner_database, replication_state_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT link_guid, partner_server, partner_database, replication_state_desc,
        role_desc, secondary_allow_connections_desc, last_replication, replication_lag_sec
 FROM sys.dm_geo_replication_link_status;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, link_guid, partner_server, partner_database, replication_state_desc,
+       role_desc, secondary_allow_connections_desc, last_replication, replication_lag_sec
+FROM sys.dm_geo_replication_link_status'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5220,16 +8845,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_auto_tuning @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_auto_tuning @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_auto_tuning
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.9: AUTOMATIC TUNING (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT name, desired_state_desc, actual_state_desc, reason_desc
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT name, desired_state_desc, actual_state_desc, reason_desc
 FROM sys.database_automatic_tuning_options;
 
 SELECT name, type, reason, valid_since, last_refresh,
@@ -5238,7 +8866,54 @@ SELECT name, type, reason, valid_since, last_refresh,
        score
 FROM sys.dm_db_tuning_recommendations
 ORDER BY score DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5250,21 +8925,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_connections @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_connections @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, COUNT(*) AS sessions,
+       SUM(CASE WHEN status = ''running'' THEN 1 ELSE 0 END) AS running,
+       (SELECT MAX(max_session_percent) FROM sys.dm_db_resource_stats) AS max_session_pct_last_hour
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1',
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_connections
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.10: ACTIVE CONNECTIONS vs LIMIT (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT COUNT(*) AS sessions,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT COUNT(*) AS sessions,
        SUM(CASE WHEN status = ''''running'''' THEN 1 ELSE 0 END) AS running,
        (SELECT MAX(max_session_percent) FROM sys.dm_db_resource_stats) AS max_session_pct_last_hour
 FROM sys.dm_exec_sessions
 WHERE is_user_process = 1;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, COUNT(*) AS sessions,
+       SUM(CASE WHEN status = ''''running'''' THEN 1 ELSE 0 END) AS running,
+       (SELECT MAX(max_session_percent) FROM sys.dm_db_resource_stats) AS max_session_pct_last_hour
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5276,16 +9009,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_sqldb_pvs @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_sqldb_pvs @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME(database_id) AS database_name,
+       persistent_version_store_size_kb / 1024 AS pvs_mb,
+       online_index_version_store_size_kb / 1024 AS online_index_vs_mb,
+       current_aborted_transaction_count,
+       oldest_active_transaction_id, oldest_aborted_transaction_id,
+       pvs_off_row_page_skipped_oldest_active_xdesid
+FROM sys.dm_tran_persistent_version_store_stats
+WHERE database_id = DB_ID()',
     @definition = N'ALTER PROCEDURE dbo.HC_sqldb_pvs
     @database_name sysname = NULL
 AS
 -- Toolkit 16_azure_sql_database.sql section 16.11: PERSISTENT VERSION STORE (ADR is always on in Azure SQL DB) (user DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT DB_NAME(database_id) AS database_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT DB_NAME(database_id) AS database_name,
        persistent_version_store_size_kb / 1024 AS pvs_mb,
        online_index_version_store_size_kb / 1024 AS online_index_vs_mb,
        current_aborted_transaction_count,
@@ -5293,7 +9036,61 @@ DECLARE @hc_sql nvarchar(max) = N''SELECT DB_NAME(database_id) AS database_name,
        pvs_off_row_page_skipped_oldest_active_xdesid
 FROM sys.dm_tran_persistent_version_store_stats
 WHERE database_id = DB_ID();'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME(database_id) AS database_name,
+       persistent_version_store_size_kb / 1024 AS pvs_mb,
+       online_index_version_store_size_kb / 1024 AS online_index_vs_mb,
+       current_aborted_transaction_count,
+       oldest_active_transaction_id, oldest_aborted_transaction_id,
+       pvs_off_row_page_skipped_oldest_active_xdesid
+FROM sys.dm_tran_persistent_version_store_stats
+WHERE database_id = DB_ID()'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5305,6 +9102,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_check;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_mi_check;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_mi_check',
     @definition = N'ALTER VIEW dbo.HC_mi_check
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.1: AM I ON A MANAGED INSTANCE?
@@ -5316,6 +9116,9 @@ SELECT SERVERPROPERTY(''EngineEdition'') AS engine_edition,
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.1: AM I ON A MANAGED INSTANCE?
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT SERVERPROPERTY(''EngineEdition'') AS engine_edition,
        SERVERPROPERTY(''ServerName'')    AS server_name,
        @@VERSION                       AS version;
@@ -5329,10 +9132,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_mi_resource_history;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_mi_resource_history;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT TOP (300)
+    start_time, end_time, resource_name, sku, hardware_generation,
+    virtual_core_count, avg_cpu_percent,
+    reserved_storage_mb, storage_space_used_mb,
+    CAST(100.0 * storage_space_used_mb / NULLIF(reserved_storage_mb, 0) AS decimal(5,2)) AS storage_used_pct,
+    io_requests, io_bytes_read, io_bytes_written
+FROM master.sys.server_resource_stats
+ORDER BY start_time DESC
+--#HC_NEXT_RESULT#
+SELECT CAST(start_time AS date) AS day, MAX(avg_cpu_percent) AS peak_cpu, AVG(avg_cpu_percent) AS avg_cpu
+FROM master.sys.server_resource_stats
+GROUP BY CAST(start_time AS date)
+ORDER BY day DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_mi_resource_history
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.2: INSTANCE RESOURCE HISTORY - CPU / STORAGE / IO (master)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (300)
     start_time, end_time, resource_name, sku, hardware_generation,
     virtual_core_count, avg_cpu_percent,
@@ -5357,6 +9178,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_governance;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_mi_governance;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_mi_governance',
     @definition = N'ALTER VIEW dbo.HC_mi_governance
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.3: INSTANCE GOVERNANCE LIMITS (log rate, IOPS, memory)
@@ -5366,6 +9190,9 @@ SELECT * FROM sys.dm_instance_resource_governance;
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.3: INSTANCE GOVERNANCE LIMITS (log rate, IOPS, memory)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT * FROM sys.dm_instance_resource_governance;
 ';
 GO
@@ -5377,10 +9204,25 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_mi_storage;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_mi_storage;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT TOP (1) reserved_storage_mb, storage_space_used_mb,
+       reserved_storage_mb - storage_space_used_mb AS free_mb
+FROM master.sys.server_resource_stats
+ORDER BY start_time DESC
+--#HC_NEXT_RESULT#
+SELECT DB_NAME(database_id) AS database_name, type_desc,
+       CAST(SUM(CAST(size AS bigint)) * 8 / 1024.0 / 1024 AS decimal(18,2)) AS size_gb
+FROM sys.master_files
+GROUP BY database_id, type_desc
+ORDER BY size_gb DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_mi_storage
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.4: STORAGE: INSTANCE TOTAL vs RESERVED
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (1) reserved_storage_mb, storage_space_used_mb,
        reserved_storage_mb - storage_space_used_mb AS free_mb
 FROM master.sys.server_resource_stats
@@ -5402,6 +9244,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_gp_file_perf ORDER BY total_io DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY total_io DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_mi_gp_file_perf;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_mi_gp_file_perf',
     @definition = N'ALTER VIEW dbo.HC_mi_gp_file_perf
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.5: GENERAL PURPOSE: FILE SIZE vs REMOTE STORAGE PERFORMANCE
@@ -5417,6 +9262,9 @@ JOIN sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs ON vfs.database_id = mf.dat
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.5: GENERAL PURPOSE: FILE SIZE vs REMOTE STORAGE PERFORMANCE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(mf.database_id) AS database_name, mf.name, mf.type_desc,
        CAST(CAST(mf.size AS bigint) * 8 / 1024.0 / 1024 AS decimal(18,2)) AS size_gb,
        CAST(vfs.io_stall_read_ms  * 1.0 / NULLIF(vfs.num_of_reads, 0)  AS decimal(10,2)) AS avg_read_ms,
@@ -5435,6 +9283,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_log_rate_waits ORDER BY wait_time_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wait_time_ms DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_mi_log_rate_waits;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_mi_log_rate_waits',
     @definition = N'ALTER VIEW dbo.HC_mi_log_rate_waits
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.6: LOG RATE GOVERNANCE WAITS
@@ -5448,6 +9299,9 @@ WHERE wait_type IN (N''INSTANCE_LOG_RATE_GOVERNOR'', N''LOG_RATE_GOVERNOR'', N''
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.6: LOG RATE GOVERNANCE WAITS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT wait_type, waiting_tasks_count, wait_time_ms
 FROM sys.dm_os_wait_stats
 WHERE wait_type IN (N''INSTANCE_LOG_RATE_GOVERNOR'', N''LOG_RATE_GOVERNOR'', N''POOL_LOG_RATE_GOVERNOR'',
@@ -5464,6 +9318,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_replica_state ORDER BY database_name, is_primary_replica DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY database_name, is_primary_replica DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_mi_replica_state;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_mi_replica_state',
     @definition = N'ALTER VIEW dbo.HC_mi_replica_state
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.7: BUSINESS CRITICAL / FAILOVER GROUP REPLICA STATE
@@ -5476,6 +9333,9 @@ FROM sys.dm_hadr_database_replica_states;
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.7: BUSINESS CRITICAL / FAILOVER GROUP REPLICA STATE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, is_local, is_primary_replica,
        synchronization_state_desc, synchronization_health_desc,
        log_send_queue_size, redo_queue_size, secondary_lag_seconds, last_commit_time
@@ -5491,6 +9351,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_mi_backup_history ORDER BY backup_start_date DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_mi_backup_history;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_mi_backup_history',
     @definition = N'ALTER VIEW dbo.HC_mi_backup_history
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.8: BACKUP HISTORY ON MI
@@ -5503,6 +9366,9 @@ ORDER BY backup_start_date DESC;
 AS
 -- Toolkit 17_azure_managed_instance.sql section 17.8: BACKUP HISTORY ON MI
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (50) database_name, type, backup_start_date, backup_finish_date,
        is_copy_only, backup_size / 1048576 AS size_mb
 FROM msdb.dbo.backupset
@@ -5517,10 +9383,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_xe_sessions;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_xe_sessions;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_xe_sessions
 AS
 -- Toolkit 18_extended_events.sql section 18.1: RUNNING XE SESSIONS & TARGETS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT s.name AS session_name, s.create_time, t.target_name,
        CAST(t.target_data AS xml).value(''(EventFileTarget/File/@name)[1]'', ''nvarchar(260)'') AS current_file
 FROM sys.dm_xe_sessions AS s
@@ -5537,10 +9409,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_xe_blocked_process;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_xe_blocked_process;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_xe_blocked_process
 AS
 -- Toolkit 18_extended_events.sql section 18.2: BLOCKED PROCESS REPORT (who blocked whom, > N seconds)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     x.ev.value(''(event/@timestamp)[1]'', ''datetime2'')                     AS event_time_utc,
     x.ev.value(''(event/data[@name="database_name"]/value)[1]'', ''sysname'') AS database_name,
@@ -5560,10 +9438,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_xe_long_queries;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_xe_long_queries;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_xe_long_queries
 AS
 -- Toolkit 18_extended_events.sql section 18.3: LONG-RUNNING QUERIES (> 5 seconds)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT
     x.ev.value(''(event/@timestamp)[1]'', ''datetime2'')                                    AS event_time_utc,
     x.ev.value(''(event/@name)[1]'', ''nvarchar(60)'')                                      AS event_name,
@@ -5588,16 +9472,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_generate_index_maint @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_generate_index_maint @database_name = @db;', @test_mode = 'heavy: reads index pages',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_generate_index_maint
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.1: GENERATE INDEX REORG / REBUILD - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''DECLARE @online bit = CASE WHEN SERVERPROPERTY(''''EngineEdition'''') IN (3, 5, 8) THEN 1 ELSE 0 END;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''DECLARE @online bit = CASE WHEN SERVERPROPERTY(''''EngineEdition'''') IN (3, 5, 8) THEN 1 ELSE 0 END;
 
 SELECT
     OBJECT_SCHEMA_NAME(ips.object_id) + N''''.'''' + OBJECT_NAME(ips.object_id) AS table_name,
@@ -5620,7 +9507,54 @@ WHERE ips.avg_fragmentation_in_percent >= 5
   AND i.is_disabled = 0
   AND ips.alloc_unit_type_desc = ''''IN_ROW_DATA''''
 ORDER BY ips.page_count DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5632,17 +9566,31 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_generate_stats_update @database_name = N''YourDB'', @min_mod_pct = 10.0;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_generate_stats_update @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @min_mod_pct decimal(5,2) = 10.0;
+SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) AS table_name,
+    s.name AS stats_name, sp.rows, sp.modification_counter, sp.last_updated,
+    N''UPDATE STATISTICS '' + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N''.'' + QUOTENAME(OBJECT_NAME(s.object_id))
+      + N'' '' + QUOTENAME(s.name) + N'' WITH FULLSCAN;'' AS update_cmd
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE OBJECTPROPERTY(s.object_id, ''IsUserTable'') = 1
+  AND sp.rows > 0
+  AND 100.0 * sp.modification_counter / sp.rows >= @min_mod_pct
+ORDER BY sp.modification_counter DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_generate_stats_update
     @database_name sysname = NULL,
     @min_mod_pct decimal(5,2) = 10.0
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.2: GENERATE UPDATE STATISTICS FOR STALE STATS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT
     OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name,
     s.name AS stats_name, sp.rows, sp.modification_counter, sp.last_updated,
     N''''UPDATE STATISTICS '''' + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(s.object_id))
@@ -5653,7 +9601,64 @@ WHERE OBJECTPROPERTY(s.object_id, ''''IsUserTable'''') = 1
   AND sp.rows > 0
   AND 100.0 * sp.modification_counter / sp.rows >= @min_mod_pct
 ORDER BY sp.modification_counter DESC;'';
-EXEC @hc_exec @hc_sql, N''@min_mod_pct decimal(5,2)'', @min_mod_pct = @min_mod_pct;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+    OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name,
+    s.name AS stats_name, sp.rows, sp.modification_counter, sp.last_updated,
+    N''''UPDATE STATISTICS '''' + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(s.object_id))
+      + N'''' '''' + QUOTENAME(s.name) + N'''' WITH FULLSCAN;'''' AS update_cmd
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE OBJECTPROPERTY(s.object_id, ''''IsUserTable'''') = 1
+  AND sp.rows > 0
+  AND 100.0 * sp.modification_counter / sp.rows >= @min_mod_pct
+ORDER BY sp.modification_counter DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@min_mod_pct decimal(5,2)'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @min_mod_pct = @min_mod_pct;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @min_mod_pct = @min_mod_pct;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5665,11 +9670,17 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_find_object @object_name = N''%Customer%'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_find_object;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_find_object
     @object_name nvarchar(128) = N''%Customer%''
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.4: FIND AN OBJECT BY NAME ACROSS ALL DATABASES
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#found'') IS NOT NULL DROP TABLE #found;
 CREATE TABLE #found (database_name sysname, schema_name sysname, object_name sysname, type_desc nvarchar(60), modify_date datetime);
 DECLARE @sql nvarchar(max) = N'''';
@@ -5690,22 +9701,82 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_find_column @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_find_column @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''.'' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type, c.max_length, c.is_nullable
+FROM sys.columns AS c
+JOIN sys.objects AS o ON o.object_id = c.object_id AND o.type IN (''U'', ''V'')
+WHERE c.name LIKE N''%Email%''
+ORDER BY table_name',
     @definition = N'ALTER PROCEDURE dbo.HC_find_column
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.5: FIND A COLUMN BY NAME - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
        c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type, c.max_length, c.is_nullable
 FROM sys.columns AS c
 JOIN sys.objects AS o ON o.object_id = c.object_id AND o.type IN (''''U'''', ''''V'''')
 WHERE c.name LIKE N''''%Email%''''
 ORDER BY table_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type, c.max_length, c.is_nullable
+FROM sys.columns AS c
+JOIN sys.objects AS o ON o.object_id = c.object_id AND o.type IN (''''U'''', ''''V'''')
+WHERE c.name LIKE N''''%Email%''''
+ORDER BY table_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5717,22 +9788,82 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_search_code @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_search_code @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(m.object_id) + N''.'' + OBJECT_NAME(m.object_id) AS object_name,
+       o.type_desc, o.modify_date
+FROM sys.sql_modules AS m
+JOIN sys.objects AS o ON o.object_id = m.object_id
+WHERE m.definition LIKE N''%YourSearchText%''
+ORDER BY object_name',
     @definition = N'ALTER PROCEDURE dbo.HC_search_code
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.6: SEARCH CODE (procs, views, functions, triggers) - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(m.object_id) + N''''.'''' + OBJECT_NAME(m.object_id) AS object_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(m.object_id) + N''''.'''' + OBJECT_NAME(m.object_id) AS object_name,
        o.type_desc, o.modify_date
 FROM sys.sql_modules AS m
 JOIN sys.objects AS o ON o.object_id = m.object_id
 WHERE m.definition LIKE N''''%YourSearchText%''''
 ORDER BY object_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(m.object_id) + N''''.'''' + OBJECT_NAME(m.object_id) AS object_name,
+       o.type_desc, o.modify_date
+FROM sys.sql_modules AS m
+JOIN sys.objects AS o ON o.object_id = m.object_id
+WHERE m.definition LIKE N''''%YourSearchText%''''
+ORDER BY object_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5744,22 +9875,82 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_row_counts @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_row_counts @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''.'' + OBJECT_NAME(object_id) AS table_name,
+       SUM(row_count) AS row_count
+FROM sys.dm_db_partition_stats
+WHERE index_id IN (0, 1) AND OBJECTPROPERTY(object_id, ''IsUserTable'') = 1
+GROUP BY object_id
+ORDER BY row_count DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_row_counts
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.7: FAST ROW COUNTS - CURRENT DB (no table scans)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
        SUM(row_count) AS row_count
 FROM sys.dm_db_partition_stats
 WHERE index_id IN (0, 1) AND OBJECTPROPERTY(object_id, ''''IsUserTable'''') = 1
 GROUP BY object_id
 ORDER BY row_count DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
+       SUM(row_count) AS row_count
+FROM sys.dm_db_partition_stats
+WHERE index_id IN (0, 1) AND OBJECTPROPERTY(object_id, ''''IsUserTable'''') = 1
+GROUP BY object_id
+ORDER BY row_count DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5771,20 +9962,76 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_recently_modified @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_recently_modified @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT TOP (50) DB_NAME() AS database_name, SCHEMA_NAME(schema_id) + N''.'' + name AS object_name, type_desc, create_date, modify_date
+FROM sys.objects
+WHERE is_ms_shipped = 0
+ORDER BY modify_date DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_recently_modified
     @database_name sysname = NULL
 AS
 -- Toolkit 19_maintenance_helpers.sql section 19.8: RECENTLY MODIFIED OBJECTS (what changed?) - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (50) SCHEMA_NAME(schema_id) + N''''.'''' + name AS object_name, type_desc, create_date, modify_date
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (50) SCHEMA_NAME(schema_id) + N''''.'''' + name AS object_name, type_desc, create_date, modify_date
 FROM sys.objects
 WHERE is_ms_shipped = 0
 ORDER BY modify_date DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (50) DB_NAME() AS database_name, SCHEMA_NAME(schema_id) + N''''.'''' + name AS object_name, type_desc, create_date, modify_date
+FROM sys.objects
+WHERE is_ms_shipped = 0
+ORDER BY modify_date DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5796,19 +10043,69 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_v2017_features @database_name = N''YourDB'';',
     @min_version = 14,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_v2017_features @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_v2017_features
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.1: 2017+ : HOST INFO, AUTOMATIC TUNING, RESUMABLE INDEX
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT * FROM sys.dm_os_host_info;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT * FROM sys.dm_os_host_info;
 SELECT * FROM sys.dm_db_tuning_recommendations;
 SELECT * FROM sys.index_resumable_operations;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5820,22 +10117,72 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_adr_status @database_name = N''YourDB'';',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_adr_status @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_adr_status
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.2: 2019+ : ACCELERATED DATABASE RECOVERY (ADR)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT name, is_accelerated_database_recovery_on FROM sys.databases ORDER BY name;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT name, is_accelerated_database_recovery_on FROM sys.databases ORDER BY name;
 
 SELECT DB_NAME(database_id) AS database_name,
        persistent_version_store_size_kb / 1024 AS pvs_mb,
        current_aborted_transaction_count, oldest_active_transaction_id
 FROM sys.dm_tran_persistent_version_store_stats;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5847,6 +10194,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_decode_page;',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_decode_page;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_decode_page',
     @definition = N'ALTER VIEW dbo.HC_decode_page
 AS
 -- Toolkit 20_version_specific_features.sql section 20.3: 2019+ : DECODE A wait_resource PAGE (PAGELATCH / PAGEIOLATCH)
@@ -5862,6 +10212,9 @@ WHERE r.page_resource IS NOT NULL;
 AS
 -- Toolkit 20_version_specific_features.sql section 20.3: 2019+ : DECODE A wait_resource PAGE (PAGELATCH / PAGEIOLATCH)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT r.session_id, r.wait_type, r.wait_resource,
        OBJECT_SCHEMA_NAME(pi.object_id, pi.database_id) + N''.'' + OBJECT_NAME(pi.object_id, pi.database_id) AS object_name,
        pi.index_id, pi.page_type_desc
@@ -5879,6 +10232,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_last_actual_plan;',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_last_actual_plan;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_last_actual_plan',
     @definition = N'ALTER VIEW dbo.HC_last_actual_plan
 AS
 -- Toolkit 20_version_specific_features.sql section 20.4: 2019+ : LAST ACTUAL EXECUTION PLAN FROM CACHE
@@ -5892,6 +10248,9 @@ ORDER BY qs.total_worker_time DESC;
 AS
 -- Toolkit 20_version_specific_features.sql section 20.4: 2019+ : LAST ACTUAL EXECUTION PLAN FROM CACHE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (10) DB_NAME(t.dbid) AS database_name, qs.execution_count, t.text, qps.query_plan AS last_actual_plan
 FROM sys.dm_exec_query_stats AS qs
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS t
@@ -5907,6 +10266,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_missing_index_queries;',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_missing_index_queries;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_missing_index_queries',
     @definition = N'ALTER VIEW dbo.HC_missing_index_queries
 AS
 -- Toolkit 20_version_specific_features.sql section 20.5: 2019+ : MISSING INDEX -> WHICH QUERY ASKED FOR IT
@@ -5925,6 +10287,9 @@ ORDER BY migsq.avg_total_user_cost * migsq.avg_user_impact * migsq.user_seeks DE
 AS
 -- Toolkit 20_version_specific_features.sql section 20.5: 2019+ : MISSING INDEX -> WHICH QUERY ASKED FOR IT
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (20) mid.statement AS table_name, mid.equality_columns, mid.inequality_columns, mid.included_columns,
        migsq.user_seeks, migsq.avg_user_impact, migsq.avg_total_user_cost,
        SUBSTRING(t.text, migsq.last_statement_start_offset / 2 + 1,
@@ -5945,16 +10310,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_iqp_settings @database_name = N''YourDB'';',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_iqp_settings @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, name, value, is_value_default
+FROM sys.database_scoped_configurations
+WHERE name IN (N''BATCH_MODE_ON_ROWSTORE'', N''BATCH_MODE_MEMORY_GRANT_FEEDBACK'',
+               N''ROW_MODE_MEMORY_GRANT_FEEDBACK'', N''INTERLEAVED_EXECUTION_TVF'',
+               N''TSQL_SCALAR_UDF_INLINING'', N''DEFERRED_COMPILATION_TV'',
+               N''PARAMETER_SENSITIVE_PLAN_OPTIMIZATION'', N''DOP_FEEDBACK'', N''CE_FEEDBACK'',
+               N''MEMORY_GRANT_FEEDBACK_PERCENTILE_GRANT'', N''MEMORY_GRANT_FEEDBACK_PERSISTENCE'',
+               N''OPTIMIZED_PLAN_FORCING'', N''LAST_QUERY_PLAN_STATS'', N''LIGHTWEIGHT_QUERY_PROFILING'')
+ORDER BY name',
     @definition = N'ALTER PROCEDURE dbo.HC_iqp_settings
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.6: 2019+ : INTELLIGENT QUERY PROCESSING SETTINGS (current DB)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT name, value, is_value_default
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT name, value, is_value_default
 FROM sys.database_scoped_configurations
 WHERE name IN (N''''BATCH_MODE_ON_ROWSTORE'''', N''''BATCH_MODE_MEMORY_GRANT_FEEDBACK'''',
                N''''ROW_MODE_MEMORY_GRANT_FEEDBACK'''', N''''INTERLEAVED_EXECUTION_TVF'''',
@@ -5963,7 +10339,62 @@ WHERE name IN (N''''BATCH_MODE_ON_ROWSTORE'''', N''''BATCH_MODE_MEMORY_GRANT_FEE
                N''''MEMORY_GRANT_FEEDBACK_PERCENTILE_GRANT'''', N''''MEMORY_GRANT_FEEDBACK_PERSISTENCE'''',
                N''''OPTIMIZED_PLAN_FORCING'''', N''''LAST_QUERY_PLAN_STATS'''', N''''LIGHTWEIGHT_QUERY_PROFILING'''')
 ORDER BY name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, name, value, is_value_default
+FROM sys.database_scoped_configurations
+WHERE name IN (N''''BATCH_MODE_ON_ROWSTORE'''', N''''BATCH_MODE_MEMORY_GRANT_FEEDBACK'''',
+               N''''ROW_MODE_MEMORY_GRANT_FEEDBACK'''', N''''INTERLEAVED_EXECUTION_TVF'''',
+               N''''TSQL_SCALAR_UDF_INLINING'''', N''''DEFERRED_COMPILATION_TV'''',
+               N''''PARAMETER_SENSITIVE_PLAN_OPTIMIZATION'''', N''''DOP_FEEDBACK'''', N''''CE_FEEDBACK'''',
+               N''''MEMORY_GRANT_FEEDBACK_PERCENTILE_GRANT'''', N''''MEMORY_GRANT_FEEDBACK_PERSISTENCE'''',
+               N''''OPTIMIZED_PLAN_FORCING'''', N''''LAST_QUERY_PLAN_STATS'''', N''''LIGHTWEIGHT_QUERY_PROFILING'''')
+ORDER BY name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -5975,6 +10406,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_contained_ags;',
     @min_version = 16,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_contained_ags;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_contained_ags',
     @definition = N'ALTER VIEW dbo.HC_contained_ags
 AS
 -- Toolkit 20_version_specific_features.sql section 20.7: 2022+ : CONTAINED AVAILABILITY GROUPS
@@ -5984,6 +10418,9 @@ SELECT name, is_contained, cluster_type_desc FROM sys.availability_groups;
 AS
 -- Toolkit 20_version_specific_features.sql section 20.7: 2022+ : CONTAINED AVAILABILITY GROUPS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, is_contained, cluster_type_desc FROM sys.availability_groups;
 ';
 GO
@@ -5995,20 +10432,76 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_psp_variants @database_name = N''YourDB'';',
     @min_version = 16,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_psp_variants @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, qv.query_variant_query_id, qv.parent_query_id, qv.dispatcher_plan_id, qt.query_sql_text
+FROM sys.query_store_query_variant AS qv
+JOIN sys.query_store_query AS q ON q.query_id = qv.parent_query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id',
     @definition = N'ALTER PROCEDURE dbo.HC_psp_variants
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.8: 2022+ : PARAMETER SENSITIVE PLAN (PSP) VARIANTS IN QUERY STORE
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT qv.query_variant_query_id, qv.parent_query_id, qv.dispatcher_plan_id, qt.query_sql_text
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT qv.query_variant_query_id, qv.parent_query_id, qv.dispatcher_plan_id, qt.query_sql_text
 FROM sys.query_store_query_variant AS qv
 JOIN sys.query_store_query AS q ON q.query_id = qv.parent_query_id
 JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, qv.query_variant_query_id, qv.parent_query_id, qv.dispatcher_plan_id, qt.query_sql_text
+FROM sys.query_store_query_variant AS qv
+JOIN sys.query_store_query AS q ON q.query_id = qv.parent_query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6020,19 +10513,73 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ledger_tables @database_name = N''YourDB'';',
     @min_version = 16,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ledger_tables @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''.'' + name AS table_name, ledger_type_desc, is_dropped_ledger_table
+FROM sys.tables
+WHERE ledger_type <> 0',
     @definition = N'ALTER PROCEDURE dbo.HC_ledger_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 20_version_specific_features.sql section 20.9: 2022+ : LEDGER TABLES
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + name AS table_name, ledger_type_desc, is_dropped_ledger_table
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + name AS table_name, ledger_type_desc, is_dropped_ledger_table
 FROM sys.tables
 WHERE ledger_type <> 0;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + name AS table_name, ledger_type_desc, is_dropped_ledger_table
+FROM sys.tables
+WHERE ledger_type <> 0'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6044,6 +10591,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_oom_events_2022;',
     @min_version = 16,
     @sort_hint = N'ORDER BY event_time DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_oom_events_2022;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_oom_events_2022',
     @definition = N'ALTER VIEW dbo.HC_oom_events_2022
 AS
 -- Toolkit 20_version_specific_features.sql section 20.10: 2022+ : OUT-OF-MEMORY EVENTS
@@ -6053,6 +10603,9 @@ SELECT * FROM sys.dm_os_out_of_memory_events;
 AS
 -- Toolkit 20_version_specific_features.sql section 20.10: 2022+ : OUT-OF-MEMORY EVENTS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT * FROM sys.dm_os_out_of_memory_events ORDER BY event_time DESC;
 ';
 GO
@@ -6064,6 +10617,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_optimized_locking ORDER BY name;',
     @min_version = 17,
     @sort_hint = N'ORDER BY name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_optimized_locking;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_optimized_locking',
     @definition = N'ALTER VIEW dbo.HC_optimized_locking
 AS
 -- Toolkit 20_version_specific_features.sql section 20.11: 2025 (and Azure SQL DB) : OPTIMIZED LOCKING
@@ -6078,6 +10634,9 @@ WHERE database_id > 4;
 AS
 -- Toolkit 20_version_specific_features.sql section 20.11: 2025 (and Azure SQL DB) : OPTIMIZED LOCKING
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name,
        is_accelerated_database_recovery_on,
        is_read_committed_snapshot_on,
@@ -6092,13 +10651,15 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_version_decoder', @section = N'20.12', @source_file = N'20_version_specific_features.sql',
     @title = N'QUICK "WHAT VERSION AM I ON" DECODER', @tags = N'',
-    @usage = N'EXEC dbo.HC_version_decoder;',
+    @usage = N'SELECT * FROM dbo.HC_version_decoder;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_version_decoder
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_version_decoder;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_version_decoder',
+    @definition = N'ALTER VIEW dbo.HC_version_decoder
 AS
 -- Toolkit 20_version_specific_features.sql section 20.12: QUICK "WHAT VERSION AM I ON" DECODER
-SET NOCOUNT ON;
 SELECT CASE PARSENAME(CAST(SERVERPROPERTY(''ProductVersion'') AS varchar(20)), 4)
            WHEN ''13'' THEN ''SQL Server 2016''
            WHEN ''14'' THEN ''SQL Server 2017''
@@ -6113,20 +10674,57 @@ SELECT CASE PARSENAME(CAST(SERVERPROPERTY(''ProductVersion'') AS varchar(20)), 4
        SERVERPROPERTY(''ProductUpdateLevel'') AS cu,
        SERVERPROPERTY(''EngineEdition'') AS engine_edition;
 ',
-    @fallback_definition = NULL;
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_version_decoder
+AS
+-- Toolkit 20_version_specific_features.sql section 20.12: QUICK "WHAT VERSION AM I ON" DECODER
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+SELECT CASE PARSENAME(CAST(SERVERPROPERTY(''ProductVersion'') AS varchar(20)), 4)
+           WHEN ''13'' THEN ''SQL Server 2016''
+           WHEN ''14'' THEN ''SQL Server 2017''
+           WHEN ''15'' THEN ''SQL Server 2019''
+           WHEN ''16'' THEN ''SQL Server 2022''
+           WHEN ''17'' THEN ''SQL Server 2025''
+           WHEN ''12'' THEN CASE WHEN SERVERPROPERTY(''EngineEdition'') = 5 THEN ''Azure SQL Database''
+                               WHEN SERVERPROPERTY(''EngineEdition'') = 8 THEN ''Azure SQL Managed Instance''
+                               ELSE ''SQL Server 2014'' END
+           ELSE ''Other / unknown'' END AS sql_version,
+       SERVERPROPERTY(''ProductVersion'') AS build,
+       SERVERPROPERTY(''ProductUpdateLevel'') AS cu,
+       SERVERPROPERTY(''EngineEdition'') AS engine_edition;
+';
 GO
 
 /* 21.1  DATABASES WITH CDC / CHANGE TRACKING ENABLED   (21_cdc_change_tracking.sql) */
 EXEC dbo.HC_usp_deploy
     @name = N'HC_cdc_ct_databases', @section = N'21.1', @source_file = N'21_cdc_change_tracking.sql',
     @title = N'DATABASES WITH CDC / CHANGE TRACKING ENABLED', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_cdc_ct_databases;',
+    @usage = N'SELECT * FROM dbo.HC_cdc_ct_databases ORDER BY name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_cdc_ct_databases
+    @sort_hint = N'ORDER BY d.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_cdc_ct_databases;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_cdc_ct_databases',
+    @definition = N'ALTER VIEW dbo.HC_cdc_ct_databases
+AS
+-- Toolkit 21_cdc_change_tracking.sql section 21.1: DATABASES WITH CDC / CHANGE TRACKING ENABLED
+SELECT d.name, d.is_cdc_enabled,
+       CASE WHEN ct.database_id IS NOT NULL THEN 1 ELSE 0 END AS is_change_tracking_enabled,
+       ct.retention_period, ct.retention_period_units_desc, ct.is_auto_cleanup_on,
+       d.log_reuse_wait_desc
+FROM sys.databases AS d
+LEFT JOIN sys.change_tracking_databases AS ct ON ct.database_id = d.database_id
+WHERE d.is_cdc_enabled = 1 OR ct.database_id IS NOT NULL;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_cdc_ct_databases
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.1: DATABASES WITH CDC / CHANGE TRACKING ENABLED
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name, d.is_cdc_enabled,
        CASE WHEN ct.database_id IS NOT NULL THEN 1 ELSE 0 END AS is_change_tracking_enabled,
        ct.retention_period, ct.retention_period_units_desc, ct.is_auto_cleanup_on,
@@ -6135,8 +10733,7 @@ FROM sys.databases AS d
 LEFT JOIN sys.change_tracking_databases AS ct ON ct.database_id = d.database_id
 WHERE d.is_cdc_enabled = 1 OR ct.database_id IS NOT NULL
 ORDER BY d.name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 21.2  CDC TRACKED TABLES & CAPTURE INSTANCES - CURRENT DB   (21_cdc_change_tracking.sql) */
@@ -6146,16 +10743,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_tables @database_name = @db;', @test_mode = 'needs_cdc',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.2: CDC TRACKED TABLES & CAPTURE INSTANCES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ct.source_object_id) + N''''.'''' + OBJECT_NAME(ct.source_object_id) AS source_table,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ct.source_object_id) + N''''.'''' + OBJECT_NAME(ct.source_object_id) AS source_table,
        ct.capture_instance, ct.supports_net_changes, ct.role_name AS gating_role,
        ct.index_name AS unique_index_for_net_changes, ct.filegroup_name,
        ct.create_date, ct.start_lsn,
@@ -6168,7 +10768,54 @@ ORDER BY source_table;
 
 SELECT sys.fn_cdc_get_max_lsn() AS max_lsn,
        sys.fn_cdc_map_lsn_to_time(sys.fn_cdc_get_max_lsn()) AS last_captured_change_time;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6180,20 +10827,76 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_columns @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_columns @database_name = @db;', @test_mode = 'needs_cdc',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, ct.capture_instance, cc.column_ordinal, cc.column_name, cc.column_type, cc.is_computed
+FROM cdc.captured_columns AS cc
+JOIN cdc.change_tables AS ct ON ct.object_id = cc.object_id
+ORDER BY ct.capture_instance, cc.column_ordinal',
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_columns
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.3: CAPTURED COLUMNS PER CAPTURE INSTANCE - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT ct.capture_instance, cc.column_ordinal, cc.column_name, cc.column_type, cc.is_computed
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT ct.capture_instance, cc.column_ordinal, cc.column_name, cc.column_type, cc.is_computed
 FROM cdc.captured_columns AS cc
 JOIN cdc.change_tables AS ct ON ct.object_id = cc.object_id
 ORDER BY ct.capture_instance, cc.column_ordinal;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, ct.capture_instance, cc.column_ordinal, cc.column_name, cc.column_type, cc.is_computed
+FROM cdc.captured_columns AS cc
+JOIN cdc.change_tables AS ct ON ct.object_id = cc.object_id
+ORDER BY ct.capture_instance, cc.column_ordinal'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6205,16 +10908,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_schema_drift @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_schema_drift @database_name = @db;', @test_mode = 'needs_cdc',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, ct.capture_instance,
+       OBJECT_SCHEMA_NAME(c.object_id) + N''.'' + OBJECT_NAME(c.object_id) AS source_table,
+       c.name AS column_not_captured
+FROM cdc.change_tables AS ct
+JOIN sys.columns AS c ON c.object_id = ct.source_object_id
+WHERE NOT EXISTS (SELECT 1 FROM cdc.captured_columns AS cc
+                  WHERE cc.object_id = ct.object_id AND cc.column_name = c.name)
+ORDER BY source_table, c.column_id',
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_schema_drift
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.4: SOURCE TABLE COLUMNS NOT CAPTURED (schema drift after enabling CDC)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT ct.capture_instance,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT ct.capture_instance,
        OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS source_table,
        c.name AS column_not_captured
 FROM cdc.change_tables AS ct
@@ -6222,7 +10935,61 @@ JOIN sys.columns AS c ON c.object_id = ct.source_object_id
 WHERE NOT EXISTS (SELECT 1 FROM cdc.captured_columns AS cc
                   WHERE cc.object_id = ct.object_id AND cc.column_name = c.name)
 ORDER BY source_table, c.column_id;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, ct.capture_instance,
+       OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS source_table,
+       c.name AS column_not_captured
+FROM cdc.change_tables AS ct
+JOIN sys.columns AS c ON c.object_id = ct.source_object_id
+WHERE NOT EXISTS (SELECT 1 FROM cdc.captured_columns AS cc
+                  WHERE cc.object_id = ct.object_id AND cc.column_name = c.name)
+ORDER BY source_table, c.column_id'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6234,21 +11001,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_latency @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_latency @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT TOP (50) DB_NAME() AS database_name, session_id, start_time, end_time, duration, scan_phase,
+       error_count, tran_count, command_count, empty_scan_count,
+       latency, last_commit_time, log_record_count, schema_change_count, failed_sessions_count
+FROM sys.dm_cdc_log_scan_sessions
+ORDER BY session_id DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_latency
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.5: CDC CAPTURE LATENCY & THROUGHPUT (log scan sessions)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (50) session_id, start_time, end_time, duration, scan_phase,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (50) session_id, start_time, end_time, duration, scan_phase,
        error_count, tran_count, command_count, empty_scan_count,
        latency, last_commit_time, log_record_count, schema_change_count, failed_sessions_count
 FROM sys.dm_cdc_log_scan_sessions
 ORDER BY session_id DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (50) DB_NAME() AS database_name, session_id, start_time, end_time, duration, scan_phase,
+       error_count, tran_count, command_count, empty_scan_count,
+       latency, last_commit_time, log_record_count, schema_change_count, failed_sessions_count
+FROM sys.dm_cdc_log_scan_sessions
+ORDER BY session_id DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6260,19 +11085,73 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_errors @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_errors @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, session_id, phase_number, entry_time, error_number, error_severity, error_state, error_message
+FROM sys.dm_cdc_errors
+ORDER BY entry_time DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_errors
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.6: CDC ERRORS
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT session_id, phase_number, entry_time, error_number, error_severity, error_state, error_message
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT session_id, phase_number, entry_time, error_number, error_severity, error_state, error_message
 FROM sys.dm_cdc_errors
 ORDER BY entry_time DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, session_id, phase_number, entry_time, error_number, error_severity, error_state, error_message
+FROM sys.dm_cdc_errors
+ORDER BY entry_time DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6284,10 +11163,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_jobs;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_jobs;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT DB_NAME(cj.database_id) AS database_name, cj.job_type, j.name AS job_name, j.enabled,
+       cj.maxtrans, cj.maxscans, cj.continuous, cj.pollinginterval,
+       cj.retention AS retention_minutes, cj.retention / 1440.0 AS retention_days, cj.threshold
+FROM msdb.dbo.cdc_jobs AS cj
+LEFT JOIN msdb.dbo.sysjobs AS j ON j.job_id = cj.job_id
+ORDER BY database_name, cj.job_type
+--#HC_NEXT_RESULT#
+SELECT j.name, ja.start_execution_date, ja.stop_execution_date
+FROM msdb.dbo.sysjobactivity AS ja
+JOIN msdb.dbo.sysjobs AS j ON j.job_id = ja.job_id
+WHERE j.name LIKE N''cdc.%capture''
+  AND ja.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)',
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_jobs
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.7: CDC AGENT JOBS & SETTINGS (retention, polling)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(cj.database_id) AS database_name, cj.job_type, j.name AS job_name, j.enabled,
        cj.maxtrans, cj.maxscans, cj.continuous, cj.pollinginterval,
        cj.retention AS retention_minutes, cj.retention / 1440.0 AS retention_days, cj.threshold
@@ -6311,6 +11207,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_cdc_log_hold;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_cdc_log_hold;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_cdc_log_hold',
     @definition = N'ALTER VIEW dbo.HC_cdc_log_hold
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.8: CDC IS HOLDING THE LOG? (log_reuse_wait = REPLICATION)
@@ -6322,6 +11221,9 @@ WHERE log_reuse_wait_desc = N''REPLICATION'';
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.8: CDC IS HOLDING THE LOG? (log_reuse_wait = REPLICATION)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, is_cdc_enabled, is_published, log_reuse_wait_desc
 FROM sys.databases
 WHERE log_reuse_wait_desc = N''REPLICATION'';
@@ -6335,23 +11237,85 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_cdc_table_sizes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_cdc_table_sizes @database_name = @db;', @test_mode = 'needs_cdc',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, ct.capture_instance,
+       SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END)     AS change_rows,
+       CAST(SUM(ps.reserved_page_count) * 8 / 1024.0 AS decimal(18,2)) AS reserved_mb
+FROM cdc.change_tables AS ct
+JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = ct.object_id
+GROUP BY ct.capture_instance
+ORDER BY reserved_mb DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_cdc_table_sizes
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.9: CHANGE TABLE SIZES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT ct.capture_instance,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT ct.capture_instance,
        SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END)     AS change_rows,
        CAST(SUM(ps.reserved_page_count) * 8 / 1024.0 AS decimal(18,2)) AS reserved_mb
 FROM cdc.change_tables AS ct
 JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = ct.object_id
 GROUP BY ct.capture_instance
 ORDER BY reserved_mb DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, ct.capture_instance,
+       SUM(CASE WHEN ps.index_id < 2 THEN ps.row_count ELSE 0 END)     AS change_rows,
+       CAST(SUM(ps.reserved_page_count) * 8 / 1024.0 AS decimal(18,2)) AS reserved_mb
+FROM cdc.change_tables AS ct
+JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = ct.object_id
+GROUP BY ct.capture_instance
+ORDER BY reserved_mb DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6363,16 +11327,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ct_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ct_tables @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_ct_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 21_cdc_change_tracking.sql section 21.13: CHANGE TRACKING - TABLES & VERSIONS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ctt.object_id) + N''''.'''' + OBJECT_NAME(ctt.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ctt.object_id) + N''''.'''' + OBJECT_NAME(ctt.object_id) AS table_name,
        ctt.is_track_columns_updated_on,
        ctt.min_valid_version,
        ctt.begin_version, ctt.cleanup_version,
@@ -6388,7 +11355,54 @@ JOIN sys.dm_db_partition_stats AS ps ON ps.object_id = it.object_id AND ps.index
 WHERE it.internal_type_desc IN (N''''CHANGE_TRACKING'''', N''''TRACKED_COMMITTED_TRANSACTIONS'''')
 GROUP BY it.parent_id, it.name, it.internal_type_desc
 ORDER BY reserved_mb DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6397,13 +11411,37 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_tde_status', @section = N'22.1', @source_file = N'22_tde_encryption.sql',
     @title = N'TDE STATUS PER DATABASE + PROTECTING CERTIFICATE', @tags = N'BOX,MI,SQLDB',
-    @usage = N'EXEC dbo.HC_tde_status;',
+    @usage = N'SELECT * FROM dbo.HC_tde_status ORDER BY database_name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_tde_status
+    @sort_hint = N'ORDER BY database_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tde_status;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tde_status',
+    @definition = N'ALTER VIEW dbo.HC_tde_status
+AS
+-- Toolkit 22_tde_encryption.sql section 22.1: TDE STATUS PER DATABASE + PROTECTING CERTIFICATE
+SELECT DB_NAME(dek.database_id) AS database_name,
+       dek.encryption_state,
+       CASE dek.encryption_state WHEN 0 THEN ''No key'' WHEN 1 THEN ''Unencrypted''
+            WHEN 2 THEN ''Encryption in progress'' WHEN 3 THEN ''ENCRYPTED''
+            WHEN 4 THEN ''Key change in progress'' WHEN 5 THEN ''Decryption in progress''
+            WHEN 6 THEN ''Protection change in progress'' END AS encryption_state_desc,
+       dek.percent_complete,
+
+       dek.key_algorithm, dek.key_length,
+       dek.encryptor_type,
+       c.name AS certificate_name, c.expiry_date AS cert_expiry, c.pvt_key_last_backup_date,
+       dek.create_date, dek.regenerate_date, dek.set_date
+FROM sys.dm_database_encryption_keys AS dek
+LEFT JOIN master.sys.certificates AS c ON c.thumbprint = dek.encryptor_thumbprint;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tde_status
 AS
 -- Toolkit 22_tde_encryption.sql section 22.1: TDE STATUS PER DATABASE + PROTECTING CERTIFICATE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(dek.database_id) AS database_name,
        dek.encryption_state,
        CASE dek.encryption_state WHEN 0 THEN ''No key'' WHEN 1 THEN ''Unencrypted''
@@ -6419,8 +11457,7 @@ SELECT DB_NAME(dek.database_id) AS database_name,
 FROM sys.dm_database_encryption_keys AS dek
 LEFT JOIN master.sys.certificates AS c ON c.thumbprint = dek.encryptor_thumbprint
 ORDER BY database_name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 22.2  USER DATABASES NOT ENCRYPTED   (22_tde_encryption.sql) */
@@ -6430,6 +11467,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_dbs_not_encrypted ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY d.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_dbs_not_encrypted;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_dbs_not_encrypted',
     @definition = N'ALTER VIEW dbo.HC_dbs_not_encrypted
 AS
 -- Toolkit 22_tde_encryption.sql section 22.2: USER DATABASES NOT ENCRYPTED
@@ -6443,6 +11483,9 @@ WHERE d.database_id > 4
 AS
 -- Toolkit 22_tde_encryption.sql section 22.2: USER DATABASES NOT ENCRYPTED
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name, d.is_encrypted, d.state_desc
 FROM sys.databases AS d
 LEFT JOIN sys.dm_database_encryption_keys AS dek ON dek.database_id = d.database_id
@@ -6456,13 +11499,33 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_certificates', @section = N'22.3', @source_file = N'22_tde_encryption.sql',
     @title = N'CERTIFICATES IN MASTER - EXPIRY & PRIVATE KEY BACKUP', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_certificates;',
+    @usage = N'SELECT * FROM dbo.HC_certificates ORDER BY expiry_date;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_certificates
+    @sort_hint = N'ORDER BY c.expiry_date',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_certificates;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_certificates',
+    @definition = N'ALTER VIEW dbo.HC_certificates
+AS
+-- Toolkit 22_tde_encryption.sql section 22.3: CERTIFICATES IN MASTER - EXPIRY & PRIVATE KEY BACKUP
+SELECT c.name, c.subject, c.start_date, c.expiry_date,
+       DATEDIFF(DAY, GETDATE(), c.expiry_date) AS days_to_expiry,
+       c.pvt_key_encryption_type_desc, c.pvt_key_last_backup_date,
+       c.thumbprint,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.dm_database_encryption_keys AS d WHERE d.encryptor_thumbprint = c.thumbprint)
+            THEN ''Used by TDE'' ELSE '''' END AS tde_usage,
+       CASE WHEN EXISTS (SELECT 1 FROM msdb.dbo.backupset AS b WHERE b.encryptor_thumbprint = c.thumbprint)
+            THEN ''Used for backup encryption'' ELSE '''' END AS backup_usage
+FROM master.sys.certificates AS c
+WHERE c.name NOT LIKE N''##%'';
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_certificates
 AS
 -- Toolkit 22_tde_encryption.sql section 22.3: CERTIFICATES IN MASTER - EXPIRY & PRIVATE KEY BACKUP
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT c.name, c.subject, c.start_date, c.expiry_date,
        DATEDIFF(DAY, GETDATE(), c.expiry_date) AS days_to_expiry,
        c.pvt_key_encryption_type_desc, c.pvt_key_last_backup_date,
@@ -6474,8 +11537,7 @@ SELECT c.name, c.subject, c.start_date, c.expiry_date,
 FROM master.sys.certificates AS c
 WHERE c.name NOT LIKE N''##%''
 ORDER BY c.expiry_date;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 22.4  DATABASE MASTER KEY (master DB) & SERVICE MASTER KEY   (22_tde_encryption.sql) */
@@ -6485,10 +11547,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_master_keys;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_master_keys;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_master_keys
 AS
 -- Toolkit 22_tde_encryption.sql section 22.4: DATABASE MASTER KEY (master DB) & SERVICE MASTER KEY
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, is_master_key_encrypted_by_server, is_encrypted, is_trustworthy_on
 FROM sys.databases
 WHERE name = N''master'';
@@ -6507,6 +11575,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_tde_progress;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tde_progress;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tde_progress',
     @definition = N'ALTER VIEW dbo.HC_tde_progress
 AS
 -- Toolkit 22_tde_encryption.sql section 22.5: TDE PROGRESS (encryption / decryption scan)
@@ -6519,6 +11590,9 @@ WHERE encryption_state IN (2, 4, 5, 6);
 AS
 -- Toolkit 22_tde_encryption.sql section 22.5: TDE PROGRESS (encryption / decryption scan)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, encryption_state, percent_complete
 
 FROM sys.dm_database_encryption_keys
@@ -6530,13 +11604,15 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_encrypted_backups', @section = N'22.6', @source_file = N'22_tde_encryption.sql',
     @title = N'ENCRYPTED BACKUPS - WHICH CERT / ALGORITHM', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_encrypted_backups;',
+    @usage = N'SELECT * FROM dbo.HC_encrypted_backups ORDER BY backup_finish_date DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_encrypted_backups
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_encrypted_backups;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_encrypted_backups',
+    @definition = N'ALTER VIEW dbo.HC_encrypted_backups
 AS
 -- Toolkit 22_tde_encryption.sql section 22.6: ENCRYPTED BACKUPS - WHICH CERT / ALGORITHM
-SET NOCOUNT ON;
 SELECT TOP (50) bs.database_name, bs.type, bs.backup_finish_date,
        bs.key_algorithm, bs.encryptor_type, bs.encryptor_thumbprint,
        c.name AS certificate_name,
@@ -6546,20 +11622,37 @@ LEFT JOIN master.sys.certificates AS c ON c.thumbprint = bs.encryptor_thumbprint
 LEFT JOIN sys.dm_database_encryption_keys AS dek ON dek.database_id = DB_ID(bs.database_name) AND dek.encryption_state = 3
 ORDER BY bs.backup_finish_date DESC;
 ',
-    @fallback_definition = NULL;
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_encrypted_backups
+AS
+-- Toolkit 22_tde_encryption.sql section 22.6: ENCRYPTED BACKUPS - WHICH CERT / ALGORITHM
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+SELECT TOP (50) bs.database_name, bs.type, bs.backup_finish_date,
+       bs.key_algorithm, bs.encryptor_type, bs.encryptor_thumbprint,
+       c.name AS certificate_name,
+       CASE WHEN dek.database_id IS NOT NULL THEN ''TDE'' ELSE '''' END AS db_is_tde
+FROM msdb.dbo.backupset AS bs
+LEFT JOIN master.sys.certificates AS c ON c.thumbprint = bs.encryptor_thumbprint
+LEFT JOIN sys.dm_database_encryption_keys AS dek ON dek.database_id = DB_ID(bs.database_name) AND dek.encryption_state = 3
+ORDER BY bs.backup_finish_date DESC;
+';
 GO
 
 /* 22.7  ALWAYS ON + TDE: CERT THUMBPRINTS TO COMPARE ACROSS REPLICAS   (22_tde_encryption.sql) */
 EXEC dbo.HC_usp_deploy
     @name = N'HC_tde_cert_thumbprints', @section = N'22.7', @source_file = N'22_tde_encryption.sql',
     @title = N'ALWAYS ON + TDE: CERT THUMBPRINTS TO COMPARE ACROSS REPLICAS', @tags = N'BOX',
-    @usage = N'EXEC dbo.HC_tde_cert_thumbprints;',
+    @usage = N'SELECT * FROM dbo.HC_tde_cert_thumbprints;',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_tde_cert_thumbprints
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_tde_cert_thumbprints;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_tde_cert_thumbprints',
+    @definition = N'ALTER VIEW dbo.HC_tde_cert_thumbprints
 AS
 -- Toolkit 22_tde_encryption.sql section 22.7: ALWAYS ON + TDE: CERT THUMBPRINTS TO COMPARE ACROSS REPLICAS
-SET NOCOUNT ON;
 SELECT @@SERVERNAME AS replica, DB_NAME(dek.database_id) AS database_name,
        dek.encryptor_thumbprint,
        c.name AS cert_on_this_replica,
@@ -6568,7 +11661,21 @@ FROM sys.dm_database_encryption_keys AS dek
 LEFT JOIN master.sys.certificates AS c ON c.thumbprint = dek.encryptor_thumbprint
 WHERE dek.database_id > 4;
 ',
-    @fallback_definition = NULL;
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_tde_cert_thumbprints
+AS
+-- Toolkit 22_tde_encryption.sql section 22.7: ALWAYS ON + TDE: CERT THUMBPRINTS TO COMPARE ACROSS REPLICAS
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+SELECT @@SERVERNAME AS replica, DB_NAME(dek.database_id) AS database_name,
+       dek.encryptor_thumbprint,
+       c.name AS cert_on_this_replica,
+       CASE WHEN c.thumbprint IS NULL THEN ''MISSING ON THIS REPLICA'' ELSE ''OK'' END AS status
+FROM sys.dm_database_encryption_keys AS dek
+LEFT JOIN master.sys.certificates AS c ON c.thumbprint = dek.encryptor_thumbprint
+WHERE dek.database_id > 4;
+';
 GO
 
 /* 22.8  EKM / AZURE KEY VAULT (customer-managed keys)   (22_tde_encryption.sql) */
@@ -6578,10 +11685,21 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ekm_akv;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ekm_akv;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM sys.cryptographic_providers
+--#HC_NEXT_RESULT#
+SELECT name, algorithm_desc, key_length, provider_type, thumbprint, cryptographic_provider_guid
+FROM master.sys.asymmetric_keys
+--#HC_NEXT_RESULT#
+SELECT name, credential_identity, target_type FROM sys.credentials',
     @definition = N'ALTER PROCEDURE dbo.HC_ekm_akv
 AS
 -- Toolkit 22_tde_encryption.sql section 22.8: EKM / AZURE KEY VAULT (customer-managed keys)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT * FROM sys.cryptographic_providers;
 SELECT name, algorithm_desc, key_length, provider_type, thumbprint, cryptographic_provider_guid
 FROM master.sys.asymmetric_keys;
@@ -6597,16 +11715,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_always_encrypted @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_always_encrypted @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_always_encrypted
     @database_name sysname = NULL
 AS
 -- Toolkit 22_tde_encryption.sql section 22.9: ALWAYS ENCRYPTED INVENTORY - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
        c.name AS column_name, c.encryption_type_desc, c.encryption_algorithm_name,
        cek.name AS column_encryption_key
 FROM sys.columns AS c
@@ -6619,7 +11740,54 @@ SELECT cmk.name AS column_master_key, cmk.key_store_provider_name, cmk.key_path,
 FROM sys.column_master_keys AS cmk
 LEFT JOIN sys.column_encryption_key_values AS v ON v.column_master_key_id = cmk.column_master_key_id
 LEFT JOIN sys.column_encryption_keys AS cek ON cek.column_encryption_key_id = v.column_encryption_key_id;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6631,22 +11799,82 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_masked_columns @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_masked_columns @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(mc.object_id) + N''.'' + OBJECT_NAME(mc.object_id) AS table_name,
+       mc.name AS column_name, TYPE_NAME(mc.user_type_id) AS data_type, mc.max_length,
+       mc.masking_function
+FROM sys.masked_columns AS mc
+WHERE mc.is_masked = 1
+ORDER BY table_name, column_name',
     @definition = N'ALTER PROCEDURE dbo.HC_masked_columns
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.1: MASKED COLUMNS
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(mc.object_id) + N''''.'''' + OBJECT_NAME(mc.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(mc.object_id) + N''''.'''' + OBJECT_NAME(mc.object_id) AS table_name,
        mc.name AS column_name, TYPE_NAME(mc.user_type_id) AS data_type, mc.max_length,
        mc.masking_function
 FROM sys.masked_columns AS mc
 WHERE mc.is_masked = 1
 ORDER BY table_name, column_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(mc.object_id) + N''''.'''' + OBJECT_NAME(mc.object_id) AS table_name,
+       mc.name AS column_name, TYPE_NAME(mc.user_type_id) AS data_type, mc.max_length,
+       mc.masking_function
+FROM sys.masked_columns AS mc
+WHERE mc.is_masked = 1
+ORDER BY table_name, column_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6658,16 +11886,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_unmask_permissions @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_unmask_permissions @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_unmask_permissions
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.2: WHO CAN SEE UNMASKED DATA
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT pr.name AS principal_name, pr.type_desc, pe.state_desc, pe.permission_name, pe.class_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT pr.name AS principal_name, pr.type_desc, pe.state_desc, pe.permission_name, pe.class_desc,
        CASE pe.class WHEN 0 THEN N''''DATABASE''''
                      WHEN 1 THEN OBJECT_SCHEMA_NAME(pe.major_id) + N''''.'''' + OBJECT_NAME(pe.major_id)
                                  + ISNULL(N''''.'''' + COL_NAME(pe.major_id, NULLIF(pe.minor_id, 0)), N'''''''')
@@ -6681,7 +11912,54 @@ SELECT m.name AS db_owner_member, m.type_desc
 FROM sys.database_role_members AS drm
 JOIN sys.database_principals AS r ON r.principal_id = drm.role_principal_id AND r.name = N''''db_owner''''
 JOIN sys.database_principals AS m ON m.principal_id = drm.member_principal_id;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6693,16 +11971,32 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_unmasked_sensitive_cols @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_unmasked_sensitive_cols @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''.'' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type,
+       CASE WHEN mc.is_masked = 1 THEN ''MASKED'' ELSE ''not masked'' END AS mask_status,
+       CASE WHEN c.encryption_type IS NOT NULL THEN ''ALWAYS ENCRYPTED'' ELSE '''' END AS ae_status
+FROM sys.columns AS c
+JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
+LEFT JOIN sys.masked_columns AS mc ON mc.object_id = c.object_id AND mc.column_id = c.column_id
+WHERE c.name LIKE N''%email%''  OR c.name LIKE N''%phone%''   OR c.name LIKE N''%mobile%''
+   OR c.name LIKE N''%ssn%''    OR c.name LIKE N''%pan%''     OR c.name LIKE N''%aadhaar%''
+   OR c.name LIKE N''%passport%'' OR c.name LIKE N''%card%''  OR c.name LIKE N''%account%''
+   OR c.name LIKE N''%iban%''   OR c.name LIKE N''%salary%''  OR c.name LIKE N''%dob%''
+   OR c.name LIKE N''%birth%''  OR c.name LIKE N''%address%'' OR c.name LIKE N''%password%''
+   OR c.name LIKE N''%tax%''    OR c.name LIKE N''%national%''
+ORDER BY mask_status DESC, table_name, column_name',
     @definition = N'ALTER PROCEDURE dbo.HC_unmasked_sensitive_cols
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.4: POSSIBLY SENSITIVE COLUMNS NOT MASKED (name-based finder)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
        c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type,
        CASE WHEN mc.is_masked = 1 THEN ''''MASKED'''' ELSE ''''not masked'''' END AS mask_status,
        CASE WHEN c.encryption_type IS NOT NULL THEN ''''ALWAYS ENCRYPTED'''' ELSE '''''''' END AS ae_status
@@ -6716,7 +12010,67 @@ WHERE c.name LIKE N''''%email%''''  OR c.name LIKE N''''%phone%''''   OR c.name 
    OR c.name LIKE N''''%birth%''''  OR c.name LIKE N''''%address%'''' OR c.name LIKE N''''%password%''''
    OR c.name LIKE N''''%tax%''''    OR c.name LIKE N''''%national%''''
 ORDER BY mask_status DESC, table_name, column_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS column_name, TYPE_NAME(c.user_type_id) AS data_type,
+       CASE WHEN mc.is_masked = 1 THEN ''''MASKED'''' ELSE ''''not masked'''' END AS mask_status,
+       CASE WHEN c.encryption_type IS NOT NULL THEN ''''ALWAYS ENCRYPTED'''' ELSE '''''''' END AS ae_status
+FROM sys.columns AS c
+JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
+LEFT JOIN sys.masked_columns AS mc ON mc.object_id = c.object_id AND mc.column_id = c.column_id
+WHERE c.name LIKE N''''%email%''''  OR c.name LIKE N''''%phone%''''   OR c.name LIKE N''''%mobile%''''
+   OR c.name LIKE N''''%ssn%''''    OR c.name LIKE N''''%pan%''''     OR c.name LIKE N''''%aadhaar%''''
+   OR c.name LIKE N''''%passport%'''' OR c.name LIKE N''''%card%''''  OR c.name LIKE N''''%account%''''
+   OR c.name LIKE N''''%iban%''''   OR c.name LIKE N''''%salary%''''  OR c.name LIKE N''''%dob%''''
+   OR c.name LIKE N''''%birth%''''  OR c.name LIKE N''''%address%'''' OR c.name LIKE N''''%password%''''
+   OR c.name LIKE N''''%tax%''''    OR c.name LIKE N''''%national%''''
+ORDER BY mask_status DESC, table_name, column_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6728,22 +12082,82 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_rls_policies @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_rls_policies @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, sp.name AS policy_name, sp.is_enabled, sp.is_schema_bound,
+       OBJECT_SCHEMA_NAME(pr.target_object_id) + N''.'' + OBJECT_NAME(pr.target_object_id) AS target_table,
+       pr.predicate_type_desc, pr.operation_desc, pr.predicate_definition
+FROM sys.security_policies AS sp
+JOIN sys.security_predicates AS pr ON pr.object_id = sp.object_id
+ORDER BY policy_name, target_table',
     @definition = N'ALTER PROCEDURE dbo.HC_rls_policies
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.6: ROW-LEVEL SECURITY POLICIES & PREDICATES
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT sp.name AS policy_name, sp.is_enabled, sp.is_schema_bound,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT sp.name AS policy_name, sp.is_enabled, sp.is_schema_bound,
        OBJECT_SCHEMA_NAME(pr.target_object_id) + N''''.'''' + OBJECT_NAME(pr.target_object_id) AS target_table,
        pr.predicate_type_desc, pr.operation_desc, pr.predicate_definition
 FROM sys.security_policies AS sp
 JOIN sys.security_predicates AS pr ON pr.object_id = sp.object_id
 ORDER BY policy_name, target_table;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, sp.name AS policy_name, sp.is_enabled, sp.is_schema_bound,
+       OBJECT_SCHEMA_NAME(pr.target_object_id) + N''''.'''' + OBJECT_NAME(pr.target_object_id) AS target_table,
+       pr.predicate_type_desc, pr.operation_desc, pr.predicate_definition
+FROM sys.security_policies AS sp
+JOIN sys.security_predicates AS pr ON pr.object_id = sp.object_id
+ORDER BY policy_name, target_table'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6755,21 +12169,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_data_classification @database_name = N''YourDB'';',
     @min_version = 15,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_data_classification @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(sc.major_id) + N''.'' + OBJECT_NAME(sc.major_id) AS table_name,
+       COL_NAME(sc.major_id, sc.minor_id) AS column_name,
+       sc.label, sc.information_type, sc.rank_desc
+FROM sys.sensitivity_classifications AS sc
+ORDER BY sc.rank DESC, table_name',
     @definition = N'ALTER PROCEDURE dbo.HC_data_classification
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.7: DATA CLASSIFICATION / SENSITIVITY LABELS (2019+, Azure)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(sc.major_id) + N''''.'''' + OBJECT_NAME(sc.major_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(sc.major_id) + N''''.'''' + OBJECT_NAME(sc.major_id) AS table_name,
        COL_NAME(sc.major_id, sc.minor_id) AS column_name,
        sc.label, sc.information_type, sc.rank_desc
 FROM sys.sensitivity_classifications AS sc
 ORDER BY sc.rank DESC, table_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(sc.major_id) + N''''.'''' + OBJECT_NAME(sc.major_id) AS table_name,
+       COL_NAME(sc.major_id, sc.minor_id) AS column_name,
+       sc.label, sc.information_type, sc.rank_desc
+FROM sys.sensitivity_classifications AS sc
+ORDER BY sc.rank DESC, table_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6781,16 +12253,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_protection_summary @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_protection_summary @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(t.object_id) + N''.'' + t.name AS table_name,
+       (SELECT COUNT(*) FROM sys.masked_columns mc WHERE mc.object_id = t.object_id AND mc.is_masked = 1)   AS masked_cols,
+       (SELECT COUNT(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.encryption_type IS NOT NULL) AS always_encrypted_cols,
+       (SELECT COUNT(*) FROM sys.sensitivity_classifications s WHERE s.major_id = t.object_id)             AS classified_cols,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.security_predicates p WHERE p.target_object_id = t.object_id)
+            THEN ''Yes'' ELSE ''No'' END AS has_rls
+FROM sys.tables AS t
+WHERE t.is_ms_shipped = 0
+ORDER BY masked_cols + always_encrypted_cols + classified_cols DESC, table_name',
     @definition = N'ALTER PROCEDURE dbo.HC_protection_summary
     @database_name sysname = NULL
 AS
 -- Toolkit 23_data_masking_rls_classification.sql section 23.8: PROTECTION SUMMARY PER TABLE
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + t.name AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + t.name AS table_name,
        (SELECT COUNT(*) FROM sys.masked_columns mc WHERE mc.object_id = t.object_id AND mc.is_masked = 1)   AS masked_cols,
        (SELECT COUNT(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.encryption_type IS NOT NULL) AS always_encrypted_cols,
        (SELECT COUNT(*) FROM sys.sensitivity_classifications s WHERE s.major_id = t.object_id)             AS classified_cols,
@@ -6799,7 +12282,62 @@ DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N'''
 FROM sys.tables AS t
 WHERE t.is_ms_shipped = 0
 ORDER BY masked_cols + always_encrypted_cols + classified_cols DESC, table_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + t.name AS table_name,
+       (SELECT COUNT(*) FROM sys.masked_columns mc WHERE mc.object_id = t.object_id AND mc.is_masked = 1)   AS masked_cols,
+       (SELECT COUNT(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.encryption_type IS NOT NULL) AS always_encrypted_cols,
+       (SELECT COUNT(*) FROM sys.sensitivity_classifications s WHERE s.major_id = t.object_id)             AS classified_cols,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.security_predicates p WHERE p.target_object_id = t.object_id)
+            THEN ''''Yes'''' ELSE ''''No'''' END AS has_rls
+FROM sys.tables AS t
+WHERE t.is_ms_shipped = 0
+ORDER BY masked_cols + always_encrypted_cols + classified_cols DESC, table_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6811,16 +12349,34 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_missing_indexes_per_table @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_missing_indexes_per_table @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name,
+    mid.statement AS table_name,
+    COUNT(*) OVER (PARTITION BY mid.object_id)                                 AS suggestions_on_table,
+    mid.equality_columns, mid.inequality_columns, mid.included_columns,
+    migs.user_seeks + migs.user_scans                                          AS uses,
+    CAST(migs.avg_user_impact AS decimal(5,1))                                 AS avg_impact_pct,
+    CAST(migs.avg_total_user_cost * migs.avg_user_impact / 100.0
+         * (migs.user_seeks + migs.user_scans) AS decimal(18,0))               AS score,
+    (SELECT COUNT(*) FROM sys.indexes i WHERE i.object_id = mid.object_id AND i.index_id > 0) AS existing_indexes
+FROM sys.dm_db_missing_index_details     AS mid
+JOIN sys.dm_db_missing_index_groups      AS mig  ON mig.index_handle = mid.index_handle
+JOIN sys.dm_db_missing_index_group_stats AS migs ON migs.group_handle = mig.index_group_handle
+WHERE mid.database_id = DB_ID()
+ORDER BY SUM(migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans))
+             OVER (PARTITION BY mid.object_id) DESC,
+         mid.statement, mid.equality_columns',
     @definition = N'ALTER PROCEDURE dbo.HC_missing_indexes_per_table
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.1: MISSING INDEXES CONSOLIDATED PER TABLE - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT
     mid.statement AS table_name,
     COUNT(*) OVER (PARTITION BY mid.object_id)                                 AS suggestions_on_table,
     mid.equality_columns, mid.inequality_columns, mid.included_columns,
@@ -6836,7 +12392,69 @@ WHERE mid.database_id = DB_ID()
 ORDER BY SUM(migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans))
              OVER (PARTITION BY mid.object_id) DESC,
          mid.statement, mid.equality_columns;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name,
+    mid.statement AS table_name,
+    COUNT(*) OVER (PARTITION BY mid.object_id)                                 AS suggestions_on_table,
+    mid.equality_columns, mid.inequality_columns, mid.included_columns,
+    migs.user_seeks + migs.user_scans                                          AS uses,
+    CAST(migs.avg_user_impact AS decimal(5,1))                                 AS avg_impact_pct,
+    CAST(migs.avg_total_user_cost * migs.avg_user_impact / 100.0
+         * (migs.user_seeks + migs.user_scans) AS decimal(18,0))               AS score,
+    (SELECT COUNT(*) FROM sys.indexes i WHERE i.object_id = mid.object_id AND i.index_id > 0) AS existing_indexes
+FROM sys.dm_db_missing_index_details     AS mid
+JOIN sys.dm_db_missing_index_groups      AS mig  ON mig.index_handle = mid.index_handle
+JOIN sys.dm_db_missing_index_group_stats AS migs ON migs.group_handle = mig.index_group_handle
+WHERE mid.database_id = DB_ID()
+ORDER BY SUM(migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans))
+             OVER (PARTITION BY mid.object_id) DESC,
+         mid.statement, mid.equality_columns'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6848,17 +12466,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_index_column_map @database_name = N''YourDB'', @table = N''dbo.YourTable'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_index_column_map @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @table sysname = N''dbo.YourTable'';
+SELECT DB_NAME() AS database_name, i.name AS index_name, i.type_desc, ic.key_ordinal, c.name AS column_name,
+       CASE WHEN ic.is_included_column = 1 THEN ''INCLUDE'' ELSE ''KEY'' END AS role,
+       ic.is_descending_key, TYPE_NAME(c.user_type_id) AS data_type, c.max_length
+FROM sys.indexes AS i
+JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.object_id = OBJECT_ID(@table)
+ORDER BY i.index_id, ic.is_included_column, ic.key_ordinal, c.name',
     @definition = N'ALTER PROCEDURE dbo.HC_index_column_map
     @database_name sysname = NULL,
     @table sysname = N''dbo.YourTable''
 AS
 -- Toolkit 24_index_tuning.sql section 24.2: EXISTING INDEX COLUMN MAP FOR A TABLE (compare with 24.1)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT i.name AS index_name, i.type_desc, ic.key_ordinal, c.name AS column_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT i.name AS index_name, i.type_desc, ic.key_ordinal, c.name AS column_name,
        CASE WHEN ic.is_included_column = 1 THEN ''''INCLUDE'''' ELSE ''''KEY'''' END AS role,
        ic.is_descending_key, TYPE_NAME(c.user_type_id) AS data_type, c.max_length
 FROM sys.indexes AS i
@@ -6866,7 +12495,61 @@ JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.i
 JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 WHERE i.object_id = OBJECT_ID(@table)
 ORDER BY i.index_id, ic.is_included_column, ic.key_ordinal, c.name;'';
-EXEC @hc_exec @hc_sql, N''@table sysname'', @table = @table;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, i.name AS index_name, i.type_desc, ic.key_ordinal, c.name AS column_name,
+       CASE WHEN ic.is_included_column = 1 THEN ''''INCLUDE'''' ELSE ''''KEY'''' END AS role,
+       ic.is_descending_key, TYPE_NAME(c.user_type_id) AS data_type, c.max_length
+FROM sys.indexes AS i
+JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.object_id = OBJECT_ID(@table)
+ORDER BY i.index_id, ic.is_included_column, ic.key_ordinal, c.name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@table sysname'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @table = @table;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @table = @table;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6878,10 +12561,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_key_lookups;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_key_lookups;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_key_lookups
 AS
 -- Toolkit 24_index_tuning.sql section 24.3: KEY / RID LOOKUPS IN CACHED PLANS (covering index candidates)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan''),
 lookups AS (
     SELECT TOP (500) qs.plan_handle, qs.execution_count, qs.total_logical_reads, qs.total_worker_time,
@@ -6915,10 +12604,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_scans_in_cache;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_scans_in_cache;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_scans_in_cache
 AS
 -- Toolkit 24_index_tuning.sql section 24.4: TABLE / CLUSTERED INDEX SCANS IN CACHED PLANS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH XMLNAMESPACES (DEFAULT ''http://schemas.microsoft.com/sqlserver/2004/07/showplan'')
 SELECT TOP (50)
     qs.execution_count, qs.total_logical_reads / qs.execution_count AS avg_reads,
@@ -6946,16 +12641,48 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_fk_without_index @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_fk_without_index @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'WITH fk_cols AS (
+    SELECT fk.object_id AS fk_id, fk.name AS fk_name, fk.parent_object_id,
+           cols = STUFF((SELECT N'','' + QUOTENAME(c.name)
+                         FROM sys.foreign_key_columns AS fkc
+                         JOIN sys.columns AS c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id
+                         WHERE fkc.constraint_object_id = fk.object_id
+                         ORDER BY fkc.constraint_column_id
+                         FOR XML PATH(''''), TYPE).value(''.'', ''nvarchar(max)''), 1, 1, N'''')
+    FROM sys.foreign_keys AS fk
+), idx_cols AS (
+    SELECT i.object_id, i.index_id,
+           cols = STUFF((SELECT N'','' + QUOTENAME(c.name)
+                         FROM sys.index_columns AS ic
+                         JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+                         ORDER BY ic.key_ordinal
+                         FOR XML PATH(''''), TYPE).value(''.'', ''nvarchar(max)''), 1, 1, N'''')
+    FROM sys.indexes AS i
+    WHERE i.index_id > 0 AND i.is_disabled = 0
+)
+SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(f.parent_object_id) + N''.'' + OBJECT_NAME(f.parent_object_id) AS child_table,
+       f.fk_name, f.cols AS fk_columns,
+       N''CREATE INDEX '' + QUOTENAME(N''IX_'' + OBJECT_NAME(f.parent_object_id) + N''_'' + REPLACE(REPLACE(REPLACE(f.cols, N''['', N''''), N'']'', N''''), N'','', N''_''))
+         + N'' ON '' + QUOTENAME(OBJECT_SCHEMA_NAME(f.parent_object_id)) + N''.'' + QUOTENAME(OBJECT_NAME(f.parent_object_id))
+         + N'' ('' + f.cols + N'');'' AS suggested_index
+FROM fk_cols AS f
+WHERE NOT EXISTS (SELECT 1 FROM idx_cols AS ix
+                  WHERE ix.object_id = f.parent_object_id
+                    AND (ix.cols = f.cols OR ix.cols LIKE f.cols + N'',%''))
+ORDER BY child_table',
     @definition = N'ALTER PROCEDURE dbo.HC_fk_without_index
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.5: FOREIGN KEYS WITHOUT A SUPPORTING INDEX - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH fk_cols AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH fk_cols AS (
     SELECT fk.object_id AS fk_id, fk.name AS fk_name, fk.parent_object_id,
            cols = STUFF((SELECT N'''','''' + QUOTENAME(c.name)
                          FROM sys.foreign_key_columns AS fkc
@@ -6985,7 +12712,83 @@ WHERE NOT EXISTS (SELECT 1 FROM idx_cols AS ix
                   WHERE ix.object_id = f.parent_object_id
                     AND (ix.cols = f.cols OR ix.cols LIKE f.cols + N'''',%''''))
 ORDER BY child_table;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''WITH fk_cols AS (
+    SELECT fk.object_id AS fk_id, fk.name AS fk_name, fk.parent_object_id,
+           cols = STUFF((SELECT N'''','''' + QUOTENAME(c.name)
+                         FROM sys.foreign_key_columns AS fkc
+                         JOIN sys.columns AS c ON c.object_id = fkc.parent_object_id AND c.column_id = fkc.parent_column_id
+                         WHERE fkc.constraint_object_id = fk.object_id
+                         ORDER BY fkc.constraint_column_id
+                         FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 1, N'''''''')
+    FROM sys.foreign_keys AS fk
+), idx_cols AS (
+    SELECT i.object_id, i.index_id,
+           cols = STUFF((SELECT N'''','''' + QUOTENAME(c.name)
+                         FROM sys.index_columns AS ic
+                         JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+                         ORDER BY ic.key_ordinal
+                         FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 1, N'''''''')
+    FROM sys.indexes AS i
+    WHERE i.index_id > 0 AND i.is_disabled = 0
+)
+SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(f.parent_object_id) + N''''.'''' + OBJECT_NAME(f.parent_object_id) AS child_table,
+       f.fk_name, f.cols AS fk_columns,
+       N''''CREATE INDEX '''' + QUOTENAME(N''''IX_'''' + OBJECT_NAME(f.parent_object_id) + N''''_'''' + REPLACE(REPLACE(REPLACE(f.cols, N''''['''', N''''''''), N'''']'''', N''''''''), N'''','''', N''''_''''))
+         + N'''' ON '''' + QUOTENAME(OBJECT_SCHEMA_NAME(f.parent_object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(f.parent_object_id))
+         + N'''' ('''' + f.cols + N'''');'''' AS suggested_index
+FROM fk_cols AS f
+WHERE NOT EXISTS (SELECT 1 FROM idx_cols AS ix
+                  WHERE ix.object_id = f.parent_object_id
+                    AND (ix.cols = f.cols OR ix.cols LIKE f.cols + N'''',%''''))
+ORDER BY child_table'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -6997,16 +12800,35 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_clustered_key_review @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_clustered_key_review @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(i.object_id) + N''.'' + OBJECT_NAME(i.object_id) AS table_name,
+       i.name AS clustered_index, i.is_unique,
+       COUNT(*)                         AS key_columns,
+       SUM(c.max_length)                AS key_bytes,
+       MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''uniqueidentifier'' THEN 1 ELSE 0 END) AS has_guid_key,
+       MAX(CAST(c.is_nullable AS int))  AS has_nullable_key,
+       CASE WHEN SUM(c.max_length) > 16 THEN ''WIDE KEY; '' ELSE '''' END
+     + CASE WHEN MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''uniqueidentifier'' THEN 1 ELSE 0 END) = 1 THEN ''GUID KEY (use NEWSEQUENTIALID or other key); '' ELSE '''' END
+     + CASE WHEN i.is_unique = 0 THEN ''NOT UNIQUE; '' ELSE '''' END AS findings
+FROM sys.indexes AS i
+JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.type = 1 AND OBJECTPROPERTY(i.object_id, ''IsUserTable'') = 1
+GROUP BY i.object_id, i.name, i.is_unique
+HAVING SUM(c.max_length) > 16 OR i.is_unique = 0
+    OR MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''uniqueidentifier'' THEN 1 ELSE 0 END) = 1
+ORDER BY key_bytes DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_clustered_key_review
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.6: CLUSTERED INDEX KEY REVIEW - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
        i.name AS clustered_index, i.is_unique,
        COUNT(*)                         AS key_columns,
        SUM(c.max_length)                AS key_bytes,
@@ -7023,7 +12845,70 @@ GROUP BY i.object_id, i.name, i.is_unique
 HAVING SUM(c.max_length) > 16 OR i.is_unique = 0
     OR MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''''uniqueidentifier'''' THEN 1 ELSE 0 END) = 1
 ORDER BY key_bytes DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
+       i.name AS clustered_index, i.is_unique,
+       COUNT(*)                         AS key_columns,
+       SUM(c.max_length)                AS key_bytes,
+       MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''''uniqueidentifier'''' THEN 1 ELSE 0 END) AS has_guid_key,
+       MAX(CAST(c.is_nullable AS int))  AS has_nullable_key,
+       CASE WHEN SUM(c.max_length) > 16 THEN ''''WIDE KEY; '''' ELSE '''''''' END
+     + CASE WHEN MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''''uniqueidentifier'''' THEN 1 ELSE 0 END) = 1 THEN ''''GUID KEY (use NEWSEQUENTIALID or other key); '''' ELSE '''''''' END
+     + CASE WHEN i.is_unique = 0 THEN ''''NOT UNIQUE; '''' ELSE '''''''' END AS findings
+FROM sys.indexes AS i
+JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.type = 1 AND OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
+GROUP BY i.object_id, i.name, i.is_unique
+HAVING SUM(c.max_length) > 16 OR i.is_unique = 0
+    OR MAX(CASE WHEN TYPE_NAME(c.user_type_id) = N''''uniqueidentifier'''' THEN 1 ELSE 0 END) = 1
+ORDER BY key_bytes DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7035,16 +12920,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_over_indexed_tables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_over_indexed_tables @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_over_indexed_tables
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.7: OVER-INDEXED & WIDE INDEXES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) AS table_name,
        COUNT(*) AS nc_index_count,
        SUM(ISNULL(us.user_updates, 0)) AS total_index_writes,
        SUM(ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0)) AS total_index_reads
@@ -7067,7 +12955,54 @@ GROUP BY i.object_id, i.name
 HAVING SUM(CASE WHEN ic.is_included_column = 0 THEN 1 ELSE 0 END) > 5
     OR SUM(CASE WHEN ic.is_included_column = 1 THEN 1 ELSE 0 END) > 10
 ORDER BY key_cols + included_cols DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7079,16 +13014,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_page_splits @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_page_splits @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_page_splits
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.8: PAGE SPLITS (instance counter + per-index "bad" splits)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT RTRIM(counter_name) AS counter_name, cntr_value
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT RTRIM(counter_name) AS counter_name, cntr_value
 FROM sys.dm_os_performance_counters
 WHERE counter_name IN (N''''Page Splits/sec'''', N''''Batch Requests/sec'''');
 
@@ -7103,7 +13041,54 @@ FROM sys.dm_db_index_operational_stats(DB_ID(), NULL, NULL, NULL) AS os
 JOIN sys.indexes AS i ON i.object_id = os.object_id AND i.index_id = os.index_id
 WHERE OBJECTPROPERTY(os.object_id, ''''IsUserTable'''') = 1 AND os.leaf_allocation_count > 0
 ORDER BY os.leaf_allocation_count DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7115,21 +13100,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_fill_factors @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_fill_factors @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''.'' + OBJECT_NAME(object_id) AS table_name,
+       name AS index_name, type_desc, fill_factor, is_padded
+FROM sys.indexes
+WHERE fill_factor NOT IN (0, 100) AND OBJECTPROPERTY(object_id, ''IsUserTable'') = 1
+ORDER BY fill_factor',
     @definition = N'ALTER PROCEDURE dbo.HC_fill_factors
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.9: NON-DEFAULT FILL FACTORS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
        name AS index_name, type_desc, fill_factor, is_padded
 FROM sys.indexes
 WHERE fill_factor NOT IN (0, 100) AND OBJECTPROPERTY(object_id, ''''IsUserTable'''') = 1
 ORDER BY fill_factor;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
+       name AS index_name, type_desc, fill_factor, is_padded
+FROM sys.indexes
+WHERE fill_factor NOT IN (0, 100) AND OBJECTPROPERTY(object_id, ''''IsUserTable'''') = 1
+ORDER BY fill_factor'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7141,16 +13184,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compression_candidates @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_compression_candidates @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_compression_candidates
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.10: COMPRESSION CANDIDATES - LARGE UNCOMPRESSED INDEXES
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (25)
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (25)
     OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id) AS table_name,
     i.name AS index_name, i.index_id, p.data_compression_desc,
     SUM(p.rows) AS rows,
@@ -7164,7 +13210,54 @@ JOIN sys.dm_db_partition_stats AS ps ON ps.partition_id = p.partition_id
 WHERE p.data_compression = 0 AND OBJECTPROPERTY(p.object_id, ''''IsUserTable'''') = 1
 GROUP BY p.object_id, i.name, i.index_id, p.data_compression_desc
 ORDER BY used_mb DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7176,16 +13269,32 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_partitions @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_partitions @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(p.object_id) + N''.'' + OBJECT_NAME(p.object_id) AS table_name,
+       i.name AS index_name, ps.name AS partition_scheme, pf.name AS partition_function,
+       p.partition_number, prv.value AS boundary_value, pf.boundary_value_on_right,
+       fg.name AS filegroup, p.rows, p.data_compression_desc
+FROM sys.partitions AS p
+JOIN sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
+JOIN sys.partition_schemes AS ps ON ps.data_space_id = i.data_space_id
+JOIN sys.partition_functions AS pf ON pf.function_id = ps.function_id
+LEFT JOIN sys.partition_range_values AS prv ON prv.function_id = pf.function_id
+      AND prv.boundary_id = p.partition_number - CASE WHEN pf.boundary_value_on_right = 1 THEN 1 ELSE 0 END
+JOIN sys.destination_data_spaces AS dds ON dds.partition_scheme_id = ps.data_space_id AND dds.destination_id = p.partition_number
+JOIN sys.filegroups AS fg ON fg.data_space_id = dds.data_space_id
+WHERE i.index_id IN (0, 1)
+ORDER BY table_name, p.partition_number',
     @definition = N'ALTER PROCEDURE dbo.HC_partitions
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.11: PARTITIONED TABLES - BOUNDARIES & ROWS PER PARTITION
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id) AS table_name,
        i.name AS index_name, ps.name AS partition_scheme, pf.name AS partition_function,
        p.partition_number, prv.value AS boundary_value, pf.boundary_value_on_right,
        fg.name AS filegroup, p.rows, p.data_compression_desc
@@ -7199,7 +13308,67 @@ JOIN sys.destination_data_spaces AS dds ON dds.partition_scheme_id = ps.data_spa
 JOIN sys.filegroups AS fg ON fg.data_space_id = dds.data_space_id
 WHERE i.index_id IN (0, 1)
 ORDER BY table_name, p.partition_number;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(p.object_id) + N''''.'''' + OBJECT_NAME(p.object_id) AS table_name,
+       i.name AS index_name, ps.name AS partition_scheme, pf.name AS partition_function,
+       p.partition_number, prv.value AS boundary_value, pf.boundary_value_on_right,
+       fg.name AS filegroup, p.rows, p.data_compression_desc
+FROM sys.partitions AS p
+JOIN sys.indexes AS i ON i.object_id = p.object_id AND i.index_id = p.index_id
+JOIN sys.partition_schemes AS ps ON ps.data_space_id = i.data_space_id
+JOIN sys.partition_functions AS pf ON pf.function_id = ps.function_id
+LEFT JOIN sys.partition_range_values AS prv ON prv.function_id = pf.function_id
+      AND prv.boundary_id = p.partition_number - CASE WHEN pf.boundary_value_on_right = 1 THEN 1 ELSE 0 END
+JOIN sys.destination_data_spaces AS dds ON dds.partition_scheme_id = ps.data_space_id AND dds.destination_id = p.partition_number
+JOIN sys.filegroups AS fg ON fg.data_space_id = dds.data_space_id
+WHERE i.index_id IN (0, 1)
+ORDER BY table_name, p.partition_number'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7211,16 +13380,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_disabled_hypothetical_indexes @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_disabled_hypothetical_indexes @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''.'' + OBJECT_NAME(object_id) AS table_name, name AS index_name,
+       is_disabled, is_hypothetical,
+       CASE WHEN is_hypothetical = 1 THEN N''DROP INDEX '' + QUOTENAME(name) + N'' ON ''
+              + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N''.'' + QUOTENAME(OBJECT_NAME(object_id)) + N'';''
+            ELSE N''ALTER INDEX '' + QUOTENAME(name) + N'' ON ''
+              + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N''.'' + QUOTENAME(OBJECT_NAME(object_id)) + N'' REBUILD;  -- or DROP'' END AS action
+FROM sys.indexes
+WHERE (is_disabled = 1 OR is_hypothetical = 1) AND OBJECTPROPERTY(object_id, ''IsMSShipped'') = 0',
     @definition = N'ALTER PROCEDURE dbo.HC_disabled_hypothetical_indexes
     @database_name sysname = NULL
 AS
 -- Toolkit 24_index_tuning.sql section 24.12: DISABLED & HYPOTHETICAL (leftover DTA) INDEXES
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name, name AS index_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name, name AS index_name,
        is_disabled, is_hypothetical,
        CASE WHEN is_hypothetical = 1 THEN N''''DROP INDEX '''' + QUOTENAME(name) + N'''' ON ''''
               + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(object_id)) + N'''';''''
@@ -7228,7 +13407,61 @@ DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.
               + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(object_id)) + N'''' REBUILD;  -- or DROP'''' END AS action
 FROM sys.indexes
 WHERE (is_disabled = 1 OR is_hypothetical = 1) AND OBJECTPROPERTY(object_id, ''''IsMSShipped'''') = 0;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name, name AS index_name,
+       is_disabled, is_hypothetical,
+       CASE WHEN is_hypothetical = 1 THEN N''''DROP INDEX '''' + QUOTENAME(name) + N'''' ON ''''
+              + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(object_id)) + N'''';''''
+            ELSE N''''ALTER INDEX '''' + QUOTENAME(name) + N'''' ON ''''
+              + QUOTENAME(OBJECT_SCHEMA_NAME(object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(object_id)) + N'''' REBUILD;  -- or DROP'''' END AS action
+FROM sys.indexes
+WHERE (is_disabled = 1 OR is_hypothetical = 1) AND OBJECTPROPERTY(object_id, ''''IsMSShipped'''') = 0'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7237,16 +13470,63 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_ag_alert', @section = N'25.1', @source_file = N'25_alwayson_advanced.sql',
     @title = N'SINGLE ALERT QUERY - RETURNS ROWS ONLY WHEN SOMETHING IS WRONG', @tags = N'BOX',
-    @usage = N'EXEC dbo.HC_ag_alert @max_send_queue_kb = 1048576, @max_redo_queue_kb = 1048576, @max_lag_s = 300;',
+    @usage = N'SELECT * FROM dbo.HC_ag_alert(DEFAULT, DEFAULT, DEFAULT);  -- @max_send_queue_kb = 1048576, @max_redo_queue_kb = 1048576, @max_lag_s = 300',
     @min_version = NULL,
     @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_ag_alert
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_alert(DEFAULT, DEFAULT, DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_alert(DEFAULT, DEFAULT, DEFAULT)',
+    @definition = N'ALTER FUNCTION dbo.HC_ag_alert
+(
+    @max_send_queue_kb bigint = 1048576,
+    @max_redo_queue_kb bigint = 1048576,
+    @max_lag_s int = 300
+)
+RETURNS TABLE
+AS
+-- Toolkit 25_alwayson_advanced.sql section 25.1: SINGLE ALERT QUERY - RETURNS ROWS ONLY WHEN SOMETHING IS WRONG
+RETURN
+(
+SELECT ''AG'' AS level, ag.name AS ag_name, NULL AS replica, NULL AS database_name,
+       ''AG health: '' + ags.synchronization_health_desc AS issue
+FROM sys.dm_hadr_availability_group_states AS ags
+JOIN sys.availability_groups AS ag ON ag.group_id = ags.group_id
+WHERE ags.synchronization_health_desc <> ''HEALTHY''
+UNION ALL
+SELECT ''REPLICA'', ag.name, ar.replica_server_name, NULL,
+       ''Replica '' + ISNULL(ars.connected_state_desc, ''UNKNOWN'') + '' / '' + ISNULL(ars.synchronization_health_desc, ''UNKNOWN'')
+       + ISNULL('' / last error: '' + ars.last_connect_error_description, '''')
+FROM sys.availability_replicas AS ar
+JOIN sys.availability_groups AS ag ON ag.group_id = ar.group_id
+LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id
+WHERE ars.connected_state_desc <> ''CONNECTED'' OR ars.synchronization_health_desc <> ''HEALTHY''
+UNION ALL
+SELECT ''DATABASE'', ag.name, ar.replica_server_name, DB_NAME(drs.database_id),
+       CASE WHEN drs.is_suspended = 1 THEN ''SUSPENDED ('' + drs.suspend_reason_desc + '')''
+            WHEN drs.synchronization_health_desc <> ''HEALTHY'' THEN ''Health: '' + drs.synchronization_health_desc + '' / '' + drs.synchronization_state_desc
+            WHEN drs.log_send_queue_size > @max_send_queue_kb THEN ''Log send queue '' + CAST(drs.log_send_queue_size / 1024 AS varchar(20)) + '' MB''
+            WHEN drs.redo_queue_size > @max_redo_queue_kb THEN ''Redo queue '' + CAST(drs.redo_queue_size / 1024 AS varchar(20)) + '' MB''
+            ELSE ''Secondary lag '' + CAST(drs.secondary_lag_seconds AS varchar(20)) + '' s'' END
+FROM sys.dm_hadr_database_replica_states AS drs
+JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id
+JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
+WHERE drs.is_suspended = 1
+   OR drs.synchronization_health_desc <> ''HEALTHY''
+   OR drs.log_send_queue_size > @max_send_queue_kb
+   OR drs.redo_queue_size > @max_redo_queue_kb
+   OR drs.secondary_lag_seconds > @max_lag_s
+);
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_alert
     @max_send_queue_kb bigint = 1048576,
     @max_redo_queue_kb bigint = 1048576,
     @max_lag_s int = 300
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.1: SINGLE ALERT QUERY - RETURNS ROWS ONLY WHEN SOMETHING IS WRONG
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ''AG'' AS level, ag.name AS ag_name, NULL AS replica, NULL AS database_name,
        ''AG health: '' + ags.synchronization_health_desc AS issue
 FROM sys.dm_hadr_availability_group_states AS ags
@@ -7275,8 +13555,7 @@ WHERE drs.is_suspended = 1
    OR drs.log_send_queue_size > @max_send_queue_kb
    OR drs.redo_queue_size > @max_redo_queue_kb
    OR drs.secondary_lag_seconds > @max_lag_s;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 25.2  "NOT SYNCHRONIZING" TROUBLESHOOTING CHECKLIST   (25_alwayson_advanced.sql) */
@@ -7286,10 +13565,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_not_syncing_checklist;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ag_not_syncing_checklist;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_ag_not_syncing_checklist
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.2: "NOT SYNCHRONIZING" TROUBLESHOOTING CHECKLIST
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, synchronization_state_desc, is_suspended,
        suspend_reason_desc, database_state_desc, last_received_time, last_redone_time
 FROM sys.dm_hadr_database_replica_states
@@ -7314,10 +13599,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_redo_blocked;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ag_redo_blocked;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT r.session_id, r.command, DB_NAME(r.database_id) AS database_name,
+       r.wait_type, r.wait_time, r.blocking_session_id,
+       bs.login_name AS blocker_login, bs.program_name AS blocker_program,
+       bib.event_info AS blocker_sql
+FROM sys.dm_exec_requests AS r
+LEFT JOIN sys.dm_exec_sessions AS bs ON bs.session_id = r.blocking_session_id
+OUTER APPLY sys.dm_exec_input_buffer(r.blocking_session_id, NULL) AS bib
+WHERE r.command IN (N''DB STARTUP'', N''PARALLEL REDO TASK'', N''PARALLEL REDO HELP TASK'')
+ORDER BY r.wait_time DESC
+--#HC_NEXT_RESULT#
+SELECT RTRIM(instance_name) AS database_name, cntr_value AS redo_blocked
+FROM sys.dm_os_performance_counters
+WHERE object_name LIKE N''%Database Replica%'' AND counter_name = N''Redo blocked/sec'' AND cntr_value > 0',
     @definition = N'ALTER PROCEDURE dbo.HC_ag_redo_blocked
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.3: READABLE SECONDARY: REDO BLOCKED BY REPORTING QUERIES
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT r.session_id, r.command, DB_NAME(r.database_id) AS database_name,
        r.wait_type, r.wait_time, r.blocking_session_id,
        bs.login_name AS blocker_login, bs.program_name AS blocker_program,
@@ -7342,10 +13645,25 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ag_secondary_version_store;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ag_secondary_version_store;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT TOP (10) ast.session_id, ast.elapsed_time_seconds, s.login_name, s.program_name,
+       ib.event_info AS sql_text
+FROM sys.dm_tran_active_snapshot_database_transactions AS ast
+JOIN sys.dm_exec_sessions AS s ON s.session_id = ast.session_id
+OUTER APPLY sys.dm_exec_input_buffer(ast.session_id, NULL) AS ib
+ORDER BY ast.elapsed_time_seconds DESC
+--#HC_NEXT_RESULT#
+SELECT DB_NAME(database_id) AS database_name, reserved_page_count * 8 / 1024 AS version_store_mb
+FROM sys.dm_tran_version_store_space_usage
+ORDER BY reserved_page_count DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_ag_secondary_version_store
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.4: READABLE SECONDARY: VERSION STORE / GHOST CLEANUP IMPACT
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (10) ast.session_id, ast.elapsed_time_seconds, s.login_name, s.program_name,
        ib.event_info AS sql_text
 FROM sys.dm_tran_active_snapshot_database_transactions AS ast
@@ -7367,6 +13685,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_commit_latency;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_commit_latency;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_commit_latency',
     @definition = N'ALTER VIEW dbo.HC_ag_commit_latency
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.5: COMMIT LATENCY ON THE PRIMARY (sync replicas)
@@ -7382,6 +13703,9 @@ GROUP BY instance_name;
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.5: COMMIT LATENCY ON THE PRIMARY (sync replicas)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT RTRIM(instance_name) AS database_name,
        MAX(CASE WHEN counter_name = N''Transaction Delay'' THEN cntr_value END)                AS transaction_delay_ms_total,
        MAX(CASE WHEN counter_name = N''Mirrored Write Transactions/sec'' THEN cntr_value END)  AS mirrored_write_tx_total
@@ -7399,10 +13723,29 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_distributed_ags;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_distributed_ags;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT ag.name AS distributed_ag, ar.replica_server_name AS member_ag,
+       ar.endpoint_url AS listener_url, ar.availability_mode_desc, ar.failover_mode_desc,
+       ar.seeding_mode_desc, ars.role_desc, ars.connected_state_desc, ars.synchronization_health_desc
+FROM sys.availability_groups AS ag
+JOIN sys.availability_replicas AS ar ON ar.group_id = ag.group_id
+LEFT JOIN sys.dm_hadr_availability_replica_states AS ars ON ars.replica_id = ar.replica_id
+WHERE ag.is_distributed = 1
+--#HC_NEXT_RESULT#
+SELECT ag.name AS distributed_ag, DB_NAME(drs.database_id) AS database_name,
+       drs.synchronization_state_desc, drs.log_send_queue_size, drs.redo_queue_size,
+       drs.last_hardened_lsn, drs.last_commit_time
+FROM sys.dm_hadr_database_replica_states AS drs
+JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
+WHERE ag.is_distributed = 1',
     @definition = N'ALTER PROCEDURE dbo.HC_distributed_ags
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.6: DISTRIBUTED AVAILABILITY GROUPS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS distributed_ag, ar.replica_server_name AS member_ag,
        ar.endpoint_url AS listener_url, ar.availability_mode_desc, ar.failover_mode_desc,
        ar.seeding_mode_desc, ars.role_desc, ars.connected_state_desc, ars.synchronization_health_desc
@@ -7428,6 +13771,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_contained_ags_detail;',
     @min_version = 16,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_contained_ags_detail;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_contained_ags_detail',
     @definition = N'ALTER VIEW dbo.HC_contained_ags_detail
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.7: CONTAINED AVAILABILITY GROUPS (2022+)
@@ -7437,6 +13783,9 @@ SELECT name, is_contained, cluster_type_desc FROM sys.availability_groups WHERE 
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.7: CONTAINED AVAILABILITY GROUPS (2022+)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT name, is_contained, cluster_type_desc FROM sys.availability_groups WHERE is_contained = 1;
 ';
 GO
@@ -7448,6 +13797,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_login_drift ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_login_drift;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_login_drift',
     @definition = N'ALTER VIEW dbo.HC_ag_login_drift
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.8: LOGIN DRIFT BETWEEN REPLICAS
@@ -7460,6 +13812,9 @@ WHERE type IN (''S'', ''U'', ''G'') AND name NOT LIKE N''##%'' AND name NOT LIKE
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.8: LOGIN DRIFT BETWEEN REPLICAS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT @@SERVERNAME AS replica, name, type_desc, sid, is_disabled, default_database_name,
        CONVERT(varchar(100), LOGINPROPERTY(name, ''PasswordHash''), 1) AS password_hash
 FROM sys.server_principals
@@ -7475,6 +13830,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_job_drift ORDER BY name;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY j.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_job_drift;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_job_drift',
     @definition = N'ALTER VIEW dbo.HC_ag_job_drift
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.9: JOB DRIFT BETWEEN REPLICAS + "AM I PRIMARY" JOB GUARD
@@ -7485,6 +13843,9 @@ FROM msdb.dbo.sysjobs AS j;
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.9: JOB DRIFT BETWEEN REPLICAS + "AM I PRIMARY" JOB GUARD
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT @@SERVERNAME AS replica, j.name, j.enabled, j.date_modified
 FROM msdb.dbo.sysjobs AS j
 ORDER BY j.name;
@@ -7498,6 +13859,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_ag_backup_preference;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_backup_preference;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_backup_preference',
     @definition = N'ALTER VIEW dbo.HC_ag_backup_preference
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.10: BACKUP PREFERENCE CHECK PER DATABASE (run on each replica)
@@ -7512,6 +13876,9 @@ JOIN sys.availability_databases_cluster AS adc ON adc.group_id = ag.group_id;
 AS
 -- Toolkit 25_alwayson_advanced.sql section 25.10: BACKUP PREFERENCE CHECK PER DATABASE (run on each replica)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, ag.automated_backup_preference_desc, ar.replica_server_name, ar.backup_priority,
        adc.database_name,
        sys.fn_hadr_backup_is_preferred_replica(adc.database_name) AS backup_here
@@ -7528,10 +13895,20 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_config;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_filestream_config;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT SERVERPROPERTY(''FilestreamConfiguredLevel'') AS configured_level,
+       SERVERPROPERTY(''FilestreamEffectiveLevel'')  AS effective_level,
+       SERVERPROPERTY(''FilestreamShareName'')       AS windows_share_name
+--#HC_NEXT_RESULT#
+SELECT name, value, value_in_use FROM sys.configurations WHERE name = N''filestream access level''',
     @definition = N'ALTER PROCEDURE dbo.HC_filestream_config
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.1: INSTANCE FILESTREAM CONFIGURATION
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT SERVERPROPERTY(''FilestreamConfiguredLevel'') AS configured_level,
        SERVERPROPERTY(''FilestreamEffectiveLevel'')  AS effective_level,
        SERVERPROPERTY(''FilestreamShareName'')       AS windows_share_name;
@@ -7548,10 +13925,25 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_dbs;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_filestream_dbs;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT DB_NAME(fo.database_id) AS database_name,
+       fo.non_transacted_access_desc,
+       fo.directory_name
+FROM sys.database_filestream_options AS fo
+WHERE fo.non_transacted_access <> 0 OR fo.directory_name IS NOT NULL
+--#HC_NEXT_RESULT#
+SELECT DB_NAME(mf.database_id) AS database_name, mf.name AS container_name, mf.physical_name, mf.state_desc
+FROM sys.master_files AS mf
+WHERE mf.type_desc = N''FILESTREAM''
+ORDER BY database_name',
     @definition = N'ALTER PROCEDURE dbo.HC_filestream_dbs
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.2: DATABASES USING FILESTREAM + NON-TRANSACTED ACCESS (FileTable)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(fo.database_id) AS database_name,
        fo.non_transacted_access_desc,
        fo.directory_name
@@ -7573,16 +13965,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_containers @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_filestream_containers @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, fg.name AS filegroup_name, fg.type_desc, fg.is_default,
+       df.name AS container_name, df.physical_name, df.state_desc,
+       CAST(CAST(df.size AS bigint) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
+       CASE df.max_size WHEN -1 THEN ''Unlimited'' ELSE CAST(CAST(df.max_size AS bigint) * 8 / 1024 AS varchar(20)) + '' MB'' END AS max_size
+FROM sys.filegroups AS fg
+JOIN sys.database_files AS df ON df.data_space_id = fg.data_space_id
+WHERE fg.type = ''FD''
+ORDER BY fg.name, df.name',
     @definition = N'ALTER PROCEDURE dbo.HC_filestream_containers
     @database_name sysname = NULL
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.3: FILESTREAM FILEGROUPS & CONTAINERS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT fg.name AS filegroup_name, fg.type_desc, fg.is_default,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT fg.name AS filegroup_name, fg.type_desc, fg.is_default,
        df.name AS container_name, df.physical_name, df.state_desc,
        CAST(CAST(df.size AS bigint) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
        CASE df.max_size WHEN -1 THEN ''''Unlimited'''' ELSE CAST(CAST(df.max_size AS bigint) * 8 / 1024 AS varchar(20)) + '''' MB'''' END AS max_size
@@ -7590,7 +13992,61 @@ FROM sys.filegroups AS fg
 JOIN sys.database_files AS df ON df.data_space_id = fg.data_space_id
 WHERE fg.type = ''''FD''''
 ORDER BY fg.name, df.name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, fg.name AS filegroup_name, fg.type_desc, fg.is_default,
+       df.name AS container_name, df.physical_name, df.state_desc,
+       CAST(CAST(df.size AS bigint) * 8 / 1024.0 AS decimal(18,2)) AS size_mb,
+       CASE df.max_size WHEN -1 THEN ''''Unlimited'''' ELSE CAST(CAST(df.max_size AS bigint) * 8 / 1024 AS varchar(20)) + '''' MB'''' END AS max_size
+FROM sys.filegroups AS fg
+JOIN sys.database_files AS df ON df.data_space_id = fg.data_space_id
+WHERE fg.type = ''''FD''''
+ORDER BY fg.name, df.name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7602,16 +14058,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filestream_columns @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_filestream_columns @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''.'' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS filestream_column, ds.name AS filestream_filegroup,
+       (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = c.object_id AND p.index_id IN (0, 1)) AS row_count
+FROM sys.columns AS c
+JOIN sys.tables AS t ON t.object_id = c.object_id
+LEFT JOIN sys.data_spaces AS ds ON ds.data_space_id = t.filestream_data_space_id
+WHERE c.is_filestream = 1
+ORDER BY table_name',
     @definition = N'ALTER PROCEDURE dbo.HC_filestream_columns
     @database_name sysname = NULL
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.4: TABLES / COLUMNS STORING FILESTREAM DATA - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
        c.name AS filestream_column, ds.name AS filestream_filegroup,
        (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = c.object_id AND p.index_id IN (0, 1)) AS row_count
 FROM sys.columns AS c
@@ -7619,7 +14085,61 @@ JOIN sys.tables AS t ON t.object_id = c.object_id
 LEFT JOIN sys.data_spaces AS ds ON ds.data_space_id = t.filestream_data_space_id
 WHERE c.is_filestream = 1
 ORDER BY table_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS filestream_column, ds.name AS filestream_filegroup,
+       (SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = c.object_id AND p.index_id IN (0, 1)) AS row_count
+FROM sys.columns AS c
+JOIN sys.tables AS t ON t.object_id = c.object_id
+LEFT JOIN sys.data_spaces AS ds ON ds.data_space_id = t.filestream_data_space_id
+WHERE c.is_filestream = 1
+ORDER BY table_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7631,20 +14151,76 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_filetables @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_filetables @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ft.object_id) + N''.'' + OBJECT_NAME(ft.object_id) AS filetable_name,
+       ft.directory_name, ft.is_enabled, ft.filename_collation_name,
+       FileTableRootPath(OBJECT_SCHEMA_NAME(ft.object_id) + N''.'' + OBJECT_NAME(ft.object_id)) AS unc_root_path
+FROM sys.filetables AS ft',
     @definition = N'ALTER PROCEDURE dbo.HC_filetables
     @database_name sysname = NULL
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.5: FILETABLES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ft.object_id) + N''''.'''' + OBJECT_NAME(ft.object_id) AS filetable_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ft.object_id) + N''''.'''' + OBJECT_NAME(ft.object_id) AS filetable_name,
        ft.directory_name, ft.is_enabled, ft.filename_collation_name,
        FileTableRootPath(OBJECT_SCHEMA_NAME(ft.object_id) + N''''.'''' + OBJECT_NAME(ft.object_id)) AS unc_root_path
 FROM sys.filetables AS ft;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ft.object_id) + N''''.'''' + OBJECT_NAME(ft.object_id) AS filetable_name,
+       ft.directory_name, ft.is_enabled, ft.filename_collation_name,
+       FileTableRootPath(OBJECT_SCHEMA_NAME(ft.object_id) + N''''.'''' + OBJECT_NAME(ft.object_id)) AS unc_root_path
+FROM sys.filetables AS ft'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7656,6 +14232,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_filetable_handles ORDER BY open_time;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY open_time',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_filetable_handles;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_filetable_handles',
     @definition = N'ALTER VIEW dbo.HC_filetable_handles
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.6: OPEN NON-TRANSACTED HANDLES (who has FileTable files open)
@@ -7667,6 +14246,9 @@ FROM sys.dm_filestream_non_transacted_handles;
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.6: OPEN NON-TRANSACTED HANDLES (who has FileTable files open)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(database_id) AS database_name, OBJECT_NAME(object_id, database_id) AS filetable_name,
        handle_id, opened_file_name, login_name, open_time, read_access, write_access, share_read, share_write
 FROM sys.dm_filestream_non_transacted_handles
@@ -7681,6 +14263,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_filestream_waits ORDER BY wait_time_ms DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY wait_time_ms DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_filestream_waits;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_filestream_waits',
     @definition = N'ALTER VIEW dbo.HC_filestream_waits
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.8: FILESTREAM-RELATED WAITS
@@ -7694,6 +14279,9 @@ WHERE (wait_type LIKE N''FS%'' OR wait_type LIKE N''FILESTREAM%'' OR wait_type L
 AS
 -- Toolkit 26_filestream_filetable.sql section 26.8: FILESTREAM-RELATED WAITS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT wait_type, waiting_tasks_count, wait_time_ms,
        CAST(wait_time_ms * 1.0 / NULLIF(waiting_tasks_count, 0) AS decimal(10,2)) AS avg_wait_ms
 FROM sys.dm_os_wait_stats
@@ -7710,16 +14298,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_schema_fingerprint @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_schema_fingerprint @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_schema_fingerprint
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.1: SCHEMA FINGERPRINT - CURRENT DB (run on both envs, compare)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH cols AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH cols AS (
     SELECT c.object_id,
            sig = (SELECT c2.name, TYPE_NAME(c2.user_type_id) AS t, c2.max_length AS l, c2.precision AS p, c2.scale AS s,
                          c2.is_nullable AS n, c2.is_identity AS i, c2.collation_name AS co,
@@ -7751,7 +14342,54 @@ SELECT OBJECT_SCHEMA_NAME(i.object_id) + N''''.'''' + OBJECT_NAME(i.object_id) +
 FROM sys.indexes AS i
 WHERE OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
 ORDER BY index_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7763,12 +14401,18 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compare_db_objects @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_compare_db_objects @source_db = @db, @target_db = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_compare_db_objects
     @source_db sysname = N''App_PROD_Copy'',
     @target_db sysname = N''App_UAT''
 AS
 -- Toolkit 31_schema_validation.sql section 31.2: COMPARE TWO DATABASES ON THE SAME INSTANCE - OBJECTS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @sql nvarchar(max) = N''
 SELECT COALESCE(s.obj, t.obj) AS object_name, COALESCE(s.type_desc, t.type_desc) AS type_desc,
        CASE WHEN t.obj IS NULL THEN ''''ONLY IN SOURCE''''
@@ -7800,12 +14444,18 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compare_db_columns @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_compare_db_columns @source_db = @db, @target_db = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_compare_db_columns
     @source_db sysname = N''App_PROD_Copy'',
     @target_db sysname = N''App_UAT''
 AS
 -- Toolkit 31_schema_validation.sql section 31.3: COMPARE TWO DATABASES - COLUMNS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @sql nvarchar(max);
 SET @sql = N''
 WITH s AS (SELECT sc.name + N''''.'''' + t.name AS tbl, c.name AS col, ty.name AS data_type, c.max_length, c.precision, c.scale, c.is_nullable, c.collation_name
@@ -7837,16 +14487,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_broken_objects @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_broken_objects @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_broken_objects
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.4: BROKEN OBJECTS - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(d.referencing_id) + N''''.'''' + OBJECT_NAME(d.referencing_id) AS referencing_object,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(d.referencing_id) + N''''.'''' + OBJECT_NAME(d.referencing_id) AS referencing_object,
        ISNULL(d.referenced_schema_name + N''''.'''', N'''''''') + d.referenced_entity_name AS missing_reference
 FROM sys.sql_expression_dependencies AS d
 WHERE d.referenced_id IS NULL
@@ -7879,7 +14532,54 @@ BEGIN
 END
 CLOSE cur; DEALLOCATE cur;
 SELECT * FROM #broken ORDER BY object_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7891,16 +14591,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_constraint_integrity @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_constraint_integrity @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_constraint_integrity
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.5: CONSTRAINT & TRIGGER INTEGRITY - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT ''''FOREIGN KEY'''' AS constraint_type, OBJECT_SCHEMA_NAME(parent_object_id) + N''''.'''' + OBJECT_NAME(parent_object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT ''''FOREIGN KEY'''' AS constraint_type, OBJECT_SCHEMA_NAME(parent_object_id) + N''''.'''' + OBJECT_NAME(parent_object_id) AS table_name,
        name, is_disabled, is_not_trusted,
        N''''ALTER TABLE '''' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + N''''.'''' + QUOTENAME(OBJECT_NAME(parent_object_id))
          + N'''' WITH CHECK CHECK CONSTRAINT '''' + QUOTENAME(name) + N'''';'''' AS fix_cmd
@@ -7914,7 +14617,54 @@ ORDER BY table_name;
 
 SELECT OBJECT_SCHEMA_NAME(parent_id) + N''''.'''' + OBJECT_NAME(parent_id) AS table_name, name AS trigger_name, is_disabled
 FROM sys.triggers WHERE parent_class = 1 AND is_disabled = 1;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7926,18 +14676,21 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_exact_row_counts @database_name = N''YourDB'', @source_db = N''App_PROD_Copy'', @target_db = N''App_UAT'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_exact_row_counts @database_name = @db, @source_db = @db, @target_db = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_exact_row_counts
     @database_name sysname = NULL,
     @source_db sysname = N''App_PROD_Copy'',
     @target_db sysname = N''App_UAT''
 AS
 -- Toolkit 31_schema_validation.sql section 31.6: ROW COUNTS - CURRENT DB (run on source & target, compare)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''DECLARE @sql nvarchar(max);
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''DECLARE @sql nvarchar(max);
 SELECT OBJECT_SCHEMA_NAME(object_id) + N''''.'''' + OBJECT_NAME(object_id) AS table_name,
        SUM(row_count) AS row_count
 FROM sys.dm_db_partition_stats
@@ -7957,7 +14710,54 @@ FULL JOIN
 WHERE ISNULL(s.rows, -1) <> ISNULL(t.rows, -1)
 ORDER BY ABS(ISNULL(s.rows,0) - ISNULL(t.rows,0)) DESC;'''';
 EXEC sys.sp_executesql @sql;'';
-EXEC @hc_exec @hc_sql, N''@source_db sysname, @target_db sysname'', @source_db = @source_db, @target_db = @target_db;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@source_db sysname, @target_db sysname'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @source_db = @source_db, @target_db = @target_db;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @source_db = @source_db, @target_db = @target_db;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7969,16 +14769,26 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_collation_mismatches @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_collation_mismatches @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''.'' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS column_name, c.collation_name,
+       CAST(DATABASEPROPERTYEX(DB_NAME(), ''Collation'') AS sysname) AS database_collation
+FROM sys.columns AS c
+JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
+WHERE c.collation_name IS NOT NULL
+  AND c.collation_name <> CAST(DATABASEPROPERTYEX(DB_NAME(), ''Collation'') AS sysname)
+ORDER BY table_name, column_name',
     @definition = N'ALTER PROCEDURE dbo.HC_collation_mismatches
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.7: COLLATION MISMATCHES (column vs database) - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
        c.name AS column_name, c.collation_name,
        CAST(DATABASEPROPERTYEX(DB_NAME(), ''''Collation'''') AS sysname) AS database_collation
 FROM sys.columns AS c
@@ -7986,7 +14796,61 @@ JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
 WHERE c.collation_name IS NOT NULL
   AND c.collation_name <> CAST(DATABASEPROPERTYEX(DB_NAME(), ''''Collation'''') AS sysname)
 ORDER BY table_name, column_name;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name,
+       c.name AS column_name, c.collation_name,
+       CAST(DATABASEPROPERTYEX(DB_NAME(), ''''Collation'''') AS sysname) AS database_collation
+FROM sys.columns AS c
+JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
+WHERE c.collation_name IS NOT NULL
+  AND c.collation_name <> CAST(DATABASEPROPERTYEX(DB_NAME(), ''''Collation'''') AS sysname)
+ORDER BY table_name, column_name'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -7998,16 +14862,28 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_column_type_mismatches @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_column_type_mismatches @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'WITH c AS (
+    SELECT c.name AS column_name, TYPE_NAME(c.user_type_id) + ''('' + CAST(c.max_length AS varchar(10)) + '')'' AS type_def,
+           OBJECT_SCHEMA_NAME(c.object_id) + N''.'' + OBJECT_NAME(c.object_id) AS table_name
+    FROM sys.columns AS c JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
+)
+SELECT DB_NAME() AS database_name, column_name, type_def, COUNT(*) AS tables_using, MIN(table_name) AS example_table
+FROM c
+WHERE column_name IN (SELECT column_name FROM c GROUP BY column_name HAVING COUNT(DISTINCT type_def) > 1)
+GROUP BY column_name, type_def
+ORDER BY column_name, tables_using DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_column_type_mismatches
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.8: SAME COLUMN NAME, DIFFERENT DATA TYPES - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''WITH c AS (
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''WITH c AS (
     SELECT c.name AS column_name, TYPE_NAME(c.user_type_id) + ''''('''' + CAST(c.max_length AS varchar(10)) + '''')'''' AS type_def,
            OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name
     FROM sys.columns AS c JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
@@ -8017,7 +14893,63 @@ FROM c
 WHERE column_name IN (SELECT column_name FROM c GROUP BY column_name HAVING COUNT(DISTINCT type_def) > 1)
 GROUP BY column_name, type_def
 ORDER BY column_name, tables_using DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''WITH c AS (
+    SELECT c.name AS column_name, TYPE_NAME(c.user_type_id) + ''''('''' + CAST(c.max_length AS varchar(10)) + '''')'''' AS type_def,
+           OBJECT_SCHEMA_NAME(c.object_id) + N''''.'''' + OBJECT_NAME(c.object_id) AS table_name
+    FROM sys.columns AS c JOIN sys.tables AS t ON t.object_id = c.object_id AND t.is_ms_shipped = 0
+)
+SELECT DB_NAME() AS database_name, column_name, type_def, COUNT(*) AS tables_using, MIN(table_name) AS example_table
+FROM c
+WHERE column_name IN (SELECT column_name FROM c GROUP BY column_name HAVING COUNT(DISTINCT type_def) > 1)
+GROUP BY column_name, type_def
+ORDER BY column_name, tables_using DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8029,16 +14961,30 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_identity_near_max @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_identity_near_max @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ic.object_id) + N''.'' + OBJECT_NAME(ic.object_id) AS table_name,
+       ic.name AS column_name, TYPE_NAME(ic.user_type_id) AS data_type,
+       CAST(ic.last_value AS bigint) AS last_value,
+       CASE TYPE_NAME(ic.user_type_id) WHEN ''tinyint'' THEN 255 WHEN ''smallint'' THEN 32767
+            WHEN ''int'' THEN 2147483647 WHEN ''bigint'' THEN 9223372036854775807 END AS max_value,
+       CAST(100.0 * CAST(ic.last_value AS bigint) /
+            CASE TYPE_NAME(ic.user_type_id) WHEN ''tinyint'' THEN 255 WHEN ''smallint'' THEN 32767
+                 WHEN ''int'' THEN 2147483647 WHEN ''bigint'' THEN 9223372036854775807 END AS decimal(6,2)) AS pct_used
+FROM sys.identity_columns AS ic
+WHERE ic.last_value IS NOT NULL
+  AND TYPE_NAME(ic.user_type_id) IN (''tinyint'', ''smallint'', ''int'', ''bigint'')
+ORDER BY pct_used DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_identity_near_max
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.9: IDENTITY COLUMNS CLOSE TO THEIR MAXIMUM - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ic.object_id) + N''''.'''' + OBJECT_NAME(ic.object_id) AS table_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(ic.object_id) + N''''.'''' + OBJECT_NAME(ic.object_id) AS table_name,
        ic.name AS column_name, TYPE_NAME(ic.user_type_id) AS data_type,
        CAST(ic.last_value AS bigint) AS last_value,
        CASE TYPE_NAME(ic.user_type_id) WHEN ''''tinyint'''' THEN 255 WHEN ''''smallint'''' THEN 32767
@@ -8050,7 +14996,65 @@ FROM sys.identity_columns AS ic
 WHERE ic.last_value IS NOT NULL
   AND TYPE_NAME(ic.user_type_id) IN (''''tinyint'''', ''''smallint'''', ''''int'''', ''''bigint'''')
 ORDER BY pct_used DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(ic.object_id) + N''''.'''' + OBJECT_NAME(ic.object_id) AS table_name,
+       ic.name AS column_name, TYPE_NAME(ic.user_type_id) AS data_type,
+       CAST(ic.last_value AS bigint) AS last_value,
+       CASE TYPE_NAME(ic.user_type_id) WHEN ''''tinyint'''' THEN 255 WHEN ''''smallint'''' THEN 32767
+            WHEN ''''int'''' THEN 2147483647 WHEN ''''bigint'''' THEN 9223372036854775807 END AS max_value,
+       CAST(100.0 * CAST(ic.last_value AS bigint) /
+            CASE TYPE_NAME(ic.user_type_id) WHEN ''''tinyint'''' THEN 255 WHEN ''''smallint'''' THEN 32767
+                 WHEN ''''int'''' THEN 2147483647 WHEN ''''bigint'''' THEN 9223372036854775807 END AS decimal(6,2)) AS pct_used
+FROM sys.identity_columns AS ic
+WHERE ic.last_value IS NOT NULL
+  AND TYPE_NAME(ic.user_type_id) IN (''''tinyint'''', ''''smallint'''', ''''int'''', ''''bigint'''')
+ORDER BY pct_used DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8062,16 +15066,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_object_counts @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_object_counts @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_object_counts
     @database_name sysname = NULL
 AS
 -- Toolkit 31_schema_validation.sql section 31.10: OBJECT COUNTS BY TYPE (quick env-to-env sanity check)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT type_desc, COUNT(*) AS object_count
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT type_desc, COUNT(*) AS object_count
 FROM sys.objects WHERE is_ms_shipped = 0
 GROUP BY type_desc
 UNION ALL SELECT ''''INDEX'''', COUNT(*) FROM sys.indexes i WHERE i.index_id > 0 AND OBJECTPROPERTY(i.object_id, ''''IsUserTable'''') = 1
@@ -8079,7 +15086,54 @@ UNION ALL SELECT ''''STATISTICS (user)'''', COUNT(*) FROM sys.stats s WHERE s.us
 UNION ALL SELECT ''''USER'''', COUNT(*) FROM sys.database_principals WHERE type IN (''''S'''',''''U'''',''''G'''',''''E'''',''''X'''') AND principal_id > 4
 UNION ALL SELECT ''''ROLE (custom)'''', COUNT(*) FROM sys.database_principals WHERE type = ''''R'''' AND is_fixed_role = 0 AND principal_id > 0 AND name <> N''''public''''
 ORDER BY type_desc;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8091,10 +15145,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_failed_logins_decoded;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_failed_logins_decoded;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_failed_logins_decoded
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.1: FAILED LOGINS DECODED (error 18456 state -> reason)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#el'') IS NOT NULL DROP TABLE #el;
 CREATE TABLE #el (LogDate datetime, ProcessInfo nvarchar(50), [Text] nvarchar(max));
 INSERT #el EXEC sys.xp_readerrorlog 0, 1, N''Login failed'';
@@ -8140,10 +15200,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_connectivity_ring_buffer;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_connectivity_ring_buffer;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_connectivity_ring_buffer
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.2: CONNECTIVITY RING BUFFER (closed connections, login timeouts)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @ms_now bigint = (SELECT ms_ticks FROM sys.dm_os_sys_info);
 SELECT TOP (100)
     DATEADD(MILLISECOND, -1 * (@ms_now - rb.[timestamp]), SYSDATETIME())                             AS event_time,
@@ -8183,10 +15249,21 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_auth_scheme_spn;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_auth_scheme_spn;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT c.auth_scheme, c.net_transport, COUNT(*) AS connections,
+       SUM(CASE WHEN c.client_net_address NOT IN (''<local machine>'', ''127.0.0.1'', ''::1'') THEN 1 ELSE 0 END) AS remote_connections
+FROM sys.dm_exec_connections AS c
+GROUP BY c.auth_scheme, c.net_transport
+--#HC_NEXT_RESULT#
+SELECT auth_scheme FROM sys.dm_exec_connections WHERE session_id = @@SPID',
     @definition = N'ALTER PROCEDURE dbo.HC_auth_scheme_spn
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.3: KERBEROS OR NTLM? + SPN CHECKS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT c.auth_scheme, c.net_transport, COUNT(*) AS connections,
        SUM(CASE WHEN c.client_net_address NOT IN (''<local machine>'', ''127.0.0.1'', ''::1'') THEN 1 ELSE 0 END) AS remote_connections
 FROM sys.dm_exec_connections AS c
@@ -8204,10 +15281,25 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_listening_ports;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_listening_ports;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT listener_id, ip_address, is_ipv4, port, type_desc, state_desc, start_time
+FROM sys.dm_tcp_listener_states
+--#HC_NEXT_RESULT#
+SELECT DISTINCT local_net_address, local_tcp_port, net_transport, protocol_type, encrypt_option
+FROM sys.dm_exec_connections WHERE local_tcp_port IS NOT NULL
+--#HC_NEXT_RESULT#
+SELECT registry_key, value_name, value_data
+FROM sys.dm_server_registry
+WHERE value_name IN (N''TcpPort'', N''TcpDynamicPorts'', N''ForceEncryption'', N''Certificate'', N''Enabled'', N''ListenOnAllIPs'')
+ORDER BY registry_key, value_name',
     @definition = N'ALTER PROCEDURE dbo.HC_listening_ports
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.4: WHAT IS SQL LISTENING ON? (ports, protocols, TLS)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT listener_id, ip_address, is_ipv4, port, type_desc, state_desc, start_time
 FROM sys.dm_tcp_listener_states;
 
@@ -8229,10 +15321,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_connection_storms;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_connection_storms;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT s.host_name, s.program_name, s.login_name, COUNT(*) AS sessions,
+       SUM(CASE WHEN s.status = ''sleeping'' THEN 1 ELSE 0 END) AS sleeping,
+       MAX(DATEDIFF(MINUTE, s.last_request_end_time, SYSDATETIME())) AS max_idle_min,
+       SUM(CASE WHEN s.open_transaction_count > 0 THEN 1 ELSE 0 END) AS with_open_tran
+FROM sys.dm_exec_sessions AS s
+WHERE s.is_user_process = 1
+GROUP BY s.host_name, s.program_name, s.login_name
+ORDER BY sessions DESC
+--#HC_NEXT_RESULT#
+SELECT RTRIM(counter_name) AS counter_name, cntr_value
+FROM sys.dm_os_performance_counters
+WHERE counter_name IN (N''Logins/sec'', N''Logouts/sec'', N''User Connections'', N''Connection Reset/sec'')',
     @definition = N'ALTER PROCEDURE dbo.HC_connection_storms
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.5: CONNECTION STORMS / POOL LEAKS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT s.host_name, s.program_name, s.login_name, COUNT(*) AS sessions,
        SUM(CASE WHEN s.status = ''sleeping'' THEN 1 ELSE 0 END) AS sleeping,
        MAX(DATEDIFF(MINUTE, s.last_request_end_time, SYSDATETIME())) AS max_idle_min,
@@ -8256,6 +15365,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_linked_server_check;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_linked_server_check;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_linked_server_check',
     @definition = N'ALTER VIEW dbo.HC_linked_server_check
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.6: LINKED SERVER TROUBLESHOOTING
@@ -8269,6 +15381,9 @@ WHERE r.wait_type IN (N''OLEDB'', N''PREEMPTIVE_OLEDBOPS'', N''PREEMPTIVE_OS_AUT
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.6: LINKED SERVER TROUBLESHOOTING
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT r.session_id, r.wait_type, r.wait_time, s.login_name, t.text
 FROM sys.dm_exec_requests r
 JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
@@ -8284,10 +15399,25 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_dtc_orphans;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_dtc_orphans;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT at.transaction_id, at.name, at.transaction_begin_time, at.transaction_type,
+       at.dtc_state, at.transaction_uow
+FROM sys.dm_tran_active_transactions AS at
+WHERE at.transaction_type = 4
+ORDER BY at.transaction_begin_time
+--#HC_NEXT_RESULT#
+SELECT DISTINCT tl.request_owner_guid AS uow,
+       N''KILL '''''' + CAST(tl.request_owner_guid AS nvarchar(40)) + N'''''';'' AS kill_cmd
+FROM sys.dm_tran_locks AS tl
+WHERE tl.request_session_id = -2',
     @definition = N'ALTER PROCEDURE dbo.HC_dtc_orphans
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.7: DISTRIBUTED TRANSACTIONS (DTC) & ORPHANED SPID -2
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT at.transaction_id, at.name, at.transaction_begin_time, at.transaction_type,
        at.dtc_state, at.transaction_uow
 FROM sys.dm_tran_active_transactions AS at
@@ -8309,16 +15439,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_service_broker @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_service_broker @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_service_broker
     @database_name sysname = NULL
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.8: SERVICE BROKER HEALTH - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT name, is_broker_enabled, service_broker_guid FROM sys.databases WHERE database_id = DB_ID();
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT name, is_broker_enabled, service_broker_guid FROM sys.databases WHERE database_id = DB_ID();
 
 SELECT q.name, q.is_receive_enabled, q.is_enqueue_enabled, q.is_activation_enabled,
        q.activation_procedure, q.max_readers, q.is_poison_message_handling_enabled,
@@ -8333,7 +15466,54 @@ FROM sys.transmission_queue ORDER BY enqueue_time;
 SELECT state_desc, COUNT(*) AS conversations FROM sys.conversation_endpoints GROUP BY state_desc ORDER BY conversations DESC;
 
 SELECT DB_NAME(database_id) AS database_name, queue_id, procedure_name, execute_as, spid FROM sys.dm_broker_activated_tasks;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8345,10 +15525,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stack_dumps_nonyield;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_stack_dumps_nonyield;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_stack_dumps_nonyield
 AS
 -- Toolkit 36_connectivity_service_troubleshooting.sql section 36.9: HANGS, STACK DUMPS, NON-YIELDING SCHEDULERS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT filename, creation_time, size_in_bytes / 1048576 AS size_mb
 FROM sys.dm_server_memory_dumps
 ORDER BY creation_time DESC;
@@ -8379,18 +15565,21 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stats_histogram @database_name = N''YourDB'', @table = N''dbo.Orders'', @stats_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_stats_histogram @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_stats_histogram
     @database_name sysname = NULL,
     @table sysname = N''dbo.Orders'',
     @stats_id int = 1
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.1: STATISTICS ON A TABLE + HISTOGRAM (2016 SP1 CU2+)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT s.stats_id, s.name AS stats_name, s.auto_created, s.has_filter, s.filter_definition,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT s.stats_id, s.name AS stats_name, s.auto_created, s.has_filter, s.filter_definition,
        STUFF((SELECT N'''', '''' + c.name FROM sys.stats_columns sc JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id
               WHERE sc.object_id = s.object_id AND sc.stats_id = s.stats_id ORDER BY sc.stats_column_id
               FOR XML PATH(''''''''), TYPE).value(''''.'''', ''''nvarchar(max)''''), 1, 2, N'''''''') AS columns,
@@ -8404,7 +15593,54 @@ ORDER BY s.stats_id;
 SELECT step_number, range_high_key, range_rows, equal_rows, distinct_range_rows, average_range_rows
 FROM sys.dm_db_stats_histogram(OBJECT_ID(@table), @stats_id)
 ORDER BY step_number;'';
-EXEC @hc_exec @hc_sql, N''@table sysname, @stats_id int'', @table = @table, @stats_id = @stats_id;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@table sysname, @stats_id int'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @table = @table, @stats_id = @stats_id;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @table = @table, @stats_id = @stats_id;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8416,21 +15652,77 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_ascending_key @database_name = N''YourDB'', @table = N''dbo.Orders'', @stats_id = 1;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_ascending_key @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @table sysname = N''dbo.Orders'';
+DECLARE @stats_id int = 1;
+SELECT TOP (3) DB_NAME() AS database_name, step_number, range_high_key, equal_rows, range_rows
+FROM sys.dm_db_stats_histogram(OBJECT_ID(@table), @stats_id)
+ORDER BY step_number DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_ascending_key
     @database_name sysname = NULL,
     @table sysname = N''dbo.Orders'',
     @stats_id int = 1
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.2: ASCENDING KEY PROBLEM (new rows beyond the last histogram step)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT TOP (3) step_number, range_high_key, equal_rows, range_rows
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT TOP (3) step_number, range_high_key, equal_rows, range_rows
 FROM sys.dm_db_stats_histogram(OBJECT_ID(@table), @stats_id)
 ORDER BY step_number DESC;'';
-EXEC @hc_exec @hc_sql, N''@table sysname, @stats_id int'', @table = @table, @stats_id = @stats_id;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT TOP (3) DB_NAME() AS database_name, step_number, range_high_key, equal_rows, range_rows
+FROM sys.dm_db_stats_histogram(OBJECT_ID(@table), @stats_id)
+ORDER BY step_number DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@table sysname, @stats_id int'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @table = @table, @stats_id = @stats_id;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @table = @table, @stats_id = @stats_id;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8442,16 +15734,30 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_stats_past_threshold @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_stats_past_threshold @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) AS table_name, s.name AS stats_name,
+       sp.rows, sp.modification_counter, sp.last_updated,
+       CAST(CASE WHEN sp.rows <= 500 THEN 500
+                 WHEN 500 + 0.2 * sp.rows < SQRT(1000.0 * sp.rows) THEN 500 + 0.2 * sp.rows
+                 ELSE SQRT(1000.0 * sp.rows) END AS bigint) AS threshold
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE OBJECTPROPERTY(s.object_id, ''IsUserTable'') = 1
+  AND sp.modification_counter > CASE WHEN sp.rows <= 500 THEN 500
+                                     WHEN 500 + 0.2 * sp.rows < SQRT(1000.0 * sp.rows) THEN 500 + 0.2 * sp.rows
+                                     ELSE SQRT(1000.0 * sp.rows) END
+ORDER BY sp.modification_counter DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_stats_past_threshold
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.3: STATS PAST THE AUTO-UPDATE THRESHOLD BUT NOT YET UPDATED
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name, s.name AS stats_name,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name, s.name AS stats_name,
        sp.rows, sp.modification_counter, sp.last_updated,
        CAST(CASE WHEN sp.rows <= 500 THEN 500
                  WHEN 500 + 0.2 * sp.rows < SQRT(1000.0 * sp.rows) THEN 500 + 0.2 * sp.rows
@@ -8463,7 +15769,65 @@ WHERE OBJECTPROPERTY(s.object_id, ''''IsUserTable'''') = 1
                                      WHEN 500 + 0.2 * sp.rows < SQRT(1000.0 * sp.rows) THEN 500 + 0.2 * sp.rows
                                      ELSE SQRT(1000.0 * sp.rows) END
 ORDER BY sp.modification_counter DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) AS table_name, s.name AS stats_name,
+       sp.rows, sp.modification_counter, sp.last_updated,
+       CAST(CASE WHEN sp.rows <= 500 THEN 500
+                 WHEN 500 + 0.2 * sp.rows < SQRT(1000.0 * sp.rows) THEN 500 + 0.2 * sp.rows
+                 ELSE SQRT(1000.0 * sp.rows) END AS bigint) AS threshold
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE OBJECTPROPERTY(s.object_id, ''''IsUserTable'''') = 1
+  AND sp.modification_counter > CASE WHEN sp.rows <= 500 THEN 500
+                                     WHEN 500 + 0.2 * sp.rows < SQRT(1000.0 * sp.rows) THEN 500 + 0.2 * sp.rows
+                                     ELSE SQRT(1000.0 * sp.rows) END
+ORDER BY sp.modification_counter DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8475,24 +15839,87 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_est_vs_actual_rows @database_name = N''YourDB'', @spid = 55;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_est_vs_actual_rows @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'DECLARE @spid int = 55;
+SELECT DB_NAME() AS database_name, node_id, physical_operator_name, OBJECT_NAME(object_id) AS object_name, index_id,
+       estimate_row_count, row_count,
+       CAST(row_count * 1.0 / NULLIF(estimate_row_count, 0) AS decimal(18,2)) AS actual_vs_estimate,
+       elapsed_time_ms, cpu_time_ms, logical_read_count
+FROM sys.dm_exec_query_profiles
+WHERE session_id = @spid
+ORDER BY ABS(row_count - estimate_row_count) DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_est_vs_actual_rows
     @database_name sysname = NULL,
     @spid int = 55
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.4: ESTIMATED vs ACTUAL ROWS FOR A RUNNING QUERY (cardinality problems)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT node_id, physical_operator_name, OBJECT_NAME(object_id) AS object_name, index_id,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT node_id, physical_operator_name, OBJECT_NAME(object_id) AS object_name, index_id,
        estimate_row_count, row_count,
        CAST(row_count * 1.0 / NULLIF(estimate_row_count, 0) AS decimal(18,2)) AS actual_vs_estimate,
        elapsed_time_ms, cpu_time_ms, logical_read_count
 FROM sys.dm_exec_query_profiles
 WHERE session_id = @spid
 ORDER BY ABS(row_count - estimate_row_count) DESC;'';
-EXEC @hc_exec @hc_sql, N''@spid int'', @spid = @spid;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, node_id, physical_operator_name, OBJECT_NAME(object_id) AS object_name, index_id,
+       estimate_row_count, row_count,
+       CAST(row_count * 1.0 / NULLIF(estimate_row_count, 0) AS decimal(18,2)) AS actual_vs_estimate,
+       elapsed_time_ms, cpu_time_ms, logical_read_count
+FROM sys.dm_exec_query_profiles
+WHERE session_id = @spid
+ORDER BY ABS(row_count - estimate_row_count) DESC'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = N''@spid int'';
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all, @hc_params, @spid = @spid;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql, @hc_params, @spid = @spid;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8504,10 +15931,39 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_parallelism;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_parallelism;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT TOP (25) qs.execution_count, qs.last_dop, qs.min_dop, qs.max_dop,
+       qs.total_worker_time / qs.execution_count / 1000   AS avg_cpu_ms,
+       qs.total_elapsed_time / qs.execution_count / 1000  AS avg_duration_ms,
+       CAST(1.0 * qs.total_worker_time / NULLIF(qs.total_elapsed_time, 0) AS decimal(10,2)) AS cpu_to_duration,
+       SUBSTRING(t.text, qs.statement_start_offset / 2 + 1, 200) AS statement_start
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS t
+WHERE qs.max_dop > 1
+ORDER BY qs.total_worker_time DESC
+--#HC_NEXT_RESULT#
+SELECT t.session_id, COUNT(*) AS tasks, MAX(t.exec_context_id) AS max_context,
+       SUM(CASE WHEN t.task_state = ''RUNNING''   THEN 1 ELSE 0 END) AS running,
+       SUM(CASE WHEN t.task_state = ''SUSPENDED'' THEN 1 ELSE 0 END) AS suspended,
+       SUM(CASE WHEN t.task_state = ''RUNNABLE''  THEN 1 ELSE 0 END) AS runnable
+FROM sys.dm_os_tasks AS t
+WHERE t.session_id > 50
+GROUP BY t.session_id
+HAVING COUNT(*) > 1
+ORDER BY tasks DESC
+--#HC_NEXT_RESULT#
+SELECT wt.session_id, wt.exec_context_id, wt.wait_type, wt.wait_duration_ms, wt.resource_description
+FROM sys.dm_os_waiting_tasks AS wt
+WHERE wt.wait_type IN (N''CXPACKET'', N''CXCONSUMER'', N''CXSYNC_PORT'', N''CXSYNC_CONSUMER'')
+ORDER BY wt.session_id, wt.exec_context_id',
     @definition = N'ALTER PROCEDURE dbo.HC_parallelism
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.5: PARALLELISM: WHO GOES PARALLEL, AND SKEW
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (25) qs.execution_count, qs.last_dop, qs.min_dop, qs.max_dop,
        qs.total_worker_time / qs.execution_count / 1000   AS avg_cpu_ms,
        qs.total_elapsed_time / qs.execution_count / 1000  AS avg_duration_ms,
@@ -8543,16 +15999,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_compile_cost @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_compile_cost @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_compile_cost
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.6: COMPILE COST & OPTIMIZER TIMEOUTS
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT counter, occurrence, value
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT counter, occurrence, value
 FROM sys.dm_exec_query_optimizer_info
 WHERE counter IN (N''''optimizations'''', N''''elapsed time'''', N''''trivial plan'''', N''''search 0'''', N''''search 1'''', N''''search 2'''',
                   N''''timeout'''', N''''memory limit exceeded'''', N''''tables'''', N''''hints'''');
@@ -8572,7 +16031,54 @@ CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS t
 WHERE qp.query_plan.exist(''''//StmtSimple[@StatementOptmEarlyAbortReason="TimeOut"]'''') = 1
 ORDER BY qs.total_worker_time DESC;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8584,21 +16090,79 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_plan_guides @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_plan_guides @database_name = @db;', @test_mode = 'run',
+    @capture_scope = N'database',
+    @capture_sql = N'SELECT DB_NAME() AS database_name, pg.plan_guide_id, pg.name, pg.is_disabled, pg.scope_type_desc,
+       OBJECT_NAME(pg.scope_object_id) AS scope_object, pg.hints, LEFT(pg.query_text, 200) AS query_text,
+       v.msgnum AS validation_error, v.message AS validation_message
+FROM sys.plan_guides AS pg
+OUTER APPLY sys.fn_validate_plan_guide(pg.plan_guide_id) AS v',
     @definition = N'ALTER PROCEDURE dbo.HC_plan_guides
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.7: PLAN GUIDES - CURRENT DB (forgotten ones cause odd plans)
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT pg.plan_guide_id, pg.name, pg.is_disabled, pg.scope_type_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT pg.plan_guide_id, pg.name, pg.is_disabled, pg.scope_type_desc,
        OBJECT_NAME(pg.scope_object_id) AS scope_object, pg.hints, LEFT(pg.query_text, 200) AS query_text,
        v.msgnum AS validation_error, v.message AS validation_message
 FROM sys.plan_guides AS pg
 OUTER APPLY sys.fn_validate_plan_guide(pg.plan_guide_id) AS v;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = N''SELECT DB_NAME() AS database_name, pg.plan_guide_id, pg.name, pg.is_disabled, pg.scope_type_desc,
+       OBJECT_NAME(pg.scope_object_id) AS scope_object, pg.hints, LEFT(pg.query_text, 200) AS query_text,
+       v.msgnum AS validation_error, v.message AS validation_message
+FROM sys.plan_guides AS pg
+OUTER APPLY sys.fn_validate_plan_guide(pg.plan_guide_id) AS v'';   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8610,10 +16174,37 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_resource_governor;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_resource_governor;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT c.is_enabled, OBJECT_SCHEMA_NAME(c.classifier_function_id, 1) + N''.'' + OBJECT_NAME(c.classifier_function_id, 1) AS classifier_function,
+       dc.is_reconfiguration_pending
+FROM sys.resource_governor_configuration AS c
+CROSS JOIN sys.dm_resource_governor_configuration AS dc
+--#HC_NEXT_RESULT#
+SELECT p.name AS pool, p.min_cpu_percent, p.max_cpu_percent, p.cap_cpu_percent,
+       p.min_memory_percent, p.max_memory_percent,
+       p.total_cpu_usage_ms, p.used_memory_kb / 1024 AS used_mb, p.target_memory_kb / 1024 AS target_mb,
+       p.active_memgrant_count, p.memgrant_waiter_count
+FROM sys.dm_resource_governor_resource_pools AS p
+--#HC_NEXT_RESULT#
+SELECT g.name AS workload_group, p.name AS pool, g.total_request_count, g.active_request_count,
+       g.queued_request_count, g.total_queued_request_count, g.total_cpu_usage_ms, g.max_request_cpu_time_ms,
+       g.total_cpu_limit_violation_count, g.blocked_task_count,
+       g.request_max_memory_grant_percent, g.max_dop, g.group_max_requests
+FROM sys.dm_resource_governor_workload_groups AS g
+JOIN sys.dm_resource_governor_resource_pools AS p ON p.pool_id = g.pool_id
+--#HC_NEXT_RESULT#
+SELECT s.session_id, s.login_name, s.program_name, g.name AS workload_group
+FROM sys.dm_exec_sessions AS s
+JOIN sys.dm_resource_governor_workload_groups AS g ON g.group_id = s.group_id
+WHERE s.is_user_process = 1',
     @definition = N'ALTER PROCEDURE dbo.HC_resource_governor
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.8: RESOURCE GOVERNOR
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT c.is_enabled, OBJECT_SCHEMA_NAME(c.classifier_function_id, 1) + N''.'' + OBJECT_NAME(c.classifier_function_id, 1) AS classifier_function,
        dc.is_reconfiguration_pending
 FROM sys.resource_governor_configuration AS c
@@ -8647,16 +16238,19 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_inmemory_oltp @database_name = N''YourDB'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_inmemory_oltp @database_name = @db;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_inmemory_oltp
     @database_name sysname = NULL
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.9: IN-MEMORY OLTP (memory-optimized tables) - CURRENT DB
+-- @database_name: one database, or N''*'' for every online user database
 SET NOCOUNT ON;
-IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
-IF DB_ID(@database_name) IS NULL
-BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance).'', 16, 1); RETURN; END;
-DECLARE @hc_exec nvarchar(400) = QUOTENAME(@database_name) + N''.sys.sp_executesql'';
-DECLARE @hc_sql nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + OBJECT_NAME(t.object_id) AS table_name, t.durability_desc,
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
+DECLARE @hc_sql     nvarchar(max) = N''SELECT OBJECT_SCHEMA_NAME(t.object_id) + N''''.'''' + OBJECT_NAME(t.object_id) AS table_name, t.durability_desc,
        ms.memory_allocated_for_table_kb / 1024 AS table_alloc_mb, ms.memory_used_by_table_kb / 1024 AS table_used_mb,
        ms.memory_allocated_for_indexes_kb / 1024 AS index_alloc_mb, ms.memory_used_by_indexes_kb / 1024 AS index_used_mb
 FROM sys.tables AS t
@@ -8675,7 +16269,54 @@ SELECT SUM(pages_kb) / 1024 AS xtp_memory_mb FROM sys.dm_os_memory_clerks WHERE 
 SELECT d.name, p.name AS bound_resource_pool
 FROM sys.databases d LEFT JOIN sys.dm_resource_governor_resource_pools p ON p.pool_id = d.resource_pool_id
 WHERE d.database_id > 4;'';
-EXEC @hc_exec @hc_sql;
+DECLARE @hc_sql_all nvarchar(max) = NULL;   -- same query with a database_name column (NULL: can''t combine)
+DECLARE @hc_params  nvarchar(max) = NULL;
+DECLARE @hc_dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @hc_i int = 1, @hc_cnt int, @hc_db sysname, @hc_exec nvarchar(400), @hc_cols nvarchar(max),
+        @hc_one bit = 0, @hc_err nvarchar(2048);
+IF @database_name IS NULL AND CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 5 SET @database_name = DB_NAME();
+INSERT @hc_dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+SET @hc_cnt = @@ROWCOUNT;
+IF @hc_cnt = 0
+BEGIN RAISERROR(N''Pass @database_name = N''''YourDB'''' (an online database on this instance), or N''''*'''' for every database.'', 16, 1); RETURN; END;
+CREATE TABLE #hc_out (hc_row int IDENTITY(1,1) NOT NULL);
+IF @hc_cnt > 1 AND @hc_sql_all IS NOT NULL
+BEGIN
+    BEGIN TRY
+        SELECT @hc_db = name FROM @hc_dbs WHERE n = 1;
+        EXEC dbo.HC_usp_shape_out @hc_db, @hc_sql_all, @hc_params, @hc_cols OUTPUT;
+        SET @hc_one = 1;                            -- one combined result set
+    END TRY
+    BEGIN CATCH
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''One result set per database (could not combine: %s)'', 10, 1, @hc_err) WITH NOWAIT;
+    END CATCH;
+END;
+WHILE @hc_i <= @hc_cnt
+BEGIN
+    SELECT @hc_db = name FROM @hc_dbs WHERE n = @hc_i;
+    SET @hc_exec = QUOTENAME(@hc_db) + N''.sys.sp_executesql'';
+    BEGIN TRY
+        IF @hc_one = 1
+            INSERT #hc_out EXEC @hc_exec @hc_sql_all;
+        ELSE
+        BEGIN
+            IF @hc_cnt > 1 RAISERROR(N''--- %s'', 0, 1, @hc_db) WITH NOWAIT;
+            EXEC @hc_exec @hc_sql;
+        END;
+    END TRY
+    BEGIN CATCH
+        IF @hc_cnt = 1 THROW;
+        SET @hc_err = ERROR_MESSAGE();
+        RAISERROR(N''%s: %s'', 10, 1, @hc_db, @hc_err) WITH NOWAIT;   -- carry on with the next database
+    END CATCH;
+    SET @hc_i += 1;
+END;
+IF @hc_one = 1
+BEGIN
+    SET @hc_sql = N''SELECT '' + @hc_cols + N'' FROM #hc_out ORDER BY hc_row;'';
+    EXEC sys.sp_executesql @hc_sql;
+END;
 ',
     @fallback_definition = NULL;
 GO
@@ -8687,6 +16328,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_spinlocks ORDER BY spins DESC;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_spinlocks;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_spinlocks',
     @definition = N'ALTER VIEW dbo.HC_spinlocks
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.10: SPINLOCK CONTENTION (advanced - high CPU with low waits)
@@ -8698,6 +16342,9 @@ ORDER BY spins DESC;
 AS
 -- Toolkit 39_advanced_tuning.sql section 39.10: SPINLOCK CONTENTION (advanced - high CPU with low waits)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT TOP (20) name, collisions, spins, spins_per_collision, sleep_time, backoffs
 FROM sys.dm_os_spinlock_stats
 ORDER BY spins DESC;
@@ -8711,6 +16358,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_rpo_rto_scorecard @default_rpo_min = 15, @default_rto_min = 60, @restore_factor = 1.30, @zero_mb_per_s = 300, @days = 7, @ifi = ''Y'';',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_rpo_rto_scorecard;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_rpo_rto_scorecard
     @default_rpo_min int = 15,
     @default_rto_min int = 60,
@@ -8721,6 +16371,9 @@ EXEC dbo.HC_usp_deploy
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.1: RPO / RTO SCORECARD vs SLA - ONE RESULT SET
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF CAST(SERVERPROPERTY(''EngineEdition'') AS int) NOT IN (5, 8)
     EXEC sys.sp_executesql
          N''SELECT TOP (1) @i = instant_file_initialization_enabled FROM sys.dm_server_services WHERE servicename LIKE N''''SQL Server (%'''''',
@@ -8815,6 +16468,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_rpo_gaps(DEFAULT, DEFAULT);  -- @gap_days = 7, @gap_threshold_min = 15',
     @min_version = NULL,
     @sort_hint = N'ORDER BY gap_min DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_rpo_gaps(DEFAULT, DEFAULT);', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_rpo_gaps(DEFAULT, DEFAULT)',
     @definition = N'ALTER FUNCTION dbo.HC_rpo_gaps
 (
     @gap_days int = 7,
@@ -8848,6 +16504,9 @@ HAVING DATEDIFF(MINUTE, MAX(backup_finish_date), GETDATE()) > @gap_threshold_min
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.2: WORST-CASE RPO DETAIL - WHEN DID THE BIG GAPS HAPPEN?
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH l AS (
     SELECT database_name, backup_finish_date,
            LAG(backup_finish_date) OVER (PARTITION BY database_name ORDER BY backup_finish_date) AS prev_finish
@@ -8874,6 +16533,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_broken_log_chains ORDER BY log_backup_after_gap DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY backup_start_date DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_broken_log_chains;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_broken_log_chains',
     @definition = N'ALTER VIEW dbo.HC_broken_log_chains
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.3: BROKEN LOG CHAINS (an unrestorable point in time)
@@ -8894,6 +16556,9 @@ WHERE prev_last_lsn IS NOT NULL AND first_lsn > prev_last_lsn;
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.3: BROKEN LOG CHAINS (an unrestorable point in time)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH l AS (
     SELECT database_name, database_guid, backup_start_date, first_lsn, last_lsn, server_name,
            LAG(last_lsn)          OVER (PARTITION BY database_name, database_guid ORDER BY first_lsn) AS prev_last_lsn,
@@ -8917,10 +16582,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_rogue_backups;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_rogue_backups;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_rogue_backups
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.4: CHAIN-BREAKING / ROGUE BACKUPS
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT bs.database_name, bs.type, bs.backup_start_date, bs.user_name, bs.server_name,
        bs.is_copy_only, bs.is_snapshot, bmf.device_type, bmf.physical_device_name,
        CASE WHEN bmf.physical_device_name = N''NUL'' THEN ''BACKUP TO NUL - chain broken''
@@ -8957,13 +16628,32 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_backup_quality', @section = N'40.5', @source_file = N'40_rpo_rto_compliance.sql',
     @title = N'BACKUP QUALITY (last 7 days)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_backup_quality;',
+    @usage = N'SELECT * FROM dbo.HC_backup_quality ORDER BY backup_finish_date DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_backup_quality
+    @sort_hint = N'ORDER BY bs.backup_finish_date DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_backup_quality;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_backup_quality',
+    @definition = N'ALTER VIEW dbo.HC_backup_quality
+AS
+-- Toolkit 40_rpo_rto_compliance.sql section 40.5: BACKUP QUALITY (last 7 days)
+SELECT bs.database_name, bs.type, bs.backup_finish_date,
+       bs.has_backup_checksums, bs.is_damaged, bs.has_incomplete_metadata,
+       CASE WHEN bs.compressed_backup_size < bs.backup_size THEN 1 ELSE 0 END AS is_compressed,
+       bs.key_algorithm AS encryption,
+       bmf.physical_device_name
+FROM msdb.dbo.backupset AS bs
+JOIN msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
+WHERE bs.backup_finish_date >= DATEADD(DAY, -7, GETDATE())
+  AND (bs.has_backup_checksums = 0 OR bs.is_damaged = 1 OR bs.has_incomplete_metadata = 1);
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_backup_quality
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.5: BACKUP QUALITY (last 7 days)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT bs.database_name, bs.type, bs.backup_finish_date,
        bs.has_backup_checksums, bs.is_damaged, bs.has_incomplete_metadata,
        CASE WHEN bs.compressed_backup_size < bs.backup_size THEN 1 ELSE 0 END AS is_compressed,
@@ -8974,8 +16664,7 @@ JOIN msdb.dbo.backupmediafamily AS bmf ON bmf.media_set_id = bs.media_set_id
 WHERE bs.backup_finish_date >= DATEADD(DAY, -7, GETDATE())
   AND (bs.has_backup_checksums = 0 OR bs.is_damaged = 1 OR bs.has_incomplete_metadata = 1)
 ORDER BY bs.backup_finish_date DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 40.6  DO THE FILES NEEDED FOR A RESTORE STILL EXIST?   (40_rpo_rto_compliance.sql) */
@@ -8985,10 +16674,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_backup_files_exist;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_backup_files_exist;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_backup_files_exist
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.6: DO THE FILES NEEDED FOR A RESTORE STILL EXIST?
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#files'') IS NOT NULL DROP TABLE #files;
 CREATE TABLE #files (database_name sysname, type char(1), backup_finish_date datetime, path nvarchar(260), file_exists bit NULL);
 
@@ -9023,13 +16718,37 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_restore_chain_length', @section = N'40.7', @source_file = N'40_rpo_rto_compliance.sql',
     @title = N'RESTORE CHAIN LENGTH (long chains = long RTO, more ways to fail)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_restore_chain_length;',
+    @usage = N'SELECT * FROM dbo.HC_restore_chain_length ORDER BY logs_to_restore DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_restore_chain_length
+    @sort_hint = N'ORDER BY logs_to_restore DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_restore_chain_length;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_restore_chain_length',
+    @definition = N'ALTER VIEW dbo.HC_restore_chain_length
+AS
+-- Toolkit 40_rpo_rto_compliance.sql section 40.7: RESTORE CHAIN LENGTH (long chains = long RTO, more ways to fail)
+SELECT d.name, d.recovery_model_desc,
+       f.backup_finish_date AS last_full,
+       df.backup_finish_date AS last_diff,
+       (SELECT COUNT(*) FROM msdb.dbo.backupset AS b
+        WHERE b.database_name = d.name AND b.type = ''L''
+          AND b.backup_finish_date > COALESCE(df.backup_finish_date, f.backup_finish_date)) AS logs_to_restore,
+       CASE WHEN df.backup_finish_date IS NULL AND DATEDIFF(DAY, f.backup_finish_date, GETDATE()) >= 2
+            THEN ''Add DIFF backups to shorten the chain'' ELSE '''' END AS advice
+FROM sys.databases AS d
+OUTER APPLY (SELECT TOP (1) backup_finish_date, checkpoint_lsn FROM msdb.dbo.backupset
+             WHERE database_name = d.name AND type = ''D'' AND is_copy_only = 0 ORDER BY backup_finish_date DESC) AS f
+OUTER APPLY (SELECT TOP (1) backup_finish_date FROM msdb.dbo.backupset
+             WHERE database_name = d.name AND type = ''I'' AND differential_base_lsn = f.checkpoint_lsn ORDER BY backup_finish_date DESC) AS df
+WHERE d.database_id > 4 AND d.recovery_model_desc <> ''SIMPLE'';
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_restore_chain_length
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.7: RESTORE CHAIN LENGTH (long chains = long RTO, more ways to fail)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name, d.recovery_model_desc,
        f.backup_finish_date AS last_full,
        df.backup_finish_date AS last_diff,
@@ -9045,21 +16764,39 @@ OUTER APPLY (SELECT TOP (1) backup_finish_date FROM msdb.dbo.backupset
              WHERE database_name = d.name AND type = ''I'' AND differential_base_lsn = f.checkpoint_lsn ORDER BY backup_finish_date DESC) AS df
 WHERE d.database_id > 4 AND d.recovery_model_desc <> ''SIMPLE''
 ORDER BY logs_to_restore DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 40.8  CRASH-RECOVERY RTO (how long a restart / failover takes)   (40_rpo_rto_compliance.sql) */
 EXEC dbo.HC_usp_deploy
     @name = N'HC_crash_recovery_rto', @section = N'40.8', @source_file = N'40_rpo_rto_compliance.sql',
     @title = N'CRASH-RECOVERY RTO (how long a restart / failover takes)', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_crash_recovery_rto;',
+    @usage = N'SELECT * FROM dbo.HC_crash_recovery_rto ORDER BY log_recovery_size_mb DESC;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_crash_recovery_rto
+    @sort_hint = N'ORDER BY ls.log_recovery_size_mb DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_crash_recovery_rto;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_crash_recovery_rto',
+    @definition = N'ALTER VIEW dbo.HC_crash_recovery_rto
+AS
+-- Toolkit 40_rpo_rto_compliance.sql section 40.8: CRASH-RECOVERY RTO (how long a restart / failover takes)
+SELECT d.name, d.target_recovery_time_in_seconds,
+       ls.log_recovery_size_mb, ls.log_since_last_checkpoint_mb,
+       ls.total_vlf_count, ls.active_vlf_count, ls.total_log_size_mb,
+       CASE WHEN d.target_recovery_time_in_seconds = 0 THEN ''Set TARGET_RECOVERY_TIME = 60 SECONDS; '' ELSE '''' END
+     + CASE WHEN ls.total_vlf_count > 1000 THEN ''Too many VLFs (19.3); '' ELSE '''' END
+     + CASE WHEN ls.log_recovery_size_mb > 10240 THEN ''Large recovery size - long txn open? (02 2.5); '' ELSE '''' END AS advice
+FROM sys.databases AS d
+CROSS APPLY sys.dm_db_log_stats(d.database_id) AS ls
+WHERE d.state_desc = N''ONLINE'' AND d.database_id <> 2;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_crash_recovery_rto
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.8: CRASH-RECOVERY RTO (how long a restart / failover takes)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name, d.target_recovery_time_in_seconds,
        ls.log_recovery_size_mb, ls.log_since_last_checkpoint_mb,
        ls.total_vlf_count, ls.active_vlf_count, ls.total_log_size_mb,
@@ -9070,8 +16807,7 @@ FROM sys.databases AS d
 CROSS APPLY sys.dm_db_log_stats(d.database_id) AS ls
 WHERE d.state_desc = N''ONLINE'' AND d.database_id <> 2
 ORDER BY ls.log_recovery_size_mb DESC;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 40.9  RESTORE TESTS - EVIDENCE THAT BACKUPS ACTUALLY WORK   (40_rpo_rto_compliance.sql) */
@@ -9081,6 +16817,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'SELECT * FROM dbo.HC_restore_tests ORDER BY days_ago DESC;',
     @min_version = NULL,
     @sort_hint = N'ORDER BY days_ago DESC',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_restore_tests;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_restore_tests',
     @definition = N'ALTER VIEW dbo.HC_restore_tests
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.9: RESTORE TESTS - EVIDENCE THAT BACKUPS ACTUALLY WORK
@@ -9095,6 +16834,9 @@ GROUP BY bs.database_name, bs.server_name;
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.9: RESTORE TESTS - EVIDENCE THAT BACKUPS ACTUALLY WORK
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT bs.database_name AS source_db, bs.server_name AS source_server,
        MAX(rh.restore_date) AS last_test_restore,
        DATEDIFF(DAY, MAX(rh.restore_date), GETDATE()) AS days_ago
@@ -9109,13 +16851,46 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_ha_dr_coverage', @section = N'40.10', @source_file = N'40_rpo_rto_compliance.sql',
     @title = N'HA / DR COVERAGE PER DATABASE', @tags = N'BOX,MI',
-    @usage = N'EXEC dbo.HC_ha_dr_coverage;',
+    @usage = N'SELECT * FROM dbo.HC_ha_dr_coverage ORDER BY protection DESC, name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_ha_dr_coverage
+    @sort_hint = N'ORDER BY protection DESC, d.name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ha_dr_coverage;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ha_dr_coverage',
+    @definition = N'ALTER VIEW dbo.HC_ha_dr_coverage
+AS
+-- Toolkit 40_rpo_rto_compliance.sql section 40.10: HA / DR COVERAGE PER DATABASE
+SELECT d.name, d.recovery_model_desc,
+       ag.name AS availability_group,
+       agx.replicas, agx.sync_replicas, agx.auto_failover_replicas, agx.has_listener,
+       CASE WHEN lsp.primary_database IS NOT NULL THEN 1 ELSE 0 END AS log_shipping,
+       CASE WHEN dm.mirroring_guid IS NOT NULL THEN 1 ELSE 0 END AS mirroring,
+       CASE
+           WHEN ag.name IS NOT NULL AND agx.auto_failover_replicas >= 2 THEN ''HA: AG sync + automatic failover''
+           WHEN ag.name IS NOT NULL AND agx.sync_replicas >= 2         THEN ''HA: AG sync, MANUAL failover (someone must act)''
+           WHEN ag.name IS NOT NULL                                    THEN ''DR: AG async only (data loss possible)''
+           WHEN dm.mirroring_guid IS NOT NULL                          THEN ''Mirroring (deprecated)''
+           WHEN lsp.primary_database IS NOT NULL                       THEN ''DR: log shipping (manual, RPO = LS interval)''
+           ELSE ''BACKUPS ONLY - RTO = full restore time (40.1)'' END AS protection
+FROM sys.databases AS d
+LEFT JOIN sys.availability_databases_cluster AS adc ON adc.database_name = d.name
+LEFT JOIN sys.availability_groups AS ag ON ag.group_id = adc.group_id
+OUTER APPLY (SELECT COUNT(*) AS replicas,
+                    SUM(CASE WHEN ar.availability_mode = 1 THEN 1 ELSE 0 END) AS sync_replicas,
+                    SUM(CASE WHEN ar.failover_mode = 0 AND ar.availability_mode = 1 THEN 1 ELSE 0 END) AS auto_failover_replicas,
+                    (SELECT COUNT(*) FROM sys.availability_group_listeners AS agl WHERE agl.group_id = ag.group_id) AS has_listener
+             FROM sys.availability_replicas AS ar WHERE ar.group_id = ag.group_id) AS agx
+LEFT JOIN msdb.dbo.log_shipping_primary_databases AS lsp ON lsp.primary_database = d.name
+LEFT JOIN sys.database_mirroring AS dm ON dm.database_id = d.database_id AND dm.mirroring_guid IS NOT NULL
+WHERE d.database_id > 4;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ha_dr_coverage
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.10: HA / DR COVERAGE PER DATABASE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT d.name, d.recovery_model_desc,
        ag.name AS availability_group,
        agx.replicas, agx.sync_replicas, agx.auto_failover_replicas, agx.has_listener,
@@ -9140,21 +16915,45 @@ LEFT JOIN msdb.dbo.log_shipping_primary_databases AS lsp ON lsp.primary_database
 LEFT JOIN sys.database_mirroring AS dm ON dm.database_id = d.database_id AND dm.mirroring_guid IS NOT NULL
 WHERE d.database_id > 4
 ORDER BY protection DESC, d.name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 40.11  AG: CAN WE FAIL OVER WITHIN RTO / WITHOUT DATA LOSS RIGHT NOW?   (40_rpo_rto_compliance.sql) */
 EXEC dbo.HC_usp_deploy
     @name = N'HC_ag_failover_rto', @section = N'40.11', @source_file = N'40_rpo_rto_compliance.sql',
     @title = N'AG: CAN WE FAIL OVER WITHIN RTO / WITHOUT DATA LOSS RIGHT NOW?', @tags = N'BOX',
-    @usage = N'EXEC dbo.HC_ag_failover_rto;',
+    @usage = N'SELECT * FROM dbo.HC_ag_failover_rto ORDER BY ag_name, database_name, secondary;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_ag_failover_rto
+    @sort_hint = N'ORDER BY ag.name, database_name, ar.replica_server_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_ag_failover_rto;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_ag_failover_rto',
+    @definition = N'ALTER VIEW dbo.HC_ag_failover_rto
+AS
+-- Toolkit 40_rpo_rto_compliance.sql section 40.11: AG: CAN WE FAIL OVER WITHIN RTO / WITHOUT DATA LOSS RIGHT NOW?
+SELECT ag.name AS ag_name, DB_NAME(drs.database_id) AS database_name, ar.replica_server_name AS secondary,
+       ar.availability_mode_desc, ar.failover_mode_desc,
+       drs.synchronization_state_desc, dcs.is_failover_ready,
+       CAST(drs.redo_queue_size * 1.0 / NULLIF(drs.redo_rate, 0) AS decimal(18,1)) AS est_failover_redo_s,
+       drs.log_send_queue_size AS unsent_log_kb,
+       DATEDIFF(SECOND, drs.last_commit_time, p.last_commit_time) AS data_loss_s_if_forced,
+       CASE WHEN ar.availability_mode = 1 AND dcs.is_failover_ready = 1 THEN ''Planned failover OK - no data loss''
+            WHEN ar.availability_mode = 1 THEN ''SYNC but NOT failover ready - fix first (25.2)''
+            ELSE ''ASYNC - only FORCE_FAILOVER_ALLOW_DATA_LOSS (or switch to SYNC and wait)'' END AS verdict
+FROM sys.dm_hadr_database_replica_states AS drs
+JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id
+JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
+JOIN sys.dm_hadr_database_replica_cluster_states AS dcs ON dcs.replica_id = drs.replica_id AND dcs.group_database_id = drs.group_database_id
+JOIN sys.dm_hadr_database_replica_states AS p ON p.group_database_id = drs.group_database_id AND p.is_primary_replica = 1
+WHERE drs.is_primary_replica = 0;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_ag_failover_rto
 AS
 -- Toolkit 40_rpo_rto_compliance.sql section 40.11: AG: CAN WE FAIL OVER WITHIN RTO / WITHOUT DATA LOSS RIGHT NOW?
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT ag.name AS ag_name, DB_NAME(drs.database_id) AS database_name, ar.replica_server_name AS secondary,
        ar.availability_mode_desc, ar.failover_mode_desc,
        drs.synchronization_state_desc, dcs.is_failover_ready,
@@ -9171,8 +16970,7 @@ JOIN sys.dm_hadr_database_replica_cluster_states AS dcs ON dcs.replica_id = drs.
 JOIN sys.dm_hadr_database_replica_states AS p ON p.group_database_id = drs.group_database_id AND p.is_primary_replica = 1
 WHERE drs.is_primary_replica = 0
 ORDER BY ag.name, database_name, ar.replica_server_name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 41.1  PROBLEMS-ONLY HEALTH CHECK (0 rows = all good)   (41_proactive_monitoring_alerts.sql) */
@@ -9182,6 +16980,9 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_problems @log_rpo_min = 30, @full_max_days = 7, @checkdb_days = 7, @disk_free_pct = 15, @log_used_pct = 80, @tempdb_free_pct = 20, @blocking_min = 5, @open_tran_min = 30, @cert_days = 30, @vlf_max = 1000;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_problems;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_problems
     @log_rpo_min int = 30,
     @full_max_days int = 7,
@@ -9196,6 +16997,9 @@ EXEC dbo.HC_usp_deploy
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.1: PROBLEMS-ONLY HEALTH CHECK (0 rows = all good)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 DECLARE @issues TABLE (severity varchar(10), area varchar(30), item nvarchar(256), detail nvarchar(4000));
 DECLARE @is_mi bit = CASE WHEN CAST(SERVERPROPERTY(''EngineEdition'') AS int) = 8 THEN 1 ELSE 0 END;
 
@@ -9334,10 +17138,61 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_growth_forecast;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_growth_forecast;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'WITH fb AS (
+    SELECT database_name, backup_finish_date, backup_size,
+           ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY backup_finish_date)      AS rn_first,
+           ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY backup_finish_date DESC) AS rn_last
+    FROM msdb.dbo.backupset
+    WHERE type = ''D'' AND is_copy_only = 0 AND backup_finish_date >= DATEADD(DAY, -30, GETDATE())
+),
+gr AS (
+    SELECT f.database_name,
+           (l.backup_size - f.backup_size) / 1048576.0 / NULLIF(DATEDIFF(DAY, f.backup_finish_date, l.backup_finish_date), 0) AS mb_per_day
+    FROM fb f JOIN fb l ON l.database_name = f.database_name AND l.rn_last = 1
+    WHERE f.rn_first = 1
+),
+dv AS (
+    SELECT DISTINCT mf.database_id, vs.volume_mount_point
+    FROM sys.master_files mf CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs
+    WHERE mf.type = 0
+),
+dvc AS (SELECT database_id, volume_mount_point, COUNT(*) OVER (PARTITION BY database_id) AS nvol FROM dv),
+vol AS (
+    SELECT DISTINCT vs.volume_mount_point, vs.available_bytes / 1048576 AS free_mb, vs.total_bytes / 1048576 AS total_mb
+    FROM sys.master_files mf CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) vs
+)
+SELECT v.volume_mount_point, v.total_mb / 1024 AS total_gb, v.free_mb / 1024 AS free_gb,
+       CAST(SUM(gr.mb_per_day / dvc.nvol) AS decimal(18,1)) AS growth_mb_per_day,
+       CAST(v.free_mb / NULLIF(SUM(gr.mb_per_day / dvc.nvol), 0) AS decimal(18,0)) AS days_until_full
+FROM vol v
+LEFT JOIN dvc ON dvc.volume_mount_point = v.volume_mount_point
+LEFT JOIN gr ON gr.database_name = DB_NAME(dvc.database_id) AND gr.mb_per_day > 0
+GROUP BY v.volume_mount_point, v.total_mb, v.free_mb
+ORDER BY days_until_full
+--#HC_NEXT_RESULT#
+WITH fb AS (
+    SELECT database_name, backup_finish_date, backup_size,
+           ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY backup_finish_date)      AS rn_first,
+           ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY backup_finish_date DESC) AS rn_last
+    FROM msdb.dbo.backupset
+    WHERE type = ''D'' AND is_copy_only = 0 AND backup_finish_date >= DATEADD(DAY, -30, GETDATE())
+)
+SELECT f.database_name,
+       CAST(l.backup_size / 1073741824.0 AS decimal(18,2)) AS current_used_gb,
+       CAST((l.backup_size - f.backup_size) / 1048576.0 / NULLIF(DATEDIFF(DAY, f.backup_finish_date, l.backup_finish_date), 0) AS decimal(18,1)) AS mb_per_day,
+       CAST((l.backup_size - f.backup_size) / 1048576.0 / NULLIF(DATEDIFF(DAY, f.backup_finish_date, l.backup_finish_date), 0) * 30 / 1024 AS decimal(18,2)) AS gb_per_month
+FROM fb f JOIN fb l ON l.database_name = f.database_name AND l.rn_last = 1
+WHERE f.rn_first = 1
+ORDER BY mb_per_day DESC',
     @definition = N'ALTER PROCEDURE dbo.HC_growth_forecast
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.2: GROWTH FORECAST - DAYS UNTIL DISK FULL
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 WITH fb AS (
     SELECT database_name, backup_finish_date, backup_size,
            ROW_NUMBER() OVER (PARTITION BY database_name ORDER BY backup_finish_date)      AS rn_first,
@@ -9392,13 +17247,38 @@ GO
 EXEC dbo.HC_usp_deploy
     @name = N'HC_autogrowth_will_fail', @section = N'41.3', @source_file = N'41_proactive_monitoring_alerts.sql',
     @title = N'FILES THAT WILL FAIL THEIR NEXT AUTOGROWTH', @tags = N'BOX',
-    @usage = N'EXEC dbo.HC_autogrowth_will_fail;',
+    @usage = N'SELECT * FROM dbo.HC_autogrowth_will_fail ORDER BY finding, database_name;',
     @min_version = NULL,
-    @sort_hint = NULL,
-    @definition = N'ALTER PROCEDURE dbo.HC_autogrowth_will_fail
+    @sort_hint = N'ORDER BY finding, database_name',
+    @test_call = N'SELECT TOP (0) * FROM dbo.HC_autogrowth_will_fail;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT * FROM dbo.HC_autogrowth_will_fail',
+    @definition = N'ALTER VIEW dbo.HC_autogrowth_will_fail
+AS
+-- Toolkit 41_proactive_monitoring_alerts.sql section 41.3: FILES THAT WILL FAIL THEIR NEXT AUTOGROWTH
+SELECT DB_NAME(mf.database_id) AS database_name, mf.name AS logical_name, mf.type_desc, vs.volume_mount_point,
+       CAST(mf.size AS bigint) * 8 / 1024 AS size_mb,
+       CASE WHEN mf.is_percent_growth = 1 THEN CAST(mf.size AS bigint) * 8 / 1024 * mf.growth / 100
+            ELSE CAST(mf.growth AS bigint) * 8 / 1024 END AS next_growth_mb,
+       vs.available_bytes / 1048576 AS disk_free_mb,
+       CASE WHEN mf.max_size = -1 THEN ''unlimited'' ELSE CAST(CAST(mf.max_size AS bigint) * 8 / 1024 AS varchar(20)) + '' MB'' END AS max_size,
+       CASE WHEN mf.growth = 0 THEN ''Autogrowth OFF''
+            WHEN mf.max_size > 0 AND mf.size >= mf.max_size THEN ''AT MAX SIZE''
+            ELSE ''NOT ENOUGH DISK FOR NEXT GROWTH'' END AS finding
+FROM sys.master_files AS mf
+CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
+WHERE mf.growth = 0
+   OR (mf.max_size > 0 AND mf.size >= mf.max_size)
+   OR vs.available_bytes / 1048576 < CASE WHEN mf.is_percent_growth = 1 THEN CAST(mf.size AS bigint) * 8 / 1024 * mf.growth / 100
+                                          ELSE CAST(mf.growth AS bigint) * 8 / 1024 END;
+',
+    @fallback_definition = N'ALTER PROCEDURE dbo.HC_autogrowth_will_fail
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.3: FILES THAT WILL FAIL THEIR NEXT AUTOGROWTH
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT DB_NAME(mf.database_id) AS database_name, mf.name AS logical_name, mf.type_desc, vs.volume_mount_point,
        CAST(mf.size AS bigint) * 8 / 1024 AS size_mb,
        CASE WHEN mf.is_percent_growth = 1 THEN CAST(mf.size AS bigint) * 8 / 1024 * mf.growth / 100
@@ -9415,8 +17295,7 @@ WHERE mf.growth = 0
    OR vs.available_bytes / 1048576 < CASE WHEN mf.is_percent_growth = 1 THEN CAST(mf.size AS bigint) * 8 / 1024 * mf.growth / 100
                                           ELSE CAST(mf.growth AS bigint) * 8 / 1024 END
 ORDER BY finding, database_name;
-',
-    @fallback_definition = NULL;
+';
 GO
 
 /* 41.5  VERIFY ALERTS ACTUALLY NOTIFY SOMEONE   (41_proactive_monitoring_alerts.sql) */
@@ -9426,10 +17305,27 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_alerts_notify;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_alerts_notify;', @test_mode = 'run',
+    @capture_scope = N'server',
+    @capture_sql = N'SELECT a.name AS alert_name, a.enabled, a.severity, a.message_id, a.occurrence_count,
+       CASE WHEN a.last_occurrence_date > 0 THEN msdb.dbo.agent_datetime(a.last_occurrence_date, a.last_occurrence_time) END AS last_fired,
+       o.name AS operator, o.email_address, o.enabled AS operator_enabled,
+       CASE WHEN n.alert_id IS NULL THEN ''NO NOTIFICATION - nobody will know'' ELSE '''' END AS finding
+FROM msdb.dbo.sysalerts AS a
+LEFT JOIN msdb.dbo.sysnotifications AS n ON n.alert_id = a.id
+LEFT JOIN msdb.dbo.sysoperators AS o ON o.id = n.operator_id
+ORDER BY finding DESC, a.name
+--#HC_NEXT_RESULT#
+SELECT j.name, j.enabled, j.notify_level_email, o.name AS operator
+FROM msdb.dbo.sysjobs j LEFT JOIN msdb.dbo.sysoperators o ON o.id = j.notify_email_operator_id
+WHERE j.enabled = 1 AND (j.notify_level_email NOT IN (2, 3) OR o.id IS NULL)',
     @definition = N'ALTER PROCEDURE dbo.HC_alerts_notify
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.5: VERIFY ALERTS ACTUALLY NOTIFY SOMEONE
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 SELECT a.name AS alert_name, a.enabled, a.severity, a.message_id, a.occurrence_count,
        CASE WHEN a.last_occurrence_date > 0 THEN msdb.dbo.agent_datetime(a.last_occurrence_date, a.last_occurrence_time) END AS last_fired,
        o.name AS operator, o.email_address, o.enabled AS operator_enabled,
@@ -9453,10 +17349,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_restart_history;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_restart_history;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_restart_history
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.6: RESTART / SHUTDOWN HISTORY (from all error logs)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#logs'') IS NOT NULL DROP TABLE #logs;
 IF OBJECT_ID(''tempdb..#ev'') IS NOT NULL DROP TABLE #ev;
 CREATE TABLE #logs (ArchiveNo int, LogDate datetime, LogSize bigint);
@@ -9487,10 +17389,16 @@ EXEC dbo.HC_usp_deploy
     @usage = N'EXEC dbo.HC_config_changes;',
     @min_version = NULL,
     @sort_hint = NULL,
+    @test_call = N'EXEC dbo.HC_config_changes;', @test_mode = 'run',
+    @capture_scope = NULL,
+    @capture_sql = NULL,
     @definition = N'ALTER PROCEDURE dbo.HC_config_changes
 AS
 -- Toolkit 41_proactive_monitoring_alerts.sql section 41.7: CONFIGURATION CHANGES (who changed what, when)
 SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;                            -- never wait more than 5 s behind production locks
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;  -- read without taking shared locks
+SET DEADLOCK_PRIORITY LOW;                         -- if anything deadlocks, it is this check
 IF OBJECT_ID(''tempdb..#logs'') IS NOT NULL DROP TABLE #logs;
 IF OBJECT_ID(''tempdb..#ev'') IS NOT NULL DROP TABLE #ev;
 CREATE TABLE #logs (ArchiveNo int, LogDate datetime, LogSize bigint);
@@ -9512,9 +17420,93 @@ SELECT DISTINCT LogDate, ProcessInfo, [Text] FROM #ev ORDER BY LogDate DESC;
 GO
 
 /*============================================================================
+  REFERENCE DATA (refreshed on every run)
+============================================================================*/
+IF OBJECT_ID(N'dbo.HC_manual_sections', N'U') IS NULL
+    CREATE TABLE dbo.HC_manual_sections (section varchar(10) NOT NULL CONSTRAINT PK_HC_manual_sections PRIMARY KEY,
+        source_file nvarchar(128) NOT NULL, title nvarchar(400) NOT NULL, reason nvarchar(200) NOT NULL);
+IF OBJECT_ID(N'dbo.HC_snapshot_sets', N'U') IS NULL
+    CREATE TABLE dbo.HC_snapshot_sets (set_name sysname NOT NULL, object_name sysname NOT NULL,
+        CONSTRAINT PK_HC_snapshot_sets PRIMARY KEY (set_name, object_name));
+GO
+DELETE dbo.HC_manual_sections;
+INSERT dbo.HC_manual_sections (section, source_file, title, reason) VALUES
+    (N'1.7', N'01_wait_stats.sql', N'CLEAR WAIT STATS (use with care - resets baseline)', N'template / action'),
+    (N'3.9', N'03_query_performance_plan_cache.sql', N'REMOVE ONE BAD PLAN FROM CACHE (surgical, not FREEPROCCACHE)', N'template / action'),
+    (N'4.10', N'04_query_store.sql', N'ENABLE / FIX QUERY STORE (templates)', N'template / action'),
+    (N'9.8', N'09_tempdb.sql', N'RESIZE / ADD TEMPDB FILES (templates)', N'template / action'),
+    (N'10.8', N'10_backup_restore.sql', N'AZURE SQL DB - AUTOMATED BACKUP LIST', N'commented out in the script - run by hand'),
+    (N'10.9', N'10_backup_restore.sql', N'MSDB HISTORY CLEANUP (keeps msdb small)', N'template / action'),
+    (N'11.15', N'11_alwayson_ag.sql', N'COMMON AG ACTIONS (templates - run deliberately)', N'template / action'),
+    (N'12.8', N'12_locking_deadlocks.sql', N'AZURE SQL DB - DEADLOCKS', N'commented out in the script - run by hand'),
+    (N'13.8', N'13_security.sql', N'EVERYTHING ONE LOGIN CAN DO (effective permissions)', N'commented out in the script - run by hand'),
+    (N'13.16', N'13_security.sql', N'AZURE SQL DB - FIREWALL RULES & ENTRA ADMINS', N'commented out in the script - run by hand'),
+    (N'14.9', N'14_agent_jobs_dbmail.sql', N'START / STOP A JOB (templates)', N'template / action'),
+    (N'15.9', N'15_database_health_errorlog.sql', N'sp_server_diagnostics SNAPSHOT (what WSFC/AG health check sees)', N'commented out in the script - run by hand'),
+    (N'15.10', N'15_database_health_errorlog.sql', N'RUN CHECKDB (templates)', N'template / action'),
+    (N'16.3', N'16_azure_sql_database.sql', N'RESOURCE USAGE - LAST 14 DAYS (5-min samples) (master)', N'commented out in the script - run by hand'),
+    (N'16.4', N'16_azure_sql_database.sql', N'ELASTIC POOL USAGE (master)', N'commented out in the script - run by hand'),
+    (N'16.8', N'16_azure_sql_database.sql', N'LONG-RUNNING MANAGEMENT OPERATIONS (scale, copy, restore) (master)', N'commented out in the script - run by hand'),
+    (N'17.9', N'17_azure_managed_instance.sql', N'THINGS THAT BEHAVE DIFFERENTLY ON MI (quick reference)', N'template / action'),
+    (N'18.4', N'18_extended_events.sql', N'ERRORS SEVERITY >= 16 (application errors, timeouts)', N'commented out in the script - run by hand'),
+    (N'18.5', N'18_extended_events.sql', N'AZURE SQL DB - DATABASE-SCOPED SESSION (ring buffer)', N'commented out in the script - run by hand'),
+    (N'18.6', N'18_extended_events.sql', N'STOP / DROP A SESSION', N'template / action'),
+    (N'19.3', N'19_maintenance_helpers.sql', N'SHRINK / RESIZE TRANSACTION LOG SAFELY (fix VLFs)', N'template / action'),
+    (N'19.9', N'19_maintenance_helpers.sql', N'SET DATABASE OWNER TO sa (generator)', N'template / action'),
+    (N'19.10', N'19_maintenance_helpers.sql', N'KICK EVERYONE OUT OF A DATABASE (templates)', N'template / action'),
+    (N'19.11', N'19_maintenance_helpers.sql', N'MIGRATING LOGINS (with SIDs and password hashes)', N'template / action'),
+    (N'21.10', N'21_cdc_change_tracking.sql', N'READ CHANGES (template)', N'template / action'),
+    (N'21.11', N'21_cdc_change_tracking.sql', N'ENABLE / DISABLE / TUNE CDC (templates)', N'template / action'),
+    (N'21.12', N'21_cdc_change_tracking.sql', N'CDC + ALWAYS ON NOTES', N'template / action'),
+    (N'22.10', N'22_tde_encryption.sql', N'TEMPLATES - ENABLE TDE', N'template / action'),
+    (N'22.11', N'22_tde_encryption.sql', N'TEMPLATES - RESTORE TDE DB ON ANOTHER SERVER / AG REPLICA', N'template / action'),
+    (N'22.12', N'22_tde_encryption.sql', N'TEMPLATES - ROTATE CERT / DISABLE TDE', N'template / action'),
+    (N'23.3', N'23_data_masking_rls_classification.sql', N'TEST WHAT A USER ACTUALLY SEES', N'template / action'),
+    (N'23.5', N'23_data_masking_rls_classification.sql', N'ADD / CHANGE / DROP MASKS (templates)', N'template / action'),
+    (N'24.13', N'24_index_tuning.sql', N'FILTERED INDEX / NULL-HEAVY COLUMN CANDIDATES (needs a table)', N'commented out in the script - run by hand'),
+    (N'24.14', N'24_index_tuning.sql', N'BEFORE / AFTER TEST FOR A NEW INDEX (template)', N'template / action'),
+    (N'25.11', N'25_alwayson_advanced.sql', N'TEMPLATES - BUILD AN AG (T-SQL)', N'template / action'),
+    (N'25.12', N'25_alwayson_advanced.sql', N'TEMPLATES - ADD / REMOVE DATABASE, ADD REPLICA', N'template / action'),
+    (N'25.13', N'25_alwayson_advanced.sql', N'AZURE VM AG NOTES', N'template / action'),
+    (N'26.7', N'26_filestream_filetable.sql', N'GARBAGE COLLECTION (disk space not freed after deletes)', N'template / action'),
+    (N'26.9', N'26_filestream_filetable.sql', N'TEMPLATES - ENABLE FILESTREAM & CREATE A FILETABLE', N'template / action'),
+    (N'26.10', N'26_filestream_filetable.sql', N'FILESTREAM + ALWAYS ON / BACKUP NOTES', N'template / action'),
+    (N'36.10', N'36_connectivity_service_troubleshooting.sql', N'AZURE SQL DB CONNECTIVITY QUICK CHECKS', N'commented out in the script - run by hand'),
+    (N'39.11', N'39_advanced_tuning.sql', N'QUERY HINT / FIX QUICK REFERENCE', N'template / action'),
+    (N'40.12', N'40_rpo_rto_compliance.sql', N'SLA TABLE (template) - RECORD THE AGREED RPO / RTO PER DATABASE', N'template / action'),
+    (N'41.4', N'41_proactive_monitoring_alerts.sql', N'SQL AGENT ALERTS - GENERATE THE STANDARD SET', N'template / action'),
+    (N'41.8', N'41_proactive_monitoring_alerts.sql', N'SCHEDULE IT: EMAIL ONLY WHEN 41.1 FINDS SOMETHING', N'template / action');
+DELETE dbo.HC_snapshot_sets WHERE set_name IN (N'change');
+INSERT dbo.HC_snapshot_sets (set_name, object_name) VALUES
+    (N'change', N'HC_version'),
+    (N'change', N'HC_instance_settings'),
+    (N'change', N'HC_services'),
+    (N'change', N'HC_host_os'),
+    (N'change', N'HC_database_properties'),
+    (N'change', N'HC_db_scoped_config'),
+    (N'change', N'HC_memory_settings'),
+    (N'change', N'HC_tempdb_files'),
+    (N'change', N'HC_autogrowth_settings'),
+    (N'change', N'HC_logins'),
+    (N'change', N'HC_server_role_members'),
+    (N'change', N'HC_linked_servers'),
+    (N'change', N'HC_job_inventory'),
+    (N'change', N'HC_agent_alerts_operators'),
+    (N'change', N'HC_ag_replicas'),
+    (N'change', N'HC_ag_listeners'),
+    (N'change', N'HC_ag_readonly_routing'),
+    (N'change', N'HC_hadr_endpoint'),
+    (N'change', N'HC_tde_status'),
+    (N'change', N'HC_audit_status'),
+    (N'change', N'HC_dbs_not_online'),
+    (N'change', N'HC_iqp_settings'),
+    (N'change', N'HC_resource_governor');
+GO
+
+/*============================================================================
   CATALOG: what is installed and how to call it
+     EXEC dbo.HC_help N'block';                                  -- find by keyword
      SELECT * FROM dbo.HC_catalog;                               -- everything
-     SELECT * FROM dbo.HC_catalog WHERE title LIKE N'%block%';   -- find one
 ============================================================================*/
 IF OBJECT_ID(N'dbo.HC_catalog', N'V') IS NULL
     EXEC (N'CREATE VIEW dbo.HC_catalog AS SELECT 1 AS placeholder;');
@@ -9534,6 +17526,8 @@ SELECT
          THEN N'EXEC dbo.' + r.name + N';'
          ELSE r.usage END         AS how_to_run,
     r.sort_hint                   AS suggested_order_by,
+    CASE WHEN r.usage LIKE N'%@database_name%' THEN 'yes' ELSE 'no' END AS all_databases_mode,
+    CASE WHEN r.capture_sql IS NOT NULL THEN 'yes' ELSE 'no' END AS can_snapshot,
     r.tags                        AS runs_on,
     r.status,
     r.message,
@@ -9543,12 +17537,500 @@ FROM dbo.HC_objects AS r
 LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(r.name));
 GO
 
+/*============================================================================
+  HELP
+     EXEC dbo.HC_help;                       -- the main commands + checks per script
+     EXEC dbo.HC_help N'block';              -- checks whose name/title matches (words in order)
+     EXEC dbo.HC_help N'5.3';                -- by toolkit section
+============================================================================*/
+IF OBJECT_ID(N'dbo.HC_help', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_help AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_help
+    @search nvarchar(200) = NULL
+AS
+SET NOCOUNT ON;
+IF @search IS NULL OR LTRIM(RTRIM(@search)) = N''
+BEGIN
+    SELECT command, what_it_does
+    FROM (VALUES
+        (1, N'EXEC dbo.HC_help N''keyword'';',                              N'Find checks by keyword or section number'),
+        (2, N'SELECT * FROM dbo.HC_catalog;',                               N'Every check installed here and how to run it'),
+        (3, N'EXEC dbo.HC_<check> @database_name = N''*'';',                N'Per-database checks: run in every online database'),
+        (4, N'EXEC dbo.HC_snapshot N''change'', @label = N''pre-patch'';',  N'Save config/state checks for a before/after compare'),
+        (5, N'EXEC dbo.HC_snapshot_diff @before_label = N''pre-patch'', @after_label = N''post-patch'';', N'What changed between two snapshots'),
+        (6, N'SELECT * FROM dbo.HC_snapshot_list;',                         N'Saved snapshots'),
+        (7, N'EXEC dbo.HC_snapshot_show @snapshot_id = 1;',                 N'One saved snapshot as a table'),
+        (8, N'EXEC dbo.HC_selftest;',                                       N'Run every check once and log pass/fail (Results: discard)'),
+        (9, N'SELECT * FROM dbo.HC_version;',                               N'Which build is installed here, and its health')
+    ) AS v (n, command, what_it_does)
+    ORDER BY n;
+
+    SELECT source_file AS script, COUNT(*) AS checks_installed
+    FROM dbo.HC_catalog
+    WHERE object_type <> 'not installed'
+    GROUP BY source_file
+    ORDER BY source_file;
+    RETURN;
+END;
+
+DECLARE @p nvarchar(450) = N'%' + REPLACE(REPLACE(LTRIM(RTRIM(@search)), N'_', N'[_]'), N' ', N'%') + N'%';
+SELECT name, toolkit_section, title, object_type, how_to_run, runs_on, status
+FROM
+(
+    SELECT name, toolkit_section, title, object_type, how_to_run, runs_on, status
+    FROM dbo.HC_catalog
+    WHERE title LIKE @p OR name LIKE @p OR toolkit_section = @search OR source_file LIKE @p
+    UNION ALL
+    SELECT NULL, section, title, 'run by hand',
+           N'Open ' + source_file + N', section ' + section + N' (' + reason + N')', NULL, 'not installed'
+    FROM dbo.HC_manual_sections
+    WHERE title LIKE @p OR section = @search OR source_file LIKE @p
+) AS x
+ORDER BY TRY_CAST(PARSENAME(toolkit_section, 2) AS int), TRY_CAST(PARSENAME(toolkit_section, 1) AS int);
+GO
+
+/*============================================================================
+  SELF-TEST: runs every installed check once and logs PASS / FAIL / SKIPPED
+     EXEC dbo.HC_selftest;                                    -- per-database checks run in DBAdmin
+     EXEC dbo.HC_selftest @test_database = N'Sales', @include_heavy = 1;
+     SELECT * FROM dbo.HC_selftest_last WHERE result = 'FAIL';
+  The checks return their normal result sets. In SSMS tick
+  Query > Query Options > Results > Grid > "Discard results after execution"
+  first; progress and failures still show on the Messages tab.
+============================================================================*/
+IF OBJECT_ID(N'dbo.HC_selftest_results', N'U') IS NULL
+    CREATE TABLE dbo.HC_selftest_results
+    (
+        run_at       datetime2(3)   NOT NULL,
+        name         sysname        NOT NULL,
+        section      varchar(10)    NULL,
+        result       varchar(10)    NOT NULL,     -- PASS | FAIL | SKIPPED
+        duration_ms  int            NULL,
+        message      nvarchar(4000) NULL,
+        CONSTRAINT PK_HC_selftest_results PRIMARY KEY (run_at, name)
+    );
+GO
+IF OBJECT_ID(N'dbo.HC_selftest', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_selftest AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_selftest
+    @test_database sysname       = NULL,   -- where per-database checks run (default: this database)
+    @include_heavy bit           = 0,      -- 1 = also run checks that read index pages
+    @name_like     nvarchar(200) = N'%',   -- e.g. N'HC_ag%'
+    @keep_runs     int           = 10
+AS
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET DEADLOCK_PRIORITY LOW;
+IF @test_database IS NULL SET @test_database = DB_NAME();
+IF DB_ID(@test_database) IS NULL
+BEGIN RAISERROR(N'Database %s not found.', 16, 1, @test_database); RETURN; END;
+
+DECLARE @run_at datetime2(3) = SYSDATETIME(), @name sysname, @section varchar(10), @call nvarchar(2000),
+        @mode varchar(100), @type char(2), @t0 datetime2(3), @err nvarchar(4000), @i int = 0, @total int,
+        @cdc bit = (SELECT is_cdc_enabled FROM sys.databases WHERE name = @test_database);
+
+DECLARE @todo TABLE (n int IDENTITY(1,1), name sysname, section varchar(10), call nvarchar(2000), mode varchar(100), type char(2));
+INSERT @todo (name, section, call, mode, type)
+SELECT r.name, r.section, r.test_call, r.test_mode, o.type
+FROM dbo.HC_objects AS r
+JOIN sys.objects AS o ON o.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(r.name))
+WHERE r.status LIKE 'OK%' AND r.name LIKE @name_like
+ORDER BY TRY_CAST(PARSENAME(r.section, 2) AS int), TRY_CAST(PARSENAME(r.section, 1) AS int);
+SET @total = @@ROWCOUNT;
+
+WHILE @i < @total
+BEGIN
+    SET @i += 1;
+    SELECT @name = name, @section = section, @call = call, @mode = ISNULL(mode, 'run'), @type = type
+    FROM @todo WHERE n = @i;
+    IF RTRIM(@type) = 'P' AND @call LIKE N'SELECT%'          -- a view/function that was installed as a procedure
+        SET @call = N'EXEC dbo.' + QUOTENAME(@name) + N';';
+
+    IF @call IS NULL OR @mode LIKE 'skip%'
+       OR (@mode LIKE 'heavy%' AND @include_heavy = 0)
+       OR (@mode = 'needs_cdc' AND ISNULL(@cdc, 0) = 0)
+    BEGIN
+        INSERT dbo.HC_selftest_results (run_at, name, section, result, message)
+        VALUES (@run_at, @name, @section, 'SKIPPED',
+                CASE WHEN @call IS NULL THEN N'no test call'
+                     WHEN @mode = 'needs_cdc' THEN N'needs CDC enabled in ' + @test_database
+                     WHEN @mode LIKE 'heavy%' THEN @mode + N' (use @include_heavy = 1)'
+                     ELSE SUBSTRING(@mode, 7, 100) END);
+        CONTINUE;
+    END;
+
+    RAISERROR(N'[%d/%d] %s', 0, 1, @i, @total, @name) WITH NOWAIT;
+    SET @t0 = SYSDATETIME();
+    BEGIN TRY
+        EXEC sys.sp_executesql @call, N'@db sysname', @db = @test_database;
+        INSERT dbo.HC_selftest_results (run_at, name, section, result, duration_ms)
+        VALUES (@run_at, @name, @section, 'PASS', DATEDIFF(millisecond, @t0, SYSDATETIME()));
+    END TRY
+    BEGIN CATCH
+        SET @err = ERROR_MESSAGE();
+        IF @@TRANCOUNT > 0 ROLLBACK;
+        INSERT dbo.HC_selftest_results (run_at, name, section, result, duration_ms, message)
+        VALUES (@run_at, @name, @section, 'FAIL', DATEDIFF(millisecond, @t0, SYSDATETIME()), @err);
+        RAISERROR(N'    FAIL %s: %s', 10, 1, @name, @err) WITH NOWAIT;
+    END CATCH;
+END;
+
+DELETE dbo.HC_selftest_results
+WHERE run_at NOT IN (SELECT DISTINCT TOP (@keep_runs) run_at FROM dbo.HC_selftest_results ORDER BY run_at DESC);
+
+DECLARE @pass int, @fail int, @skip int;
+SELECT @pass = SUM(CASE WHEN result = 'PASS' THEN 1 ELSE 0 END),
+       @fail = SUM(CASE WHEN result = 'FAIL' THEN 1 ELSE 0 END),
+       @skip = SUM(CASE WHEN result = 'SKIPPED' THEN 1 ELSE 0 END)
+FROM dbo.HC_selftest_results WHERE run_at = @run_at;
+RAISERROR(N'Self-test finished: %d passed, %d failed, %d skipped. Details: SELECT * FROM dbo.HC_selftest_last;', 10, 1,
+          @pass, @fail, @skip) WITH NOWAIT;
+
+SELECT result, COUNT(*) AS checks FROM dbo.HC_selftest_results WHERE run_at = @run_at GROUP BY result ORDER BY result;
+SELECT name, section, result, duration_ms, message
+FROM dbo.HC_selftest_results WHERE run_at = @run_at AND result <> 'PASS'
+ORDER BY result, TRY_CAST(PARSENAME(section, 2) AS int), TRY_CAST(PARSENAME(section, 1) AS int);
+GO
+IF OBJECT_ID(N'dbo.HC_selftest_last', N'V') IS NULL
+    EXEC (N'CREATE VIEW dbo.HC_selftest_last AS SELECT 1 AS placeholder;');
+GO
+ALTER VIEW dbo.HC_selftest_last
+AS
+SELECT run_at, name, section, result, duration_ms, message
+FROM dbo.HC_selftest_results
+WHERE run_at = (SELECT MAX(run_at) FROM dbo.HC_selftest_results);
+GO
+
+/*============================================================================
+  SNAPSHOTS: save a check's output now, compare it later
+     EXEC dbo.HC_snapshot N'change', @label = N'pre-patch';         -- the 'change' set
+     EXEC dbo.HC_snapshot N'HC_logins, HC_job_inventory';            -- any list of checks
+     EXEC dbo.HC_snapshot N'HC_index_usage', @database_name = N'Sales';
+     EXEC dbo.HC_snapshot_diff @before_label = N'pre-patch', @after_label = N'post-patch';
+     SELECT * FROM dbo.HC_snapshot_list;
+     EXEC dbo.HC_snapshot_show @snapshot_id = 12;
+  Checks made of plain queries can be saved (each result set separately); checks that
+  use variables, temp tables or DBCC can't (HC_catalog.can_snapshot).
+============================================================================*/
+IF OBJECT_ID(N'dbo.HC_snapshots', N'U') IS NULL
+    CREATE TABLE dbo.HC_snapshots
+    (
+        snapshot_id    int IDENTITY(1,1) NOT NULL CONSTRAINT PK_HC_snapshots PRIMARY KEY,
+        captured_at    datetime2(0)  NOT NULL CONSTRAINT DF_HC_snapshots_at DEFAULT SYSDATETIME(),
+        label          nvarchar(100) NOT NULL,
+        object_name    sysname       NOT NULL,
+        database_name  sysname       NULL,          -- NULL = server-level check
+        result_set     int           NOT NULL CONSTRAINT DF_HC_snapshots_rs DEFAULT 1,
+        row_count      int           NULL,
+        captured_by    nvarchar(128) NOT NULL CONSTRAINT DF_HC_snapshots_by DEFAULT ORIGINAL_LOGIN(),
+        data           nvarchar(max) NOT NULL       -- the rows, as a JSON array
+    );
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.HC_snapshots') AND name = N'IX_HC_snapshots_label')
+    CREATE INDEX IX_HC_snapshots_label ON dbo.HC_snapshots (label, object_name, database_name, result_set, snapshot_id);
+GO
+
+IF OBJECT_ID(N'dbo.HC_snapshot', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_snapshot AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_snapshot
+    @name          nvarchar(4000),          -- a set name (N'change'), one check, or a comma-separated list
+    @label         nvarchar(100) = NULL,    -- default: the current date and time
+    @database_name sysname       = N'*',    -- per-database checks: one database or N'*'
+    @keep_days     int           = 90       -- older snapshots are removed
+AS
+SET NOCOUNT ON;
+SET LOCK_TIMEOUT 5000;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET DEADLOCK_PRIORITY LOW;
+IF @label IS NULL SET @label = CONVERT(nvarchar(19), SYSDATETIME(), 120);
+IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND @database_name = N'*' SET @database_name = DB_NAME();
+
+DECLARE @list TABLE (n int IDENTITY(1,1), name sysname);
+IF EXISTS (SELECT 1 FROM dbo.HC_snapshot_sets WHERE set_name = @name)
+    INSERT @list (name) SELECT object_name FROM dbo.HC_snapshot_sets WHERE set_name = @name ORDER BY object_name;
+ELSE
+BEGIN
+    -- split the comma list (XML, so it works at any compatibility level)
+    DECLARE @x xml = CAST(N'<i>' + REPLACE((SELECT @name FOR XML PATH('')), N',', N'</i><i>') + N'</i>' AS xml);
+    INSERT @list (name)
+    SELECT DISTINCT CASE WHEN v LIKE N'HC[_]%' THEN v ELSE N'HC_' + v END
+    FROM (SELECT LTRIM(RTRIM(i.value('.', 'nvarchar(128)'))) AS v FROM @x.nodes('/i') AS t(i)) AS s
+    WHERE v <> N'';
+END;
+
+CREATE TABLE #frag (id int IDENTITY(1,1), chunk nvarchar(max));
+DECLARE @out TABLE (object_name sysname, database_name sysname NULL, result_set int NULL, snapshot_id int NULL, row_count int NULL, note nvarchar(2000) NULL);
+DECLARE @i int = 0, @cnt int = (SELECT COUNT(*) FROM @list), @obj sysname, @sql nvarchar(max), @scope varchar(10),
+        @type char(2), @db sysname, @exec nvarchar(400), @json nvarchar(max), @rows int, @err nvarchar(2000), @j int, @dbcnt int;
+DECLARE @dbs TABLE (n int IDENTITY(1,1), name sysname);
+DECLARE @q TABLE (n int IDENTITY(1,1), query nvarchar(max));
+DECLARE @sep nvarchar(40) = N'--#HC_NEXT_RESULT#',      -- marker line between queries (line endings don't matter)
+        @rest nvarchar(max), @pos bigint, @k int, @qcnt int, @qid int;
+
+WHILE @i < @cnt
+BEGIN
+    SET @i += 1;
+    SELECT @obj = l.name, @sql = r.capture_sql, @scope = r.capture_scope, @type = o.type
+    FROM @list AS l
+    LEFT JOIN dbo.HC_objects AS r ON r.name = l.name
+    LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(N'dbo.' + QUOTENAME(l.name))
+    WHERE l.n = @i;
+
+    IF @type IS NULL
+    BEGIN INSERT @out (object_name, note) VALUES (@obj, N'not installed on this server'); CONTINUE; END;
+    IF @sql IS NULL
+    BEGIN INSERT @out (object_name, note) VALUES (@obj, N'uses variables / temp tables / DBCC - can''t be saved'); CONTINUE; END;
+    IF RTRIM(@type) = 'P' AND @scope = 'server' AND @sql LIKE N'SELECT * FROM dbo.%'     -- view installed as a procedure
+    BEGIN INSERT @out (object_name, note) VALUES (@obj, N'installed as a procedure here - can''t be saved'); CONTINUE; END;
+
+    -- one query per result set
+    DELETE @q;
+    SET @rest = @sql;
+    WHILE @rest IS NOT NULL
+    BEGIN
+        SET @pos = CHARINDEX(@sep, @rest);
+        IF @pos = 0 BEGIN INSERT @q (query) VALUES (@rest); SET @rest = NULL; END
+        ELSE BEGIN INSERT @q (query) VALUES (LEFT(@rest, @pos - 1)); SET @rest = SUBSTRING(@rest, @pos + LEN(@sep), LEN(@rest)); END;
+    END;
+    SET @qcnt = (SELECT COUNT(*) FROM @q);
+
+    DELETE @dbs;
+    IF @scope = 'database'
+        INSERT @dbs (name) SELECT name FROM dbo.HC_fn_databases(@database_name) ORDER BY name;
+    ELSE
+        INSERT @dbs (name) VALUES (DB_NAME());
+    SELECT @j = 0, @dbcnt = COUNT(*) FROM @dbs;
+    IF @dbcnt = 0 INSERT @out (object_name, note) VALUES (@obj, N'no online database matches @database_name');
+
+    WHILE @j < @dbcnt
+    BEGIN
+        SET @j += 1;
+        SELECT @db = name FROM @dbs WHERE n = @j;
+        SET @exec = QUOTENAME(@db) + N'.sys.sp_executesql';
+        SET @k = 0;
+        WHILE @k < @qcnt
+        BEGIN
+        SET @k += 1;
+        BEGIN TRY
+            TRUNCATE TABLE #frag;
+            SELECT @json = query + N' FOR JSON PATH, INCLUDE_NULL_VALUES' FROM @q WHERE n = @k;
+            INSERT #frag (chunk) EXEC @exec @json;
+            SET @json = ISNULL((SELECT chunk AS [text()] FROM #frag ORDER BY id FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), N'[]');
+            IF @json = N'' SET @json = N'[]';
+            BEGIN TRY       -- row count needs OPENJSON (compatibility level 130+); NULL otherwise
+                EXEC sys.sp_executesql N'SET @r = (SELECT COUNT(*) FROM OPENJSON(@j));', N'@j nvarchar(max), @r int OUTPUT',
+                     @j = @json, @r = @rows OUTPUT;
+            END TRY
+            BEGIN CATCH
+                SET @rows = NULL;
+            END CATCH;
+            INSERT dbo.HC_snapshots (label, object_name, database_name, result_set, row_count, data)
+            VALUES (@label, @obj, CASE WHEN @scope = 'database' THEN @db END, @k, @rows, @json);
+            INSERT @out (object_name, database_name, result_set, snapshot_id, row_count)
+            VALUES (@obj, CASE WHEN @scope = 'database' THEN @db END, @k, SCOPE_IDENTITY(), @rows);
+        END TRY
+        BEGIN CATCH
+            SET @err = ERROR_MESSAGE();
+            INSERT @out (object_name, database_name, result_set, note) VALUES (@obj, @db, @k, N'failed: ' + @err);
+        END CATCH;
+        END;
+    END;
+END;
+
+DELETE dbo.HC_snapshots WHERE captured_at < DATEADD(day, -@keep_days, SYSDATETIME());
+SELECT @label AS label, object_name, database_name, result_set, snapshot_id, row_count, note
+FROM @out ORDER BY object_name, database_name, result_set;
+GO
+
+IF OBJECT_ID(N'dbo.HC_snapshot_list', N'V') IS NULL
+    EXEC (N'CREATE VIEW dbo.HC_snapshot_list AS SELECT 1 AS placeholder;');
+GO
+ALTER VIEW dbo.HC_snapshot_list
+AS
+SELECT snapshot_id, captured_at, label, object_name, database_name, result_set, row_count, captured_by,
+       DATALENGTH(data) / 1024 AS size_kb
+FROM dbo.HC_snapshots;
+GO
+
+-- Builds "OPENJSON(...) WITH ([col] nvarchar(max) '$."col"', ...)" column list from the first row of a snapshot
+IF OBJECT_ID(N'dbo.HC_usp_snapshot_columns', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_usp_snapshot_columns AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_usp_snapshot_columns
+    @json  nvarchar(max),
+    @with  nvarchar(max) OUTPUT,
+    @first sysname       OUTPUT
+AS
+SET NOCOUNT ON;
+DECLARE @k TABLE (n int IDENTITY(1,1), k nvarchar(4000));
+INSERT @k (k) SELECT [key] FROM OPENJSON(@json, N'$[0]');
+SET @first = (SELECT TOP (1) LEFT(k, 128) FROM @k ORDER BY n);
+SET @with = STUFF((
+    SELECT N', ' + QUOTENAME(LEFT(k, 128)) + N' nvarchar(max) ''$."'
+         + REPLACE(REPLACE(REPLACE(k, N'\', N'\\'), N'"', N'\"'), N'''', N'''''') + N'"'''
+    FROM @k ORDER BY n
+    FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, N'');
+GO
+
+IF OBJECT_ID(N'dbo.HC_snapshot_show', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_snapshot_show AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_snapshot_show
+    @snapshot_id int
+AS
+SET NOCOUNT ON;
+DECLARE @json nvarchar(max), @with nvarchar(max), @first sysname, @sql nvarchar(max);
+SELECT @json = data FROM dbo.HC_snapshots WHERE snapshot_id = @snapshot_id;
+IF @json IS NULL BEGIN RAISERROR(N'Snapshot %d not found.', 16, 1, @snapshot_id); RETURN; END;
+SELECT snapshot_id, captured_at, label, object_name, database_name, result_set, row_count, captured_by
+FROM dbo.HC_snapshots WHERE snapshot_id = @snapshot_id;
+EXEC dbo.HC_usp_snapshot_columns @json, @with OUTPUT, @first OUTPUT;
+IF @with IS NULL BEGIN SELECT N'(no rows)' AS result; RETURN; END;
+SET @sql = N'SELECT j.* FROM OPENJSON(@json) WITH (' + @with + N') AS j;';
+EXEC sys.sp_executesql @sql, N'@json nvarchar(max)', @json = @json;
+GO
+
+IF OBJECT_ID(N'dbo.HC_snapshot_diff', N'P') IS NULL
+    EXEC (N'CREATE PROCEDURE dbo.HC_snapshot_diff AS RETURN;');
+GO
+ALTER PROCEDURE dbo.HC_snapshot_diff
+    @before_label nvarchar(100) = NULL,   -- compare every check saved under both labels ...
+    @after_label  nvarchar(100) = NULL,
+    @before_id    int           = NULL,   -- ... or exactly two snapshots
+    @after_id     int           = NULL,
+    @name         sysname       = NULL,   -- limit to one check
+    @show_rows    bit           = 1       -- 1 = one result set of changed rows per check
+AS
+SET NOCOUNT ON;
+DECLARE @pairs TABLE (n int IDENTITY(1,1), object_name sysname, database_name sysname NULL, result_set int NULL,
+                     before_id int NULL, after_id int NULL);
+
+IF @before_id IS NOT NULL AND @after_id IS NOT NULL
+    INSERT @pairs (object_name, database_name, result_set, before_id, after_id)
+    SELECT b.object_name, b.database_name, b.result_set, @before_id, @after_id
+    FROM dbo.HC_snapshots AS b WHERE b.snapshot_id = @before_id;
+ELSE IF @before_label IS NOT NULL AND @after_label IS NOT NULL
+BEGIN
+    ;WITH b AS (SELECT object_name, database_name, result_set, MAX(snapshot_id) AS id FROM dbo.HC_snapshots
+               WHERE label = @before_label AND (@name IS NULL OR object_name = @name)
+               GROUP BY object_name, database_name, result_set),
+         a AS (SELECT object_name, database_name, result_set, MAX(snapshot_id) AS id FROM dbo.HC_snapshots
+               WHERE label = @after_label AND (@name IS NULL OR object_name = @name)
+               GROUP BY object_name, database_name, result_set)
+    INSERT @pairs (object_name, database_name, result_set, before_id, after_id)
+    SELECT COALESCE(b.object_name, a.object_name), COALESCE(b.database_name, a.database_name),
+           COALESCE(b.result_set, a.result_set), b.id, a.id
+    FROM b FULL JOIN a ON a.object_name = b.object_name
+                      AND ISNULL(a.database_name, N'') = ISNULL(b.database_name, N'')
+                      AND a.result_set = b.result_set
+    ORDER BY 1, 2, 3;
+END
+ELSE
+BEGIN RAISERROR(N'Pass @before_label and @after_label, or @before_id and @after_id.', 16, 1); RETURN; END;
+
+DECLARE @summary TABLE (object_name sysname, database_name sysname NULL, result_set int NULL, before_id int NULL, after_id int NULL,
+                        before_rows int NULL, after_rows int NULL, only_before int NULL, only_after int NULL);
+DECLARE @i int = 0, @cnt int = (SELECT COUNT(*) FROM @pairs), @b nvarchar(max), @a nvarchar(max), @bid int, @aid int,
+        @with nvarchar(max), @first sysname, @sql nvarchar(max), @obj sysname, @db sysname, @rs int;
+WHILE @i < @cnt
+BEGIN
+    SET @i += 1;
+    SELECT @obj = object_name, @db = database_name, @rs = result_set, @bid = before_id, @aid = after_id FROM @pairs WHERE n = @i;
+    SELECT @b = data FROM dbo.HC_snapshots WHERE snapshot_id = @bid;
+    SELECT @a = data FROM dbo.HC_snapshots WHERE snapshot_id = @aid;
+    IF @bid IS NULL SET @b = NULL;
+    IF @aid IS NULL SET @a = NULL;
+    INSERT @summary
+    SELECT @obj, @db, @rs, @bid, @aid,
+           (SELECT COUNT(*) FROM OPENJSON(@b)), (SELECT COUNT(*) FROM OPENJSON(@a)),
+           (SELECT COUNT(*) FROM (SELECT value FROM OPENJSON(@b) EXCEPT SELECT value FROM OPENJSON(@a)) AS x),
+           (SELECT COUNT(*) FROM (SELECT value FROM OPENJSON(@a) EXCEPT SELECT value FROM OPENJSON(@b)) AS y);
+END;
+
+SELECT object_name, database_name, result_set, before_id, after_id, before_rows, after_rows,
+       only_before AS rows_only_before, only_after AS rows_only_after,
+       CASE WHEN before_id IS NULL THEN 'only in after'
+            WHEN after_id  IS NULL THEN 'only in before'
+            WHEN only_before + only_after = 0 THEN 'same'
+            ELSE 'changed' END AS result
+FROM @summary
+ORDER BY CASE WHEN before_id IS NOT NULL AND after_id IS NOT NULL AND only_before + only_after = 0 THEN 1 ELSE 0 END,
+         object_name, database_name, result_set;
+
+IF @show_rows = 1
+BEGIN
+    SET @i = 0;
+    WHILE @i < @cnt
+    BEGIN
+        SET @i += 1;
+        SELECT @obj = object_name, @db = database_name, @rs = result_set, @bid = before_id, @aid = after_id FROM @pairs WHERE n = @i;
+        IF @bid IS NULL OR @aid IS NULL
+           OR EXISTS (SELECT 1 FROM @summary WHERE before_id = @bid AND after_id = @aid AND only_before + only_after = 0)
+            CONTINUE;
+        SELECT @b = data FROM dbo.HC_snapshots WHERE snapshot_id = @bid;
+        SELECT @a = data FROM dbo.HC_snapshots WHERE snapshot_id = @aid;
+        SET @with = NULL;
+        EXEC dbo.HC_usp_snapshot_columns @b, @with OUTPUT, @first OUTPUT;
+        IF @with IS NULL EXEC dbo.HC_usp_snapshot_columns @a, @with OUTPUT, @first OUTPUT;
+        IF @with IS NULL CONTINUE;
+        SET @sql = N'
+SELECT @obj AS [check], @db AS [database], @rs AS result_set, d.change, j.*
+FROM (SELECT N''before'' AS change, value FROM (SELECT value FROM OPENJSON(@b) EXCEPT SELECT value FROM OPENJSON(@a)) AS x
+      UNION ALL
+      SELECT N''after'', value FROM (SELECT value FROM OPENJSON(@a) EXCEPT SELECT value FROM OPENJSON(@b)) AS y) AS d
+CROSS APPLY OPENJSON(d.value) WITH (' + @with + N') AS j
+ORDER BY j.' + QUOTENAME(@first) + N', d.change DESC;';
+        EXEC sys.sp_executesql @sql, N'@b nvarchar(max), @a nvarchar(max), @obj sysname, @db sysname, @rs int',
+             @b = @b, @a = @a, @obj = @obj, @db = @db, @rs = @rs;
+    END;
+END;
+GO
+
+/*============================================================================
+  VERSION: which build is installed and how healthy it is
+     SELECT * FROM dbo.HC_version;
+============================================================================*/
+IF OBJECT_ID(N'dbo.HC_version', N'V') IS NULL
+    EXEC (N'CREATE VIEW dbo.HC_version AS SELECT 1 AS placeholder;');
+GO
+ALTER VIEW dbo.HC_version
+AS
+SELECT TOP (1)
+    h.build_id,
+    h.finished_at                      AS deployed_at,
+    h.login_name                       AS deployed_by,
+    h.product_version                  AS sql_version_at_deploy,
+    h.objects_ok, h.objects_failed, h.objects_skipped,
+    t.last_selftest_at, t.selftest_pass, t.selftest_fail, t.selftest_skipped
+FROM dbo.HC_deploy_history AS h
+OUTER APPLY (SELECT MAX(run_at) AS last_selftest_at,
+                    SUM(CASE WHEN result = 'PASS' THEN 1 ELSE 0 END)    AS selftest_pass,
+                    SUM(CASE WHEN result = 'FAIL' THEN 1 ELSE 0 END)    AS selftest_fail,
+                    SUM(CASE WHEN result = 'SKIPPED' THEN 1 ELSE 0 END) AS selftest_skipped
+             FROM dbo.HC_selftest_results
+             WHERE run_at = (SELECT MAX(run_at) FROM dbo.HC_selftest_results)) AS t
+WHERE h.finished_at IS NOT NULL
+ORDER BY h.deploy_id DESC;
+GO
+
 /*----------------------------------------------------------------------------
-  Remove objects an earlier run installed that this version no longer contains
+  Remove objects an earlier run installed that this build no longer contains
   (only names registered in dbo.HC_objects are touched - nothing else in DBAdmin)
 ----------------------------------------------------------------------------*/
 DECLARE @run_start datetime2(0) = CAST(SESSION_CONTEXT(N'hc_run_start') AS datetime2(0)),
         @n sysname, @t char(2), @cmd nvarchar(400);
+IF @run_start IS NULL      -- batches ran on separate connections: use this run's history row instead
+    SET @run_start = (SELECT TOP (1) started_at FROM dbo.HC_deploy_history WHERE finished_at IS NULL ORDER BY deploy_id DESC);
+IF @run_start IS NOT NULL
+   AND (SELECT COUNT(*) FROM dbo.HC_objects WHERE deployed_at >= @run_start) < 287
+BEGIN
+    PRINT N'Clean-up skipped: not every object of this build was deployed in this run (partial run?).';
+    SET @run_start = NULL;
+END;
 IF @run_start IS NOT NULL
 BEGIN
     DECLARE stale CURSOR LOCAL FAST_FORWARD FOR
@@ -9574,8 +18056,25 @@ END;
 GO
 
 /*----------------------------------------------------------------------------
-  Deployment summary
+  Finish the deploy history row + summary
 ----------------------------------------------------------------------------*/
+DECLARE @deploy_id int = ISNULL(CAST(SESSION_CONTEXT(N'hc_deploy_id') AS int),
+        (SELECT MAX(deploy_id) FROM dbo.HC_deploy_history WHERE finished_at IS NULL));
+UPDATE h
+SET finished_at     = SYSDATETIME(),
+    objects_ok      = s.ok,
+    objects_failed  = s.failed,
+    objects_skipped = s.skipped
+FROM dbo.HC_deploy_history AS h
+CROSS JOIN (SELECT SUM(CASE WHEN status LIKE 'OK%' THEN 1 ELSE 0 END)  AS ok,
+                   SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status IN ('NOT APPLICABLE', 'NOT ON THIS VERSION') THEN 1 ELSE 0 END) AS skipped
+            FROM dbo.HC_objects) AS s
+WHERE h.deploy_id = @deploy_id;
+DELETE dbo.HC_deploy_history WHERE deploy_id <= @deploy_id - 50;   -- keep the last 50 deploys
+
+SELECT build_id, deployed_at, objects_ok, objects_failed, objects_skipped FROM dbo.HC_version;
+
 SELECT status, COUNT(*) AS objects
 FROM dbo.HC_objects
 GROUP BY status
