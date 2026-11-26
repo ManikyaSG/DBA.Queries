@@ -4,7 +4,7 @@
 #   #region DbaCommon ... #endregion DbaCommon
 # so each tool still deploys as a single .ps1. After editing this file run
 #   automation/common/Sync-DbaCommon.ps1
-# (CI fails if a tool's copy differs from this file.)
+# (the unit tests fail if a tool's copy differs from this file.)
 # -----------------------------------------------------------------------------
 
 function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }

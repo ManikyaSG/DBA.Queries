@@ -1,6 +1,6 @@
 # One-click PRE / POST change check
 
-> **Files on the VM:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`, plus your `settings.psd1` and, optionally, `db_mail_setup.sql`. Keep them together in one folder, for example `C:\DBA\PrePostCheck`. Install and update from a **release zip** (see [Install and update](#install-and-update)). The older `automation/health-check` folder (script 44) isn't needed.
+> **Files on the VM:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`, plus your `settings.psd1` and, optionally, `db_mail_setup.sql`. Keep them together in one folder, for example `C:\DBA\PrePostCheck` (see [Install and update](#install-and-update)). The older `automation/health-check` folder (script 44) isn't needed.
 >
 > **Version 3.0.0** ([CHANGELOG](CHANGELOG.md)): settings moved to `settings.psd1`, checks are defined in `HC_Snapshot.sql`, and the CLEANUP option is gone (every run cleans up).
 
@@ -43,25 +43,22 @@ The report and email footer show the script version, the `HC_Snapshot.sql` versi
 | `Run-PrePostCheck.bat` | Double-click this. Starts the Secondary Logon service if needed, then runs the PowerShell script. |
 | `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. Holds the default settings. |
 | `HC_Snapshot.sql` | All the checks, run on every instance, and their `--@check` definitions (what is compared and how each section is shown). Must be the same version as the script. |
-| `settings.psd1` | *Your settings* (recipients, mail profile, extra instances, tolerances). Not in the repo or the release zip, so updates never overwrite it. Start from `settings.example.psd1`. |
+| `settings.psd1` | *Your settings* (recipients, mail profile, extra instances, tolerances). Not in the repo, so copying a newer version of the scripts never overwrites it. Start from `settings.example.psd1`. |
 | `settings.example.psd1` | Every setting with its default and a short explanation. |
 | `db_mail_setup.sql` | *Optional, your own file.* Run automatically on an instance where Database Mail is disabled or not configured. |
-| `Update-Tool.ps1` | In the release zip: updates this folder to a newer release (see below). |
 | `CHANGELOG.md` | What changed in each version. |
 
 Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\` (HTML) and `Logs\`.
 
 ## Install and update
 
-Each version is published as a GitHub release, `pre-post-check/vX.Y.Z`, with a zip of this folder: [Releases](https://github.com/ManikyaSG/DBA.Queries/releases).
-
 **First install on a VM**
-1. Unzip the release into a folder **your own account can read and write**, for example `C:\DBA\PrePostCheck`. Snapshots must be writable there.
+1. Copy `Run-PrePostCheck.bat`, `Invoke-PrePostCheck.ps1`, `HC_Snapshot.sql` and `settings.example.psd1` to a folder **your own account can read and write**, for example `C:\DBA\PrePostCheck`. Snapshots must be writable there.
 2. Copy `settings.example.psd1` to `settings.psd1` and set at least `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below), and list instances on other VMs (for example AG replicas) in `ExtraInstances = @('SQLVM2', 'SQLVM3\INST2')`. You only need to keep the lines you change.
 
-**Update an existing VM:** run `.\Update-Tool.ps1` in the folder (Windows PowerShell). It downloads the newest release, copies the files it replaces to `_previous\<old version>_<time>\`, and never touches `settings.psd1`, `db_mail_setup.sql`, `servers.txt` or the `Snapshots` / `Reports` / `Logs` folders. `-Version 3.0.1` picks a version, and `-ZipFile <path>` uses a zip you copied to the VM yourself (no internet needed). `-WhatIf` shows what would change.
+**Update a VM:** copy the new `Invoke-PrePostCheck.ps1` **and** `HC_Snapshot.sql` over the old ones (always both: they carry the same version, and the run warns if they differ). Leave `settings.psd1`, `db_mail_setup.sql` and the `Snapshots` / `Reports` / `Logs` folders as they are.
 
-**Coming from a version before 3.0.0** (settings in the script's `$Config` block): `Update-Tool.ps1` reads the values you changed in the old script and writes them to `settings.psd1` for you. If you copy the files by hand instead, set your values in `settings.psd1` first, because the new script's `$Config` has the defaults only.
+**Coming from a version before 3.0.0** (settings in the script's `$Config` block): before you replace the script, note the values you changed in its `$Config` block (`Recipients`, `MailProfile`, `ExtraInstances`, ...) and put them in `settings.psd1`. The new script's `$Config` has the defaults only.
 
 > Don't edit `Invoke-PrePostCheck.ps1` on a VM. A change made there is lost at the next update and makes that VM differ from the others. Put settings in `settings.psd1`, and change checks in the repo (see [Adding or changing a check](#adding-or-changing-a-check)).
 
@@ -143,7 +140,7 @@ SELECT N'databases' AS _section, d.name, d.state_desc AS state, ...
 Sections appear in the report in the order of the file. To add a check:
 1. Add the `SELECT` (every value cast to text) and its `--@check` lines.
 2. Raise the version in both `HC_Snapshot.sql` (`--@version`) and `Invoke-PrePostCheck.ps1` (`$ToolVersion`), and add a line to `CHANGELOG.md`.
-3. Push. CI checks that every `SELECT` has a definition, that every column a definition names is returned, and runs the file on SQL Server 2017 to 2025 (see [automation/README.md](../README.md)).
+3. Run the unit tests (see [automation/README.md](../README.md#tests-run-by-hand)). They check that every `SELECT` has a definition and that every column a definition names is in its `SELECT`. Then try it on a non-production VM before copying it to the others.
 
 At run time the script also warns if a definition names a column the `SELECT` didn't return, or if the SQL returns a section without a definition (that section is still shown, at the end of the report).
 

@@ -1,6 +1,6 @@
 # Settings for Invoke-PrePostCheck.ps1
 # Copy this file to settings.psd1 in the same folder and change what you need.
-# settings.psd1 is never part of a release, so updating the scripts keeps your values.
+# settings.psd1 is not in the repo, so copying a newer version of the scripts keeps your values.
 # Anything you leave out (or delete from here) uses the default shown below.
 # Paths can be relative to this folder. A setting name the script doesn't know is reported.
 @{

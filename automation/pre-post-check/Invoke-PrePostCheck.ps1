@@ -98,7 +98,7 @@ $ErrorActionPreference = 'Stop'
 #   #region DbaCommon ... #endregion DbaCommon
 # so each tool still deploys as a single .ps1. After editing this file run
 #   automation/common/Sync-DbaCommon.ps1
-# (CI fails if a tool's copy differs from this file.)
+# (the unit tests fail if a tool's copy differs from this file.)
 # -----------------------------------------------------------------------------
 
 function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
@@ -1037,7 +1037,7 @@ try {
     $sqlVersion = if ($sqlText -match '(?m)^--@version\s+(\S+)') { $Matches[1] } else { '(none)' }
     Write-Step "Version    : Invoke-PrePostCheck $ToolVersion, HC_Snapshot.sql $sqlVersion$(if ($script:SettingsUsed) { ", settings $($script:SettingsUsed)" })"
     if ($sqlVersion -ne $ToolVersion) {
-        Write-Step "WARNING: HC_Snapshot.sql is version $sqlVersion but this script is $ToolVersion - copy both files from the same release." 'Yellow'
+        Write-Step "WARNING: HC_Snapshot.sql is version $sqlVersion but this script is $ToolVersion - copy both files from the same version." 'Yellow'
     }
     $checkDefs = Get-CheckDefinitions $sqlText
     $Checks = $checkDefs.Checks

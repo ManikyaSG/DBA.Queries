@@ -1,6 +1,6 @@
 # Settings for Collect-PerfCheckReports.ps1
 # Copy this file to settings.psd1 in the same folder and change what you need.
-# settings.psd1 is never part of a release, so updating the script keeps your values.
+# settings.psd1 is not in the repo, so copying a newer version of the script keeps your values.
 # Anything you leave out uses the default in the script. Paths can be relative to this folder.
 @{
     # --- What to collect ---------------------------------------------------------------

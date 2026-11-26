@@ -8,7 +8,7 @@
         #region DbaCommon ...
         #endregion DbaCommon
     Edit DbaCommon.ps1, then run this script. -Check only reports (exit code 1 if a copy is
-    out of date); CI runs it that way.
+    out of date).
 
 .EXAMPLE
     .\automation\common\Sync-DbaCommon.ps1

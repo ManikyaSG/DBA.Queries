@@ -1,9 +1,11 @@
-# Integration tests against a real SQL Server (CI starts one in a container per version).
+# Integration tests against a TEST SQL Server instance - run by hand, never on production.
+# They create and drop a test database and login, change 'cost threshold for parallelism'
+# for a moment (and put it back), and set up Database Mail with a dummy SMTP account.
 #   $env:SQLCI_SERVER   = 'localhost,1433'
-#   $env:SQLCI_PASSWORD = '<sa password>'
+#   $env:SQLCI_PASSWORD = '<sa password of the test instance>'
 #   Invoke-Pester ./automation/tests/Integration.Tests.ps1 -Output Detailed
-# They run the SQL exactly as the tools do (System.Data.SqlClient, one connection),
-# with SQL authentication because the containers are Linux.
+# They run the SQL exactly as the tools do (System.Data.SqlClient, one connection), with SQL
+# authentication (sa). Nothing here touches usp_DBA_HealthPerfCheck or creates Agent jobs.
 
 BeforeAll {
     . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
@@ -18,7 +20,7 @@ BeforeAll {
     $script:RunStart = Get-Date
 
     function New-CiConnection([string]$Database = 'master') {
-        $cs = "Server=$($env:SQLCI_SERVER);Database=$Database;User ID=sa;Password=$($env:SQLCI_PASSWORD);Encrypt=False;TrustServerCertificate=True;Connect Timeout=30;Application Name=DBA automation CI"
+        $cs = "Server=$($env:SQLCI_SERVER);Database=$Database;User ID=sa;Password=$($env:SQLCI_PASSWORD);Encrypt=False;TrustServerCertificate=True;Connect Timeout=30;Application Name=DBA automation tests"
         $c = New-Object System.Data.SqlClient.SqlConnection $cs
         $c.Open()
         return $c
@@ -123,61 +125,8 @@ Describe 'Database Mail (setup script, profile detection, sending)' {
     It 'Send-DbMailItem queues a mail item and Get-DbMailItemStatus reads it back' {
         if ($script:MailSkip) { Set-ItResult -Skipped -Because 'Database Mail setup did not run'; return }
         $prof = Get-MailProfileName $Conn
-        $id = Send-DbMailItem -Connection $Conn -ProfileName $prof -Recipients 'ci@example.invalid' -Subject "CI test $(Get-Date -Format o)" -Body '<b>CI</b>'
+        $id = Send-DbMailItem -Connection $Conn -ProfileName $prof -Recipients 'test@example.invalid' -Subject "Automation test $(Get-Date -Format o)" -Body '<b>test</b>'
         $id | Should -BeGreaterThan 0
         Get-DbMailItemStatus $Conn $id | Should -Match '^(unsent|sent|retrying|failed)'
-    }
-}
-
-Describe 'perf-check-reports: HealthPerfCheck_AgentJob.sql' {
-    BeforeAll {
-        $text = [System.IO.File]::ReadAllText((Join-Path $AutomationRoot 'perf-check-reports/HealthPerfCheck_AgentJob.sql'))
-        $cut = $text.IndexOf("/*=============================================================================`n  PART 3")
-        if ($cut -lt 0) { $cut = $text.IndexOf("/*=============================================================================`r`n  PART 3") }
-        $script:Part12 = $text.Substring(0, $cut)     # PART 3 (the collector job) needs the coordinator's name
-        [void](Invoke-CiBatches $Conn "IF DB_ID(N'DBAdmin') IS NULL CREATE DATABASE DBAdmin;")
-    }
-    It 'PART 1 (objects) and PART 2 (job) install without errors' {
-        $msgs = Invoke-CiBatches $Conn $script:Part12 600
-        ($msgs -join "`n") | Should -Match 'PART 1 done'
-        Invoke-Scalar $Conn "SELECT COUNT(*) FROM msdb.dbo.sysjobs WHERE name = N'DBA - Health & Performance Check'" | Should -Be 1
-    }
-    It 'PART 1 and PART 2 can run again (upgrade in place)' {
-        { Invoke-CiBatches $Conn $script:Part12 600 } | Should -Not -Throw
-    }
-    It 'the check runs as the Agent job runs it (ODBC / sqlcmd) and saves a finished report' {
-        # SQL Agent runs T-SQL job steps through ODBC, so this is the production path.
-        if (-not $env:SQLCI_CONTAINER) { Set-ItResult -Skipped -Because 'SQLCI_CONTAINER (docker container name) not set'; return }
-        $sqlcmd = (docker exec $env:SQLCI_CONTAINER bash -c 'ls /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd 2>/dev/null | head -n 1')
-        if (-not $sqlcmd) { Set-ItResult -Skipped -Because 'no sqlcmd in this SQL Server image'; return }
-        $sqlcmdArgs = @('-S', 'localhost', '-U', 'sa', '-P', $env:SQLCI_PASSWORD, '-d', 'DBAdmin', '-b', '-I',
-                        '-Q', "EXEC dbo.usp_DBA_HealthPerfCheck @SampleSec = 5, @DurationMin = 1, @SendEmail = 0, @SaveToTable = 1, @PrimaryOnly = 1, @Label = N'CI-ODBC';")
-        if ($sqlcmd -like '*tools18*') { $sqlcmdArgs = @('-C') + $sqlcmdArgs }
-        $out = docker exec $env:SQLCI_CONTAINER $sqlcmd @sqlcmdArgs 2>&1
-        $rc = $LASTEXITCODE
-        Write-Host "sqlcmd exit code $rc"; Write-Host (($out | Select-Object -Last 5) -join "`n")
-        $rc | Should -Be 0 -Because (($out | Out-String).Trim())
-        $r = [string](Invoke-Scalar $Conn "SELECT TOP (1) status + '|' + CAST(LEN(report_html) AS varchar(20)) FROM DBAdmin.dbo.DBA_PerfCheck_Report WHERE label = N'CI-ODBC' ORDER BY run_id DESC;")
-        $r | Should -Match '^(OK|WARNING|CRITICAL)\|\d{4,}' -Because $r
-    }
-    It 'the check called from .NET (System.Data.SqlClient, as in SSMS / PowerShell) saves a finished report' {
-        $c = New-CiConnection 'DBAdmin'
-        $clientError = $null
-        try {
-            $cmd = $c.CreateCommand(); $cmd.CommandTimeout = 600
-            $cmd.CommandText = 'EXEC dbo.usp_DBA_HealthPerfCheck @SampleSec = 5, @DurationMin = 1, @SendEmail = 0, @SaveToTable = 1, @PrimaryOnly = 1, @Label = N''CI'';'
-            try { [void]$cmd.ExecuteNonQuery() } catch { $clientError = Get-SqlErrorMessage $_ }
-        }
-        finally { $c.Dispose() }
-        $r = [string](Invoke-Scalar $Conn "SELECT TOP (1) status + '|' + CAST(LEN(report_html) AS varchar(20)) + '|' + ISNULL(error_message, '') FROM DBAdmin.dbo.DBA_PerfCheck_Report WHERE label = N'CI' ORDER BY run_id DESC;")
-        Write-Host "Result row: $r"
-        $r | Should -Match '^(OK|WARNING|CRITICAL)\|\d{4,}\|' -Because $r
-        if ($clientError) {
-            # Known: SqlClient can end with 'A severe error occurred' after the procedure has finished and saved
-            # its row (the server logs no error). Reported as a warning, not a failure, while it is looked into.
-            $first = ($clientError -split "`n")[0]
-            Write-Host "::warning title=SqlClient error after usp_DBA_HealthPerfCheck finished::$first"
-            $clientError | Should -Match 'severe error' -Because "any other client error is a real failure: $clientError"
-        }
     }
 }

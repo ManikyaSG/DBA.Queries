@@ -1,6 +1,6 @@
-# Unit tests: no SQL Server needed. Run with Pester 5:
+# Unit tests: no SQL Server needed, nothing is changed anywhere. Run by hand with Pester 5
+# (Windows PowerShell 5.1 or PowerShell 7) before pushing a change to automation/:
 #   Invoke-Pester ./automation/tests/Unit.Tests.ps1 -Output Detailed
-# CI runs them on Windows PowerShell 5.1 (what the VMs use) and on PowerShell 7.
 
 BeforeAll {
     . (Join-Path $PSScriptRoot 'TestHelpers.ps1')
@@ -233,25 +233,5 @@ Describe 'Settings examples' {
         $cfg = Get-ScriptConfig $Collector
         $ex = Import-PowerShellDataFile (Join-Path $AutomationRoot 'perf-check-reports/settings.example.psd1')
         @($ex.Keys | Where-Object { -not $cfg.ContainsKey($_) }) | Should -BeNullOrEmpty
-    }
-}
-
-Describe 'Update-DbaTool settings migration' {
-    BeforeAll { . (Join-Path $AutomationRoot 'common/Update-DbaTool.ps1') }
-    It 'keeps only the values that differ from the new defaults' {
-        $old = "`$Config = @{`n  Recipients = 'team@contoso.com'`n  CleanupHours = 72`n  Encrypt = `$false`n  ExtraInstances = @('VM2\I1', 'VM3')`n  LogsFolder = Join-Path `$PSScriptRoot 'Logs'`n  Gone = 1`n}"
-        $new = "`$ToolVersion = '9.9.9'`n`$Config = @{`n  Recipients = 'dba-team@yourcompany.com'`n  CleanupHours = 48`n  Encrypt = `$false`n  ExtraInstances = @()`n  LogsFolder = Join-Path `$PSScriptRoot 'Logs'`n}"
-        $text = New-MigratedSettings $old $new
-        $file = Join-Path ([System.IO.Path]::GetTempPath()) ('mig_' + [guid]::NewGuid().ToString('N') + '.psd1')
-        try {
-            [System.IO.File]::WriteAllText($file, $text)
-            $d = Import-PowerShellDataFile $file
-            @($d.Keys | Sort-Object) -join ',' | Should -Be 'CleanupHours,ExtraInstances,Recipients'
-            $d.Recipients | Should -Be 'team@contoso.com'
-            @($d.ExtraInstances) -join '|' | Should -Be 'VM2\I1|VM3'
-        }
-        finally { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
-        New-MigratedSettings $new $new | Should -BeNullOrEmpty
-        Get-ToolVersion $new | Should -Be '9.9.9'
     }
 }
