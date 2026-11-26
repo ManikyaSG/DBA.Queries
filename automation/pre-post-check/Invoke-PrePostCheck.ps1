@@ -50,6 +50,7 @@ param(
     [switch]   $UseCurrentUser,
     [string[]] $Instances,
     [string]   $SqlFile,
+    [string]   $SettingsFile,        # default: settings.psd1 next to this script (optional)
     [switch]   $Inner,
     [string]   $HandOff,              # internal: result file shared with the original (RDP) window
     [string]   $ConsoleFile,          # internal: the hidden run-as window writes its progress here; this window shows it
@@ -60,7 +61,10 @@ param(
 $ToolVersion = '1.0.0'               # shown in the report / email footer; keep the same as --@version in HC_Snapshot.sql
 
 # =============================================================================
-#  CONFIGURATION  <== change these once
+#  DEFAULT SETTINGS
+#  Don't change them here: put your values in settings.psd1 next to this script
+#  (copy settings.example.psd1). settings.psd1 is kept when you copy in a newer
+#  version of this script, so your recipients, mail profile etc. are never lost.
 # =============================================================================
 $Config = @{
     Recipients            = 'dba-team@yourcompany.com'   # ; separated
@@ -90,6 +94,33 @@ $Config = @{
 }
 
 $ErrorActionPreference = 'Stop'
+
+# ---- settings.psd1: overrides the defaults above --------------------------------
+# Only the settings in the file are changed. Unknown names are reported (typo?) and ignored.
+# Relative paths (settings ending in Folder / File / Root) are relative to the settings file.
+if (-not $SettingsFile) { $SettingsFile = Join-Path $PSScriptRoot 'settings.psd1' }
+$script:SettingsUsed = $null
+if (Test-Path -LiteralPath $SettingsFile) {
+    try {
+        $userSettings = Import-PowerShellDataFile -LiteralPath $SettingsFile
+        $settingsDir = Split-Path -Parent (Resolve-Path -LiteralPath $SettingsFile).Path
+        foreach ($k in @($userSettings.Keys)) {
+            if (-not $Config.ContainsKey($k)) { Write-Host "Settings: '$k' in $SettingsFile is not a known setting - ignored (typo?)." -ForegroundColor Yellow; continue }
+            $v = $userSettings[$k]
+            if ($v -is [string] -and $v -and $k -match '(Folder|File|Root)$' -and -not [System.IO.Path]::IsPathRooted($v)) { $v = Join-Path $settingsDir $v }
+            if ($v -is [object[]]) { $v = @($v) }
+            $Config[$k] = $v
+        }
+        $script:SettingsUsed = (Resolve-Path -LiteralPath $SettingsFile).Path
+    }
+    catch {
+        Write-Host "ERROR: $SettingsFile could not be read: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host 'Fix the file (compare it with settings.example.psd1) and run again.' -ForegroundColor Red
+        if (-not $Inner) { Read-Host 'Press Enter to close' }
+        exit 1
+    }
+}
+
 $Phase = ([string]$Phase).Trim().ToUpperInvariant()
 if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
 if ($Phase -eq 'CLEANUP') {
@@ -830,7 +861,10 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
 #  OUTER: prompts + log on as your account (used for SQL connections)
 # =============================================================================
 if (-not $Inner) {
-    Write-Step '=== SQL Server PRE / POST change check ===' 'Green'
+    Write-Step "=== SQL Server PRE / POST change check  (v$ToolVersion) ===" 'Green'
+    if ($script:SettingsUsed) { Write-Step "Settings   : $($script:SettingsUsed)" 'DarkGray' }
+    else { Write-Step "Settings   : built-in defaults (no settings.psd1 - copy settings.example.psd1 to settings.psd1 and set your values)" 'Yellow' }
+    if ($Config.Recipients -like '*@yourcompany.com') { Write-Step "WARNING: Recipients is still the example address ($($Config.Recipients)) - set it in settings.psd1." 'Yellow' }
     while ($Phase -notin @('PRE', 'POST', 'HEALTH')) {
         Write-Host '  1 = PRE      snapshot before a change'
         Write-Host '  2 = POST     compare after the change with PRE'
@@ -897,6 +931,7 @@ if (-not $Inner) {
             $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket,
                          '-HandOff', "`"$handOffFile`"", '-ConsoleFile', "`"$consoleFile`"", '-BaselineFallback', $BaselineFallback)
             if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
+            if ($script:SettingsUsed) { $argList += @('-SettingsFile', "`"$($script:SettingsUsed)`"") }
             if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
             Write-Step "Starting the check as $($cred.UserName) (hidden window - its progress is shown here)..." 'Green'
             # No -Wait: with -Credential, Windows PowerShell's -Wait can fail with "Access is denied" AFTER the new
@@ -1285,7 +1320,7 @@ try {
         '<h3>Summary</h3>'
         [string](ConvertTo-HtmlTable $summaryRows $summaryCols '' 'status')
     ) -join '')
-    $footer = "<p style='color:#888;font-size:11px;margin-top:24px'>Invoke-PrePostCheck.ps1 $(Enc $ToolVersion) &nbsp;|&nbsp; HC_Snapshot.sql $(Enc $sqlVersion) &nbsp;|&nbsp; $(Enc $env:COMPUTERNAME)</p>"
+    $footer = "<p style='color:#888;font-size:11px;margin-top:24px'>Invoke-PrePostCheck.ps1 $(Enc $ToolVersion) &nbsp;|&nbsp; HC_Snapshot.sql $(Enc $sqlVersion) &nbsp;|&nbsp; $(Enc $env:COMPUTERNAME) &nbsp;|&nbsp; settings: $(Enc $(if ($script:SettingsUsed) { 'settings.psd1' } else { 'built-in defaults' }))</p>"
     $combinedHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + $footer + '</body></html>'
     $combinedFile = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f (Get-SafeFileName $env:COMPUTERNAME), $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
     [System.IO.File]::WriteAllText($combinedFile, $combinedHtml, [System.Text.Encoding]::UTF8)
