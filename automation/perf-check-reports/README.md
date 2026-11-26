@@ -9,6 +9,8 @@ Daily health & performance check of every SQL Server instance, **one email** wit
 | [`Collect-PerfCheckReports.ps1`](Collect-PerfCheckReports.ps1) | The collector: reads the latest result of every instance, writes one HTML file per VM, sends one email with all files attached. |
 | [`database_mail_setup.sql`](database_mail_setup.sql) | Database Mail setup / repair (only needed on the instance that sends the email). |
 | [`SETUP.txt`](SETUP.txt) | Step-by-step setup. |
+| `settings.psd1` | *Your settings* for the collector (instances, recipients, mail instance, subject). Start from [`settings.example.psd1`](settings.example.psd1); kept when the script is updated. Without it, the defaults in the script's `$Config` block are used. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Versions of the collector. Releases: `perf-check-reports/vX.Y.Z` on GitHub (zip + `Update-Tool.ps1`, see [automation/README.md](../README.md#releasing-a-version)). |
 
 ## How it works
 

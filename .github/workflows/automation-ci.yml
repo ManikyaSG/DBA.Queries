@@ -1,0 +1,118 @@
+name: automation CI
+
+# Tests for the automation tools (automation/**): unit tests on Windows PowerShell 5.1 (what
+# the VMs run) and PowerShell 7, script analysis, and the SQL against real SQL Server versions.
+on:
+  push:
+    branches: [main]
+    paths: ['automation/**', '.github/workflows/automation-ci.yml']
+  pull_request:
+    paths: ['automation/**', '.github/workflows/automation-ci.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows PowerShell 5.1
+            os: windows-latest
+            shell: powershell
+          - name: PowerShell 7
+            os: ubuntu-latest
+            shell: pwsh
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5 and PSScriptAnalyzer
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          if ($PSVersionTable.PSVersion.Major -lt 6) { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null }
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Shared core (DbaCommon) is in sync in every tool
+        run: ./automation/common/Sync-DbaCommon.ps1 -Check
+
+      - name: Unit tests
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './automation/tests/Unit.Tests.ps1'
+          $c.Run.PassThru = $true
+          $c.Output.Verbosity = 'Detailed'
+          $r = Invoke-Pester -Configuration $c
+          foreach ($t in $r.Failed) { Write-Host "::error title=Unit test failed (${{ matrix.name }})::$($t.ExpandedPath): $($t.ErrorRecord[0].Exception.Message -replace '\r?\n', ' ')" }
+          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
+
+      - name: PSScriptAnalyzer (errors fail the build, warnings are listed)
+        if: matrix.shell == 'powershell'
+        run: |
+          $all = @(Invoke-ScriptAnalyzer -Path ./automation -Recurse -Severity Error, Warning -ExcludeRule PSAvoidUsingWriteHost, PSUseShouldProcessForStateChangingFunctions, PSUseSingularNouns, PSAvoidUsingPositionalParameters)
+          $all | Sort-Object Severity, ScriptName, Line | Format-Table Severity, ScriptName, Line, RuleName, Message -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+          $errors = @($all | Where-Object { $_.Severity -eq 'Error' })
+          foreach ($x in $errors) { Write-Host "::error file=$($x.ScriptPath -replace '\\', '/'),line=$($x.Line),title=$($x.RuleName)::$($x.Message -replace '\r?\n', ' ')" }
+          if ($errors.Count) { exit 1 }
+
+  sql:
+    name: SQL Server ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['2017', '2019', '2022', '2025']
+    env:
+      SQLCI_SERVER: localhost,1433
+      SQLCI_PASSWORD: Ci_${{ github.run_id }}_Sql!x9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SQL Server ${{ matrix.version }} (with SQL Agent)
+        run: |
+          docker run -d --name sql -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$SQLCI_PASSWORD" -e MSSQL_AGENT_ENABLED=true \
+            -p 1433:1433 mcr.microsoft.com/mssql/server:${{ matrix.version }}-latest
+
+      - name: Wait until it accepts connections
+        shell: pwsh
+        run: |
+          for ($i = 0; $i -lt 60; $i++) {
+              try {
+                  $c = New-Object System.Data.SqlClient.SqlConnection "Server=$env:SQLCI_SERVER;User ID=sa;Password=$env:SQLCI_PASSWORD;Encrypt=False;TrustServerCertificate=True;Connect Timeout=5"
+                  $c.Open(); $c.Dispose(); Write-Host "ready after $($i * 5) s"; exit 0
+              } catch { Start-Sleep -Seconds 5 }
+          }
+          docker logs sql; exit 1
+
+      - name: Install Pester 5
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Integration tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './automation/tests/Integration.Tests.ps1'
+          $c.Run.PassThru = $true
+          $c.Output.Verbosity = 'Detailed'
+          $r = Invoke-Pester -Configuration $c
+          foreach ($t in $r.Failed) { Write-Host "::error title=SQL Server ${{ matrix.version }}: test failed::$($t.ExpandedPath): $(($t.ErrorRecord[0].Exception.Message -replace '\r?\n', ' ').Substring(0, [Math]::Min(900, ($t.ErrorRecord[0].Exception.Message -replace '\r?\n', ' ').Length)))" }
+          foreach ($t in $r.Skipped) { Write-Host "::warning title=SQL Server ${{ matrix.version }}: test skipped::$($t.ExpandedPath)" }
+          foreach ($b in $r.Containers | Where-Object { $_.Result -eq 'Failed' -and $_.ErrorRecord }) { Write-Host "::error title=SQL Server ${{ matrix.version }}: setup failed::$(($b.ErrorRecord[0].Exception.Message -replace '\r?\n', ' '))" }
+          if ($r.FailedCount -gt 0 -or $r.Result -ne 'Passed') { exit 1 }
+
+      - name: SQL Server log (on failure)
+        if: failure()
+        run: docker logs sql 2>&1 | tail -n 80

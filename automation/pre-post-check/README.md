@@ -1,6 +1,8 @@
 # One-click PRE / POST change check
 
-> **Just 3 files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`. Copy them together to a folder on the VM, for example `C:\DBA\PrePostCheck`. The older `automation/health-check` folder (script 44) isn't needed.
+> **Files on the VM:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`, plus your `settings.psd1` and, optionally, `db_mail_setup.sql`. Keep them together in one folder, for example `C:\DBA\PrePostCheck`. Install and update from a **release zip** (see [Install and update](#install-and-update)). The older `automation/health-check` folder (script 44) isn't needed.
+>
+> **Version 3.0.0** ([CHANGELOG](CHANGELOG.md)): settings moved to `settings.psd1`, checks are defined in `HC_Snapshot.sql`, and the CLEANUP option is gone (every run cleans up).
 
 Double-click `Run-PrePostCheck.bat` and choose:
 
@@ -9,7 +11,8 @@ Double-click `Run-PrePostCheck.bat` and choose:
 | 1 | **PRE** | Snapshot before a change, stored on the VM and emailed |
 | 2 | **POST** | Snapshot after the change, compared with PRE, emailed as SUCCESS or DIFFERENCES |
 | 3 | **HEALTH** | Health check only: one combined report with a `[CRITICAL]`, `[WARNING]` or `[OK]` subject. Nothing is stored for comparison |
-| 4 | **CLEANUP** | Delete old snapshots, reports and logs (this also runs automatically at the start of every check) |
+
+Every run also deletes old snapshots, reports and logs (see [Cleanup](#cleanup)).
 
 Before a change (patching, CU, in-place upgrade, failover test, config change), run it with **PRE**. After the change, run it with **POST**. It checks **every SQL instance on the VM**:
 
@@ -26,26 +29,41 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
   1. **Database Mail XPs off** → it runs `sp_configure 'Database Mail XPs', 1` + `RECONFIGURE`. `show advanced options` is turned on only for this step and put back afterwards if it was off.
   2. **No mail profile with an SMTP account** (none at all, or a profile with no account / no SMTP server) → it runs **`db_mail_setup.sql`** (your setup script, kept next to the `.ps1`). Its batches are split on `GO` and its `PRINT` messages go to the console and log. SQLCMD-mode lines (`:setvar`, `:r`, `:connect`) aren't supported.
 
-  Both steps need sysadmin. If either one fails, the run carries on and the reason is shown on the `Email :` line of the summary. Turn this off with `AutoSetupDbMail = $false` in `$Config`.
+  Both steps need sysadmin. If either one fails, the run carries on and the reason is shown on the `Email :` line of the summary. Turn this off with `AutoSetupDbMail = $false` in `settings.psd1`.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
-Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `$Config` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
+Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `PerInstanceReports = $true` in `settings.psd1` if you also want one HTML file per instance, or `AttachReport = $false` to always put the report in the body.
+
+The report and email footer show the script version, the `HC_Snapshot.sql` version and the settings file used, so you can tell which VMs still run an older version.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `Run-PrePostCheck.bat` | Double-click this. Starts the Secondary Logon service if needed, then runs the PowerShell script. |
-| `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. All settings are in `$Config` at the top. |
-| `HC_Snapshot.sql` | All the checks, run on every instance. |
+| `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. Holds the default settings. |
+| `HC_Snapshot.sql` | All the checks, run on every instance, and their `--@check` definitions (what is compared and how each section is shown). Must be the same version as the script. |
+| `settings.psd1` | *Your settings* (recipients, mail profile, extra instances, tolerances). Not in the repo or the release zip, so updates never overwrite it. Start from `settings.example.psd1`. |
+| `settings.example.psd1` | Every setting with its default and a short explanation. |
 | `db_mail_setup.sql` | *Optional, your own file.* Run automatically on an instance where Database Mail is disabled or not configured. |
+| `Update-Tool.ps1` | In the release zip: updates this folder to a newer release (see below). |
+| `CHANGELOG.md` | What changed in each version. |
 
 Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\` (HTML) and `Logs\`.
 
-## Set up once per VM
+## Install and update
 
-1. Copy the folder to a place **your own account can read and write**, for example `C:\DBA\PrePostCheck`. Snapshots must be writable there.
-2. In `Invoke-PrePostCheck.ps1` → `$Config`, set `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below), and list instances on other VMs (for example AG replicas) in `ExtraInstances = @('SQLVM2', 'SQLVM3\INST2')`.
+Each version is published as a GitHub release, `pre-post-check/vX.Y.Z`, with a zip of this folder: [Releases](https://github.com/ManikyaSG/DBA.Queries/releases).
+
+**First install on a VM**
+1. Unzip the release into a folder **your own account can read and write**, for example `C:\DBA\PrePostCheck`. Snapshots must be writable there.
+2. Copy `settings.example.psd1` to `settings.psd1` and set at least `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below), and list instances on other VMs (for example AG replicas) in `ExtraInstances = @('SQLVM2', 'SQLVM3\INST2')`. You only need to keep the lines you change.
+
+**Update an existing VM:** run `.\Update-Tool.ps1` in the folder (Windows PowerShell). It downloads the newest release, copies the files it replaces to `_previous\<old version>_<time>\`, and never touches `settings.psd1`, `db_mail_setup.sql`, `servers.txt` or the `Snapshots` / `Reports` / `Logs` folders. `-Version 3.0.1` picks a version, and `-ZipFile <path>` uses a zip you copied to the VM yourself (no internet needed). `-WhatIf` shows what would change.
+
+**Coming from a version before 3.0.0** (settings in the script's `$Config` block): `Update-Tool.ps1` reads the values you changed in the old script and writes them to `settings.psd1` for you. If you copy the files by hand instead, set your values in `settings.psd1` first, because the new script's `$Config` has the defaults only.
+
+> Don't edit `Invoke-PrePostCheck.ps1` on a VM. A change made there is lost at the next update and makes that VM differ from the others. Put settings in `settings.psd1`, and change checks in the repo (see [Adding or changing a check](#adding-or-changing-a-check)).
 
 ## Run it
 
@@ -80,7 +98,7 @@ If POST finds no PRE for that ticket, it offers the **latest PRE for that instan
 | SSAS | Analysis Services service; whether the instance can be queried; each database (compatibility level, type) | SSAS version, database `date_modified` |
 | Problems | issues that exist **after but not before** = new problems | issues already present at PRE are listed separately |
 
-**Tolerances**, set in `$Config`:
+**Tolerances**, set in `settings.psd1`:
 - File/DB size changes are flagged only above **10 % and 512 MB** (`FileSizeDriftPct`, `FileSizeDriftMinMB`).
 - Disk free-space changes are flagged only above **5 % of the disk** (`DiskFreeDriftPct`).
 
@@ -90,14 +108,44 @@ Last-backup *times*, log usage %, queue sizes and CPU are not compared, because 
 
 ```bat
 Run-PrePostCheck.bat -Phase HEALTH
-Run-PrePostCheck.bat -Phase CLEANUP
 ```
 
 ```powershell
 .\Invoke-PrePostCheck.ps1 -Phase PRE  -Ticket CHG0012345
 .\Invoke-PrePostCheck.ps1 -Phase POST -Ticket CHG0012345 -UseCurrentUser
 .\Invoke-PrePostCheck.ps1 -Phase POST -Ticket CHG0012345 -Instances 'SQLVM1','SQLVM1\INST2'
+.\Invoke-PrePostCheck.ps1 -Phase HEALTH -SettingsFile .\settings.test.psd1
 ```
+
+## Adding or changing a check
+
+Everything about a section lives in `HC_Snapshot.sql`, next to its query. Each output `SELECT` starts with `N'<section>' AS _section` and has `--@check` lines directly above it:
+
+```sql
+--@check databases: Databases & backups
+--@   key: name
+--@   compare: state, user_access, recovery_model, compat_level, owner_name, ...
+--@   drift: size_mb=pct
+SELECT N'databases' AS _section, d.name, d.state_desc AS state, ...
+```
+
+| Line | Meaning |
+|---|---|
+| `--@check <section>: <title>` | Starts a definition. The title is used in the report and in the *Section* column of differences. |
+| `key: col, col` | Identifies a row. Rows only in PRE are *MISSING*, rows only in POST are *NEW*. No `key` = shown in the report, not compared. |
+| `compare: col, col` | Must be equal in PRE and POST. |
+| `expected: col, col` | May change; listed under *Expected changes*. |
+| `expected_keys` / `ignore_keys` | Rows whose values may change (for example `build`), or that are never compared (for example uptime). |
+| `drift: col=pct` / `col=disk` | Numeric tolerance: `pct` uses `FileSizeDriftPct` + `FileSizeDriftMinMB`, `disk` uses `DiskFreeDriftPct`. |
+| `report: no` / `email: no` | Compared but not shown in the report / in the report file but not in the email body. |
+| `source: powershell` | The section is collected by the script on the VM (SSIS / SSRS / SSAS services), not by a `SELECT`. |
+
+Sections appear in the report in the order of the file. To add a check:
+1. Add the `SELECT` (every value cast to text) and its `--@check` lines.
+2. Raise the version in both `HC_Snapshot.sql` (`--@version`) and `Invoke-PrePostCheck.ps1` (`$ToolVersion`), and add a line to `CHANGELOG.md`.
+3. Push. CI checks that every `SELECT` has a definition, that every column a definition names is returned, and runs the file on SQL Server 2017 to 2025 (see [automation/README.md](../README.md)).
+
+At run time the script also warns if a definition names a column the `SELECT` didn't return, or if the SQL returns a section without a definition (that section is still shown, at the end of the report).
 
 ## Permissions and troubleshooting
 
@@ -111,9 +159,9 @@ For other problems (credentials, folder access, `Login failed`, mail stuck as `u
 
 ## Cleanup
 
-Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `$Config`.
+Every PRE, POST and HEALTH run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `settings.psd1`.
 
-To clean up without running a check, choose `4` CLEANUP, or schedule `Run-PrePostCheck.bat -Phase CLEANUP` daily in Task Scheduler ("Start in": this folder). Cleanup doesn't ask for credentials or start Secondary Logon.
+There is no separate CLEANUP option any more (removed in 3.0.0). A Task Scheduler job that ran `Run-PrePostCheck.bat -Phase CLEANUP` now stops with a message, so remove it.
 
 ## AG failover tool (`AG-FailoverTool.ps1`)
 

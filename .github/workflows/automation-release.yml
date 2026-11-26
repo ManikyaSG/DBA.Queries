@@ -1,0 +1,51 @@
+name: automation release
+
+# Push a tag '<tool>/vX.Y.Z' (e.g. pre-post-check/v3.0.0) to publish a GitHub release with a zip
+# of that tool's folder plus Update-Tool.ps1. The tag must match the version in the tool's script.
+on:
+  push:
+    tags: ['pre-post-check/v*', 'perf-check-reports/v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the zip and publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $tool, $version = $tag -split '/v', 2
+          $main = @{ 'pre-post-check' = 'Invoke-PrePostCheck.ps1'; 'perf-check-reports' = 'Collect-PerfCheckReports.ps1' }[$tool]
+          if (-not $main) { throw "Unknown tool in tag $tag" }
+          $folder = "automation/$tool"
+          $scriptText = Get-Content -Raw "$folder/$main"
+          if ($scriptText -notmatch "(?m)^\`$ToolVersion\s*=\s*'([^']+)'" -or $Matches[1] -ne $version) { throw "Tag $tag does not match `$ToolVersion in $main ($($Matches[1]))" }
+          ./automation/common/Sync-DbaCommon.ps1 -Check
+
+          # files of the tool (never settings / credentials) + the updater, with Windows line endings
+          $stage = Join-Path $env:RUNNER_TEMP "$tool-$version"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Get-ChildItem -LiteralPath $folder -File | Where-Object { $_.Name -ne 'settings.psd1' -and $_.Extension -notin '.cred', '.handoff' } |
+              Copy-Item -Destination $stage
+          Copy-Item automation/common/Update-DbaTool.ps1 (Join-Path $stage 'Update-Tool.ps1')
+          foreach ($f in Get-ChildItem -LiteralPath $stage -File | Where-Object { $_.Extension -in '.ps1', '.psd1', '.sql', '.bat', '.md', '.txt', '.example' }) {
+              $t = [System.IO.File]::ReadAllText($f.FullName) -replace "`r`n", "`n" -replace "`n", "`r`n"
+              [System.IO.File]::WriteAllText($f.FullName, $t, (New-Object System.Text.UTF8Encoding $false))
+          }
+          $zip = Join-Path $env:RUNNER_TEMP "$tool-$version.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+
+          # release notes: this version's section of the CHANGELOG
+          $log = Get-Content -Raw "$folder/CHANGELOG.md"
+          $m = [regex]::Match($log, "(?ms)^##\s+\[?$([regex]::Escape($version))\b.*?(?=^##\s|\z)")
+          $notes = if ($m.Success) { $m.Value } else { "Release $version" }
+          $notes += "`n`n**Install / update:** unzip into the tool's folder on the VM (your settings.psd1 is not in the zip), or run ``.\Update-Tool.ps1`` there."
+          Set-Content -Path notes.md -Value $notes
+          gh release create $tag $zip --title "$tool $version" --notes-file notes.md
