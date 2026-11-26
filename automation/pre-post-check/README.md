@@ -1,6 +1,6 @@
 # One-click PRE / POST change check
 
-> **Just 3 files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql`. Copy them together to a folder on the VM, for example `C:\DBA\PrePostCheck`. Always copy `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql` together: both carry a version number, shown in the report and email footer, and the run warns if they differ.
+> **Files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1`, `HC_Snapshot.sql`, and your own `settings.psd1` (recipients, mail profile, ...; start from `settings.example.psd1`). Keep them together in a folder on the VM, for example `C:\DBA\PrePostCheck`. Always copy `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql` together: both carry a version number, shown in the report and email footer, and the run warns if they differ.
 
 Double-click `Run-PrePostCheck.bat` and choose:
 
@@ -21,24 +21,26 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
   - 🟡 **`[POST NO BASELINE]`**: no PRE snapshot was found, so it sends the POST report only.
 
 **One report and one email per VM.** All instances on the VM go into a single HTML file, `Reports\<VM>_<PRE|POST>_<ticket>_<time>.html`. It opens with a summary table (one row per instance), followed by each instance's section. A single email is sent through the first instance that has working Database Mail, local instances first:
-- The email is always sent **from `noreply@company.com`** (`FromAddress` in `$Config`), never from the Database Mail profile's own address.
+- The email is always sent **from `noreply@company.com`** (`FromAddress` in `settings.psd1`), never from the Database Mail profile's own address.
 - The **email body** has the summary plus each instance's differences / new problems.
 - The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the report goes in the email body instead, **without the data / log file list**, which stays in the report file on the VM (its path is given in the email).
 - If Database Mail isn't usable on an instance, the script fixes it there and checks again:
   1. **Database Mail XPs off** → it runs `sp_configure 'Database Mail XPs', 1` + `RECONFIGURE`. `show advanced options` is turned on only for this step and put back afterwards if it was off.
   2. **No mail profile with an SMTP account** (none at all, or a profile with no account / no SMTP server) → it runs **`db_mail_setup.sql`** (your setup script, kept next to the `.ps1`). Its batches are split on `GO` and its `PRINT` messages go to the console and log. SQLCMD-mode lines (`:setvar`, `:r`, `:connect`) aren't supported.
 
-  Both steps need sysadmin. If either one fails, the run carries on and the reason is shown on the `Email :` line of the summary. Turn this off with `AutoSetupDbMail = $false` in `$Config`.
+  Both steps need sysadmin. If either one fails, the run carries on and the reason is shown on the `Email :` line of the summary. Turn this off with `AutoSetupDbMail = $false` in `settings.psd1`.
 - If no instance has Database Mail, no email is sent and the combined report opens in your browser.
 
-Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `AttachReport = $false` in `$Config` to always put the report in the body.
+Snapshots (JSON) and reports stay on the VM as evidence. The report and email don't list **Agent jobs, logins or server role members**, to keep them short. These are still **compared**, so a job left disabled or a login change still shows up under *Unexpected differences*. Set `AttachReport = $false` in `settings.psd1` to always put the report in the body.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `Run-PrePostCheck.bat` | Double-click this. Starts the Secondary Logon service if needed, then runs the PowerShell script. |
-| `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. All settings are in `$Config` at the top. |
+| `Invoke-PrePostCheck.ps1` | Menu, credentials, run-as with fail-safe, snapshots, PRE/POST comparison, combined report, Database Mail and cleanup. Holds the default settings. |
+| `settings.psd1` | *Your settings* for this VM (recipients, mail profile, extra instances, tolerances). Overrides the defaults in the script. Not in the repo, so copying in a newer script never overwrites it. |
+| `settings.example.psd1` | Every setting with its default and a short note. Copy it to `settings.psd1` to start. |
 | `HC_Snapshot.sql` | All the checks, run on every instance. |
 | `db_mail_setup.sql` | *Optional, your own file.* Run automatically on an instance where Database Mail is disabled or not configured. |
 
@@ -47,7 +49,11 @@ Folders that are created automatically: `Snapshots\<ticket>\` (JSON), `Reports\`
 ## Set up once per VM
 
 1. Copy the folder to a place **your own account can read and write**, for example `C:\DBA\PrePostCheck`. Snapshots must be writable there.
-2. In `Invoke-PrePostCheck.ps1` → `$Config`, set `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below), and list instances on other VMs (for example AG replicas) in `ExtraInstances = @('SQLVM2', 'SQLVM3\INST2')`.
+2. Copy `settings.example.psd1` to `settings.psd1` and set `Recipients` and your usual `MailProfile`. Optionally adjust the tolerances (below), and list instances on other VMs (for example AG replicas) in `ExtraInstances = @('SQLVM2', 'SQLVM3\INST2')`. You can delete the lines you don't change; they use the defaults. The window shows which settings file was used, and warns while `Recipients` is still the example address.
+
+**Updating a VM to a newer version:** copy the new `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql` over the old ones. Leave `settings.psd1` as it is.
+
+**First time with `settings.psd1`** (the old script had the settings in its `$Config` block): before replacing the script, open the old one and copy the values you changed (`Recipients`, `MailProfile`, `ExtraInstances`, ...) into `settings.psd1`. Don't edit `$Config` in the script any more: a change there is lost with the next update.
 
 ## Run it
 
@@ -82,7 +88,7 @@ If POST finds no PRE for that ticket on some instances, it asks you **once, righ
 | SSAS | Analysis Services service; whether the instance can be queried; each database (compatibility level, type) | SSAS version, database `date_modified` |
 | Problems | issues that exist **after but not before** = new problems | issues already present at PRE are listed separately |
 
-**Tolerances**, set in `$Config`:
+**Tolerances**, set in `settings.psd1`:
 - File/DB size changes are flagged only above **10 % and 512 MB** (`FileSizeDriftPct`, `FileSizeDriftMinMB`).
 - Disk free-space changes are flagged only above **5 % of the disk** (`DiskFreeDriftPct`).
 
@@ -124,7 +130,7 @@ For the SSIS / SSRS / SSAS sections it also needs:
 
 ## Cleanup
 
-Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `$Config`.
+Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `settings.psd1`.
 
 There is no separate CLEANUP option. If a Task Scheduler job runs `Run-PrePostCheck.bat -Phase CLEANUP`, remove it: it now stops with a message.
 
