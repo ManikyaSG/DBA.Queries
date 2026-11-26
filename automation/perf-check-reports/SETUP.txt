@@ -65,14 +65,11 @@ It ends by listing what the login can do (should be CONNECT SQL + SELECT on the 
  4. ON MARSDBW1 ONLY - files, folder rights, Database Mail
 -------------------------------------------------------------------------------
 a) Copy Collect-PerfCheckReports.ps1 to C:\DBA\PerfCheck on MARSDBW1.
-b) Settings: copy settings.example.psd1 to settings.psd1 in the same folder and
-   set (only the lines you change are needed; the rest uses the script's defaults):
-       Instances    = the 9 instances
+b) In its $Config (top of the file) check:
+       Instances    = the 9 instances (already filled in)
        Recipients   = 'dba-team@yourcompany.com'   (and CopyRecipients)
        MailInstance = 'MARSDBW1\MARS01'
        MailProfile  = ''   (default public profile) or the profile name
-   settings.psd1 is kept when the script is updated. Without it, the values in
-   the script's $Config block are used (version 1.0.0 behaviour).
 c) The Agent service account of MARSDBW1\MARS01:
 
        SELECT servicename, service_account FROM sys.dm_server_services;

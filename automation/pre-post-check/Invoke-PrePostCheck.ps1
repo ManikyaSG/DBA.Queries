@@ -15,21 +15,22 @@
          STATE on) is retried as the logged-in RDP account, and if run-as can't start
          at all, your account is used from this window. Cancel = RDP account only.
       3. Every SQL instance on the VM (+ ExtraInstances in $Config) is checked.
-      4. Every run removes files older than CleanupHours from Snapshots / Reports / Logs.
-    Files: Run-PrePostCheck.bat, Invoke-PrePostCheck.ps1, HC_Snapshot.sql (same version),
-    optional settings.psd1 (your settings - kept when the scripts are updated, see
-    settings.example.psd1) and db_mail_setup.sql (Database Mail setup, used when needed).
+      4. Files older than CleanupHours in Snapshots / Reports / Logs are removed (or run -Phase CLEANUP).
+    Only 3 files are needed: Run-PrePostCheck.bat, Invoke-PrePostCheck.ps1, HC_Snapshot.sql.
     Snapshots : Snapshots\<ticket>\<instance>_PRE|POST_<yyyyMMdd_HHmmss>.json
     Reports   : Reports\<instance>_<PRE|POST>_<ticket>_<yyyyMMdd_HHmm>.html
     Email     : Database Mail on each instance (preferred profile, else default/only profile).
 
-    What is compared (POST vs PRE) and how each section is shown is defined by the
-    --@check lines in HC_Snapshot.sql (one block per section, next to its SELECT):
-    instance settings, services, sp_configure, trace flags, databases, Always On,
-    cluster, disks, files, jobs, logins, server roles, linked servers, endpoints,
-    certificates, XE sessions, SSIS / SSRS / SSAS, and NEW problems (issues present
-    after but not before). Expected changes (build / CU / start time) are listed, not
-    failures. Size drift is ignored unless big (FileSizeDriftPct / DiskFreeDriftPct).
+    What is compared (POST vs PRE):
+      instance settings, services, sp_configure, global trace flags, databases (state,
+      recovery model, compat, owner, options, AG role/sync), AG replicas
+      (roles, primary, modes, health, listeners), AG databases per replica, cluster &
+      quorum, disks, data/log files (paths, growth, max size), jobs (enabled, owner),
+      logins, server role members, linked servers, endpoints, certificates, XE sessions,
+      and NEW problems (issues present after but not before).
+    Expected changes (listed, not failures): build / CU / KB / product level, SQL start time.
+    Size drift is ignored unless big: file/DB size change > FileSizeDriftPct % and
+    > FileSizeDriftMinMB MB, disk free space change > DiskFreeDriftPct % of the disk.
 
     Requirements: Windows PowerShell 5.1. No modules, sqlcmd or internet needed.
     Your SQL permissions: VIEW SERVER STATE, read msdb, DatabaseMailUserRole (or sysadmin).
@@ -48,17 +49,12 @@ param(
     [switch]   $UseCurrentUser,
     [string[]] $Instances,
     [string]   $SqlFile,
-    [string]   $SettingsFile,        # default: settings.psd1 next to this script (optional)
     [switch]   $Inner,
     [string]   $HandOff               # internal: result file shared with the original (RDP) window
 )
 
-$ToolVersion = '3.0.0'               # must match the --@version line in HC_Snapshot.sql
-
 # =============================================================================
-#  DEFAULT SETTINGS
-#  Don't edit them here: put your values in settings.psd1 next to this script
-#  (copy settings.example.psd1). That file is kept when the scripts are updated.
+#  CONFIGURATION  <== change these once
 # =============================================================================
 $Config = @{
     Recipients            = 'dba-team@yourcompany.com'   # ; separated
@@ -85,170 +81,62 @@ $Config = @{
     MailCheckDelaySec     = 20
     AttachReport          = $true    # attach the combined HTML report to the email (falls back to the email body)
     PerInstanceReports    = $false   # also save one HTML file per instance
-    CleanupHours          = 48       # every run deletes Reports / Logs / finished Snapshots older than this (0 = off)
+    CleanupHours          = 48       # each run deletes Reports / Logs / finished Snapshots older than this (0 = off)
     KeepPreWithoutPostDays = 7       # a PRE still waiting for its POST is kept this long
 }
 
 $ErrorActionPreference = 'Stop'
-
-#region DbaCommon - copied from automation/common/DbaCommon.ps1 by Sync-DbaCommon.ps1. Edit that file, not this copy.
-# -----------------------------------------------------------------------------
-# DbaCommon: helpers shared by the automation tools (Windows PowerShell 5.1+, no modules).
-# This file is the ONLY place to change them. Every tool script carries a copy between
-#   #region DbaCommon ... #endregion DbaCommon
-# so each tool still deploys as a single .ps1. After editing this file run
-#   automation/common/Sync-DbaCommon.ps1
-# (the unit tests fail if a tool's copy differs from this file.)
-# -----------------------------------------------------------------------------
-
-function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
-
-function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
-
-function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s,]', '_') }
-
-function Get-Val($Row, [string]$Col) {
-    # Value of a column from a hashtable / dictionary / object row, trimmed; '' when missing or NULL.
-    if ($null -eq $Row) { return '' }
-    if ($Row -is [System.Collections.IDictionary]) {
-        # IDictionary.Contains works for Hashtable, OrderedDictionary and Dictionary[string,object] (JSON)
-        if (([System.Collections.IDictionary]$Row).Contains($Col) -and $null -ne $Row[$Col]) { return ([string]$Row[$Col]).Trim() }
-        return ''
-    }
-    $p = $Row.PSObject.Properties[$Col]
-    if ($p -and $null -ne $p.Value) { return ([string]$p.Value).Trim() }
-    return ''
-}
-
-function Import-DbaSettings([hashtable]$Config, [string]$Path) {
-    # Overrides $Config with the values in a settings .psd1 (kept when the script is updated).
-    # Returns the file used, or $null when there is none. Unknown names are reported, not used.
-    # Relative paths for settings ending in Folder / File / Root are relative to the settings file.
-    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
-    $data = Import-PowerShellDataFile -LiteralPath $Path
-    $base = Split-Path -Parent (Resolve-Path -LiteralPath $Path).Path
-    foreach ($k in @($data.Keys)) {
-        if (-not $Config.ContainsKey($k)) {
-            Write-Step "Settings: '$k' in $Path is not a known setting - ignored (typo?)." 'Yellow'
-            continue
-        }
-        $v = $data[$k]
-        if ($v -is [string] -and $v -and $k -match '(Folder|File|Root)$' -and -not [System.IO.Path]::IsPathRooted($v)) { $v = Join-Path $base $v }
-        if ($v -is [object[]]) { $v = @($v) }
-        $Config[$k] = $v
-    }
-    return (Resolve-Path -LiteralPath $Path).Path
-}
-
-$DbaHtmlHead = @'
-<html><head><meta charset="utf-8"><style>
-body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
-h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
-table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
-td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
-.banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
-.footer{color:#777;font-size:11px;margin-top:24px}
-</style></head><body>
-'@
-
-function ConvertTo-HtmlTable($Rows, [string[]]$Columns, [string]$RowStyle = '', [string]$StatusColumn = '') {
-    # Rows -> HTML table. With -StatusColumn, CRITICAL rows are red and WARNING rows amber.
-    $rowsArr = @($Rows)
-    if ($rowsArr.Count -eq 0) { return '<div style="color:#2e7d32">None</div>' }
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<table><tr>')
-    foreach ($c in $Columns) { [void]$sb.Append('<th>' + (Enc $c) + '</th>') }
-    [void]$sb.Append('</tr>')
-    foreach ($r in $rowsArr) {
-        $style = $RowStyle
-        if ($StatusColumn) {
-            switch (Get-Val $r $StatusColumn) { 'CRITICAL' { $style = 'background-color:#f8d7da' } 'WARNING' { $style = 'background-color:#fff3cd' } }
-        }
-        if ($style) { [void]$sb.Append('<tr style="' + $style + '">') } else { [void]$sb.Append('<tr>') }
-        foreach ($c in $Columns) { [void]$sb.Append('<td>' + (Enc (Get-Val $r $c)) + '</td>') }
-        [void]$sb.Append('</tr>')
-    }
-    [void]$sb.Append('</table>')
-    return $sb.ToString()
-}
-
-function Split-SqlBatches([string]$Text) {
-    # Splits a script on GO lines (like SSMS / sqlcmd). 'GO' inside a line or a string is not a separator.
-    # GO <count> also separates, but the batch runs once.
-    return @([regex]::Split($Text, '(?im)^[ \t]*GO(?:[ \t]+\d+)?[ \t]*(?:--.*)?\r?$') | Where-Object { $_ -match '\S' })
-}
-
-function Get-SqlErrorMessage($ErrorRecord) {
-    # The SQL Server message from a failed ExecuteNonQuery / ExecuteReader (not the PowerShell wrapper text).
-    $ex = $ErrorRecord.Exception
-    while ($ex) { if ($ex -is [System.Data.SqlClient.SqlException]) { return $ex.Message }; $ex = $ex.InnerException }
-    if ($ErrorRecord.Exception.InnerException) { return $ErrorRecord.Exception.InnerException.Message }
-    return $ErrorRecord.Exception.Message
-}
-
-function Send-DbMailItem {
-    # msdb.dbo.sp_send_dbmail with the return code checked (it can fail with only a return code).
-    # Returns the mailitem_id. Attachments need a Windows login (SQL logins can't use @file_attachments).
-    param(
-        [Parameter(Mandatory)] $Connection,
-        [Parameter(Mandatory)] [string] $ProfileName,
-        [Parameter(Mandatory)] [string] $Recipients,
-        [string] $CopyRecipients = '',
-        [string] $FromAddress = '',
-        [string] $ReplyTo = '',
-        [Parameter(Mandatory)] [string] $Subject,
-        [Parameter(Mandatory)] [string] $Body,
-        [ValidateSet('Low', 'Normal', 'High')] [string] $Importance = 'Normal',
-        [string[]] $Attachments = @(),
-        [int] $TimeoutSec = 120
-    )
-    $nz = { param($v) if ([string]::IsNullOrWhiteSpace($v)) { [DBNull]::Value } else { $v } }
-    $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSec
-    $cmd.CommandText = 'EXEC @rc = msdb.dbo.sp_send_dbmail @profile_name = @p, @recipients = @to, @copy_recipients = @cc, @from_address = @from, @reply_to = @reply, @subject = @subj, @body = @body, @body_format = ''HTML'', @importance = @imp, @file_attachments = @files, @mailitem_id = @id OUTPUT;'
-    [void]$cmd.Parameters.AddWithValue('@p', $ProfileName)
-    [void]$cmd.Parameters.AddWithValue('@to', $Recipients)
-    [void]$cmd.Parameters.AddWithValue('@cc', (& $nz $CopyRecipients))
-    [void]$cmd.Parameters.AddWithValue('@from', (& $nz $FromAddress))
-    [void]$cmd.Parameters.AddWithValue('@reply', (& $nz $ReplyTo))
-    [void]$cmd.Parameters.AddWithValue('@subj', $Subject)
-    $pb = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pb.Value = $Body
-    [void]$cmd.Parameters.AddWithValue('@imp', $Importance)
-    $files = @($Attachments | Where-Object { $_ })
-    [void]$cmd.Parameters.AddWithValue('@files', $(if ($files.Count) { $files -join ';' } else { [DBNull]::Value }))
-    $pid_ = $cmd.Parameters.Add('@id', [System.Data.SqlDbType]::Int); $pid_.Direction = [System.Data.ParameterDirection]::Output
-    $prc = $cmd.Parameters.Add('@rc', [System.Data.SqlDbType]::Int); $prc.Direction = [System.Data.ParameterDirection]::Output
-    [void]$cmd.ExecuteNonQuery()
-    if ($prc.Value -isnot [DBNull] -and [int]$prc.Value -ne 0) { throw "sp_send_dbmail returned $($prc.Value)" }
-    if ($pid_.Value -is [DBNull] -or $null -eq $pid_.Value) { return $null }
-    return [int]$pid_.Value
-}
-
-function Get-DbMailItemStatus($Connection, [int]$MailItemId) {
-    # 'sent' / 'unsent' / 'retrying' / 'failed - <reason from the Database Mail log>' / 'not found'
-    $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = 60
-    $cmd.CommandText = @"
-SELECT a.sent_status + CASE WHEN a.sent_status = 'failed'
-       THEN ' - ' + ISNULL((SELECT TOP (1) LEFT(l.description, 300) FROM msdb.dbo.sysmail_event_log AS l WHERE l.mailitem_id = a.mailitem_id ORDER BY l.log_id DESC), '') ELSE '' END
-FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
-"@
-    [void]$cmd.Parameters.AddWithValue('@id', $MailItemId)
-    $r = $cmd.ExecuteScalar()
-    if ($null -eq $r -or $r -is [DBNull]) { return 'not found' }
-    return [string]$r
-}
-#endregion DbaCommon
-
-if (-not $SettingsFile) { $SettingsFile = Join-Path $PSScriptRoot 'settings.psd1' }
-$script:SettingsUsed = Import-DbaSettings $Config $SettingsFile
-
 $Phase = ([string]$Phase).Trim().ToUpperInvariant()
 if ($Phase -eq 'HC') { $Phase = 'HEALTH' }
-if ($Phase -eq 'CLEANUP') {
-    Write-Step 'CLEANUP is no longer a separate option: every PRE / POST / HEALTH run removes old Snapshots / Reports / Logs (CleanupHours in settings).' 'Yellow'
-    exit 1
-}
-if ($Inner -and $Phase -notin @('PRE', 'POST', 'HEALTH')) { throw "Invalid -Phase '$Phase' (use PRE, POST or HEALTH)." }
+if ($Inner -and $Phase -notin @('PRE', 'POST', 'HEALTH', 'CLEANUP')) { throw "Invalid -Phase '$Phase' (use PRE, POST, HEALTH or CLEANUP)." }
 if ($Instances) { $Instances = @($Instances -split ',' | ForEach-Object { $_.Trim(" '`"") } | Where-Object { $_ }) }
+
+# What to compare per section: Key = identifies a row, Compare = must be equal,
+# Expected = may change (listed as expected), Drift = numeric tolerance rule.
+$Spec = [ordered]@{
+    instance       = @{ Title = 'Instance';            Key = @('property_code'); Compare = @('value'); ExpectedKeys = @('build', 'sp_level', 'cu', 'kb', 'start_time', 'os_boot_time'); IgnoreKeys = @('sql_uptime', 'os_uptime') }
+    services       = @{ Title = 'SQL Server services'; Key = @('servicename');   Compare = @('status', 'startup_type', 'service_account', 'ifi'); Expected = @('last_startup') }
+    config         = @{ Title = 'sp_configure';        Key = @('name');          Compare = @('value_in_use') }
+    traceflags     = @{ Title = 'Global trace flags';  Key = @('trace_flag');    Compare = @() }
+    databases      = @{ Title = 'Databases';           Key = @('name');
+                        Compare = @('state', 'user_access', 'recovery_model', 'compat_level', 'owner_name', 'is_read_only', 'page_verify', 'rcsi',
+                                    'snapshot_isolation', 'is_encrypted', 'broker', 'trustworthy', 'query_store', 'ag_name', 'ag_role', 'ag_sync_state')
+                        Drift = @{ size_mb = 'pct' } }
+    ag_replicas    = @{ Title = 'Always On replicas';  Key = @('ag_name', 'replica_node');
+                        Compare = @('primary_replica', 'role', 'availability_mode', 'failover_mode', 'connected_state', 'sync_health', 'readable',
+                                    'endpoint_url', 'backup_priority', 'listeners') }
+    ag_listeners   = @{ Title = 'Always On listeners'; Key = @('ag_name', 'listener', 'ip_address'); Compare = @('port', 'subnet_mask', 'ip_type', 'network_subnet', 'ip_state', 'is_conformant') }
+    ag_databases   = @{ Title = 'Always On databases'; Key = @('ag_name', 'database_name', 'replica_node'); Compare = @('role', 'sync_state', 'sync_health', 'is_suspended') }
+    cluster        = @{ Title = 'Cluster & quorum';    Key = @('member_name');   Compare = @('quorum_type', 'quorum_state', 'member_type', 'member_state', 'votes') }
+    disks          = @{ Title = 'Disks';               Key = @('volume');        Compare = @('total_gb'); Drift = @{ free_gb = 'disk' } }
+    files          = @{ Title = 'Data & log files';    Key = @('database_name', 'logical_name'); Compare = @('type', 'physical_name', 'state', 'growth', 'max_size'); Drift = @{ size_mb = 'pct' } }
+    jobs           = @{ Title = 'Agent jobs';          Key = @('name');          Compare = @('enabled', 'owner', 'category') }
+    logins         = @{ Title = 'Logins';              Key = @('name');          Compare = @('type', 'is_disabled', 'default_database') }
+    server_roles   = @{ Title = 'Server role members'; Key = @('role', 'member'); Compare = @() }
+    linked_servers = @{ Title = 'Linked servers';      Key = @('name');          Compare = @('product', 'provider', 'data_source') }
+    endpoints      = @{ Title = 'Endpoints';           Key = @('name');          Compare = @('type', 'state', 'port') }
+    certificates   = @{ Title = 'Certificates';        Key = @('name');          Compare = @('thumbprint', 'expiry') }
+    xe_sessions    = @{ Title = 'XE sessions';         Key = @('name');          Compare = @('running') }
+    bi_services    = @{ Title = 'SSIS / SSRS / SSAS services'; Key = @('name'); Compare = @('state', 'start_mode', 'account') }
+    ssis_catalog   = @{ Title = 'SSIS catalog settings'; Key = @('property_name'); Compare = @('property_value'); ExpectedKeys = @('SCHEMA_BUILD', 'SCHEMA_VERSION') }
+    ssis_projects  = @{ Title = 'SSIS projects';       Key = @('folder', 'project'); Compare = @('packages', 'object_version_lsn', 'deployed_by') }
+    ssis_environments = @{ Title = 'SSIS environments'; Key = @('folder', 'environment'); Compare = @('variables') }
+    ssrs_summary   = @{ Title = 'SSRS content';        Key = @('rs_database');   Compare = @('folders', 'reports', 'datasources', 'datasets', 'other_items', 'subscriptions', 'schedules') }
+    ssrs_subscriptions = @{ Title = 'SSRS subscriptions'; Key = @('rs_database', 'subscription_id'); Compare = @('report_path', 'owner', 'inactive_flags', 'is_failing') }
+    ssas_server    = @{ Title = 'SSAS instances';      Key = @('ssas_instance'); Compare = @('service_state', 'connected'); Expected = @('version') }
+    ssas_databases = @{ Title = 'SSAS databases';      Key = @('ssas_instance', 'database'); Compare = @('compatibility_level', 'type'); Expected = @('date_modified') }
+}
+# Order + titles for the full report in the email
+$ReportSections = [ordered]@{
+    issues = 'Needs attention'; instance = 'Instance'; services = 'SQL Server services'; vitals = 'Vitals'; databases = 'Databases & backups'
+    ag_replicas = 'Always On - replicas (nodes)'; ag_listeners = 'Always On - listeners (IP / DHCP)'; ag_databases = 'Always On - databases per replica'; cluster = 'Cluster & quorum'; disks = 'Disk space'
+    files = 'Data & log files'; job_failures = 'Failed job steps (24 h)'; errorlog = 'Severe error log entries (24 h)'
+    traceflags = 'Global trace flags'; config = 'sp_configure'
+    linked_servers = 'Linked servers'; endpoints = 'Endpoints'; certificates = 'Certificates'; xe_sessions = 'XE sessions'
+    bi_services = 'SSIS / SSRS / SSAS services (this VM)'; ssis_catalog = 'SSIS catalog settings'; ssis_projects = 'SSIS projects'
+    ssis_environments = 'SSIS environments'; ssis_failures = 'SSIS failed executions (24 h)'; ssrs_summary = 'SSRS content (report server databases)'
+    ssrs_subscriptions = 'SSRS subscriptions'; ssas_server = 'SSAS instances (this VM)'; ssas_databases = 'SSAS databases'
+}
 
 # =============================================================================
 #  HELPERS
@@ -276,6 +164,8 @@ function ConvertTo-PlainObject($InputObject) {
     }
     return [string]$base
 }
+
+function Write-Step([string]$Text, [string]$Color = 'Cyan') { Write-Host $Text -ForegroundColor $Color }
 
 function Start-SecondaryLogonService {
     # "Run as different user" / Start-Process -Credential need the Secondary Logon service (seclogon).
@@ -306,6 +196,20 @@ function Start-SecondaryLogonService {
     }
     Write-Step 'WARNING: Secondary Logon service could not be started - running as a different user will fail.' 'Red'
     return $false
+}
+
+function Get-SafeFileName([string]$Value) { return ($Value -replace '[\\/:*?"<>|\s,]', '_') }
+function Enc([string]$Value) { return [System.Net.WebUtility]::HtmlEncode($Value) }
+
+function Get-Val($Row, [string]$Col) {
+    if ($null -eq $Row) { return '' }
+    if ($Row -is [System.Collections.IDictionary]) {
+        if ($Row.ContainsKey($Col) -and $null -ne $Row[$Col]) { return ([string]$Row[$Col]).Trim() }
+        return ''
+    }
+    $p = $Row.PSObject.Properties[$Col]
+    if ($p -and $null -ne $p.Value) { return ([string]$p.Value).Trim() }
+    return ''
 }
 
 function Get-SqlFilePath {
@@ -589,7 +493,7 @@ function Invoke-DbMailSetup($Connection, [string]$Instance) {
     }
     Write-Step "No Database Mail profile with an SMTP account on $Instance - running $(Split-Path $file -Leaf)..." 'Yellow'
     $text = Get-Content -LiteralPath $file -Raw
-    $batches = Split-SqlBatches $text
+    $batches = [regex]::Split($text, '(?im)^[ \t]*GO[ \t]*(?:--.*)?\r?$') | Where-Object { $_ -match '\S' }
     $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
         param($sender, $e)
         foreach ($m in ($e.Message -split "`r?`n")) { if ($m.Trim()) { Write-Step "  [dbmail] $m" 'DarkGray' } }
@@ -713,71 +617,11 @@ function ConvertTo-Number([string]$Value) {
     return $null
 }
 
-# ---- Check definitions: the --@check lines in HC_Snapshot.sql ----
-function Get-CheckDefinitions([string]$SqlText) {
-    # Returns @{ Checks; Warnings }. Checks: ordered dictionary section -> Title, Key, Compare, Expected,
-    # ExpectedKeys, IgnoreKeys, Drift (col -> pct|disk), Report, Email, Source. Warnings: problems found.
-    $warnings = New-Object System.Collections.ArrayList
-    $checks = [ordered]@{}; $cur = $null; $attr = $null
-    $lists = @{ key = 'Key'; compare = 'Compare'; expected = 'Expected'; expected_keys = 'ExpectedKeys'; ignore_keys = 'IgnoreKeys' }
-    foreach ($line in ($SqlText -split "`r?`n")) {
-        if ($line -match '^\s*--@check\s+(\w+)\s*:\s*(.*?)\s*$') {
-            $name = $Matches[1]
-            if ($checks.Contains($name)) { [void]$warnings.Add("--@check $name is defined twice - the second one is ignored"); $cur = $null; continue }
-            $cur = [ordered]@{ Name = $name; Title = $(if ($Matches[2]) { $Matches[2] } else { $name }); Key = @(); Compare = @(); Expected = @(); ExpectedKeys = @()
-                               IgnoreKeys = @(); Drift = [ordered]@{}; Report = $true; Email = $true; Source = 'sql' }
-            $checks[$name] = $cur; $attr = $null; continue
-        }
-        if (-not $cur) { continue }
-        if ($line -match '^\s*--@\s+(\w+)\s*:\s*(.*?)\s*$') { $attr = $Matches[1].ToLowerInvariant(); $val = $Matches[2] }
-        elseif ($line -match '^\s*--@\s+(.*?)\s*$' -and $attr) { $val = $Matches[1] }      # list continued on the next line
-        else { $cur = $null; $attr = $null; continue }                                    # end of this definition
-        $items = @($val -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($lists.ContainsKey($attr)) { $cur[$lists[$attr]] = @($cur[$lists[$attr]]) + $items; continue }
-        switch ($attr) {
-            'drift' {
-                foreach ($d in $items) {
-                    if ($d -match '^(\w+)\s*=\s*(pct|disk)$') { $cur.Drift[$Matches[1]] = $Matches[2] }
-                    else { [void]$warnings.Add("--@check $($cur.Name): drift '$d' is not col=pct or col=disk") }
-                }
-            }
-            'report' { $cur.Report = ($val -notmatch '^(no|false|0)$') }
-            'email'  { $cur.Email  = ($val -notmatch '^(no|false|0)$') }
-            'source' { $cur.Source = $val.ToLowerInvariant() }
-            default  { [void]$warnings.Add("--@check $($cur.Name): unknown setting '$attr'") }
-        }
-    }
-    return [pscustomobject]@{ Checks = $checks; Warnings = @($warnings) }
-}
-
-function Test-CheckDefinitions($Snap, [string]$Instance, [hashtable]$AlreadyReported = @{}) {
-    # Compares the definitions with what the SQL actually returned (only sections that have rows).
-    # Prints each problem once (pass the same -AlreadyReported hashtable for every instance) and
-    # returns all problems found. The check still runs.
-    $found = New-Object System.Collections.ArrayList
-    $cols = $Snap['columns']
-    foreach ($sec in @($Snap['sections'].Keys)) {
-        if (-not $Checks.Contains($sec)) { [void]$found.Add("section '$sec' has no --@check definition in HC_Snapshot.sql (shown at the end of the report, not compared)"); continue }
-        if (-not $cols -or -not $cols.ContainsKey($sec)) { continue }
-        $have = @($cols[$sec]); $c = $Checks[$sec]
-        foreach ($col in @($c.Key) + @($c.Compare) + @($c.Expected) + @($c.Drift.Keys)) {
-            if ($col -and $have -notcontains $col) { [void]$found.Add("--@check $sec names column '$col', but the SELECT returns no such column") }
-        }
-    }
-    foreach ($w in $found) {
-        if ($AlreadyReported.ContainsKey($w)) { continue }
-        $AlreadyReported[$w] = $true
-        Write-Step "WARNING (check definitions, $Instance): $w" 'Yellow'
-    }
-    return @($found)
-}
-
 function Compare-Snapshots($Pre, $Post) {
     $unexpected = New-Object System.Collections.ArrayList
     $expected   = New-Object System.Collections.ArrayList
-    foreach ($section in @($Checks.Keys)) {
-        $sp = $Checks[$section]
-        if (@($sp.Key).Count -eq 0) { continue }          # shown only, not compared
+    foreach ($section in $Spec.Keys) {
+        $sp = $Spec[$section]
         $preMap = @{}; foreach ($r in @(Get-Rows $Pre $section))  { $preMap[(Get-RowKey $r $sp.Key)]  = $r }
         $postMap = @{}; foreach ($r in @(Get-Rows $Post $section)) { $postMap[(Get-RowKey $r $sp.Key)] = $r }
 
@@ -795,7 +639,7 @@ function Compare-Snapshots($Pre, $Post) {
             if (-not $postMap.ContainsKey($k)) { continue }
             if ($sp.IgnoreKeys -and ($sp.IgnoreKeys -contains $k)) { continue }
             $a = $preMap[$k]; $b = $postMap[$k]
-            foreach ($col in @($sp.Compare)) {
+            foreach ($col in $sp.Compare) {
                 $va = Get-Val $a $col; $vb = Get-Val $b $col
                 if ($va -ne $vb) {
                     $d = [pscustomobject]@{ Section = $sp.Title; Item = $k; Attribute = $col; Before = $va; After = $vb; Note = '' }
@@ -808,8 +652,8 @@ function Compare-Snapshots($Pre, $Post) {
                 $va = Get-Val $a $col; $vb = Get-Val $b $col
                 if ($va -ne $vb) { [void]$expected.Add([pscustomobject]@{ Section = $sp.Title; Item = $k; Attribute = $col; Before = $va; After = $vb; Note = 'Expected' }) }
             }
-            if ($sp.Drift.Count -gt 0) {
-                foreach ($col in @($sp.Drift.Keys)) {
+            if ($sp.Drift) {
+                foreach ($col in $sp.Drift.Keys) {
                     $na = ConvertTo-Number (Get-Val $a $col); $nb = ConvertTo-Number (Get-Val $b $col)
                     if ($null -eq $na -or $null -eq $nb) { continue }
                     $diff = [math]::Abs($nb - $na)
@@ -843,28 +687,51 @@ function Compare-Snapshots($Pre, $Post) {
     return @{ Unexpected = $unexpected; Expected = $expected; NewProblems = $newProblems; OldProblems = $oldProblems }
 }
 
-function Get-FullReportHtml($Snap, [string[]]$Exclude = @(), [switch]$ForEmail) {
-    # Sections in --@check order (report: no = left out). -ForEmail also leaves out email: no.
-    # Sections the SQL returned without a definition come last, so nothing is lost.
+function ConvertTo-HtmlTable($Rows, [string[]]$Columns, [string]$RowStyle = '', [string]$StatusColumn = '') {
+    $rowsArr = @($Rows)
+    if ($rowsArr.Count -eq 0) { return '<div style="color:#2e7d32">None</div>' }
     $sb = New-Object System.Text.StringBuilder
-    $defined = @($Checks.Keys | Where-Object { $Checks[$_].Report })
-    $extra   = @($Snap['sections'].Keys | Where-Object { -not $Checks.Contains($_) } | Sort-Object)
-    foreach ($sec in @($defined) + @($extra)) {
+    [void]$sb.Append('<table><tr>')
+    foreach ($c in $Columns) { [void]$sb.Append('<th>' + (Enc $c) + '</th>') }
+    [void]$sb.Append('</tr>')
+    foreach ($r in $rowsArr) {
+        $style = $RowStyle
+        if ($StatusColumn) {
+            switch (Get-Val $r $StatusColumn) { 'CRITICAL' { $style = 'background-color:#f8d7da' } 'WARNING' { $style = 'background-color:#fff3cd' } }
+        }
+        if ($style) { [void]$sb.Append('<tr style="' + $style + '">') } else { [void]$sb.Append('<tr>') }
+        foreach ($c in $Columns) { [void]$sb.Append('<td>' + (Enc (Get-Val $r $c)) + '</td>') }
+        [void]$sb.Append('</tr>')
+    }
+    [void]$sb.Append('</table>')
+    return $sb.ToString()
+}
+
+function Get-FullReportHtml($Snap, [string[]]$Exclude = @()) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($sec in $ReportSections.Keys) {
         if ($Exclude -contains $sec) { continue }
-        $def = if ($Checks.Contains($sec)) { $Checks[$sec] } else { $null }
-        if ($ForEmail -and $def -and -not $def.Email) { continue }
         $rows = @(Get-Rows $Snap $sec)
         $cols = $null
         if ($Snap['columns'] -and $Snap['columns'].ContainsKey($sec)) { $cols = @($Snap['columns'][$sec]) }
         if ($sec -ne 'issues' -and $rows.Count -eq 0) { continue }       # skip empty sections (e.g. no AG)
-        $title = if ($def) { $def.Title } else { "$sec (no --@check definition)" }
-        [void]$sb.Append('<h3>' + (Enc $title) + '</h3>')
+        [void]$sb.Append('<h3>' + (Enc $ReportSections[$sec]) + '</h3>')
         if (-not $cols) { [void]$sb.Append('<div style="color:#2e7d32">None</div>'); continue }
         $statusCol = if ($cols -contains 'status') { 'status' } elseif ($cols -contains 'severity') { 'severity' } else { '' }
         [void]$sb.Append((ConvertTo-HtmlTable $rows $cols '' $statusCol))
     }
     return $sb.ToString()
 }
+
+$HtmlHead = @'
+<html><head><style>
+body{font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#222}
+h1{color:#fff;background:#1f4e79;padding:6px 10px;font-size:18px;margin:24px 0 6px 0} h2{color:#1f4e79;margin-bottom:2px} h3{color:#1f4e79;margin:18px 0 4px 0;border-bottom:1px solid #1f4e79}
+table{border-collapse:collapse;margin-bottom:8px} th{background:#1f4e79;color:#fff;padding:4px 6px;text-align:left;font-weight:600}
+td{border:1px solid #d0d0d0;padding:3px 6px;vertical-align:top}
+.banner{padding:10px 14px;font-size:14px;font-weight:600;margin:8px 0}
+</style></head><body>
+'@
 
 function Find-QueuedMail($Connection, [string]$Subject) {
     # mailitem_id of an email with this subject already queued / sent since this run started (any window), else $null.
@@ -885,26 +752,49 @@ ORDER BY mailitem_id DESC;
 }
 
 function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [string]$Html, [string]$Importance, [string]$Attachment = '') {
-    $id = Send-DbMailItem -Connection $Connection -ProfileName $MailProfileName -Recipients $Config.Recipients -CopyRecipients $Config.CopyRecipients `
-                          -FromAddress $Config.FromAddress -ReplyTo $Config.ReplyTo -Subject $Subject -Body $Html -Importance $Importance -Attachments @($Attachment)
-    if ($null -eq $id) { $id = Find-QueuedMail $Connection $Subject }
-    return $id
+    $cmd = $Connection.CreateCommand()
+    $cmd.CommandText = 'msdb.dbo.sp_send_dbmail'
+    $cmd.CommandType = [System.Data.CommandType]::StoredProcedure
+    $cmd.CommandTimeout = 120
+    [void]$cmd.Parameters.AddWithValue('@profile_name', $MailProfileName)
+    [void]$cmd.Parameters.AddWithValue('@recipients', $Config.Recipients)
+    if ($Config.CopyRecipients) { [void]$cmd.Parameters.AddWithValue('@copy_recipients', $Config.CopyRecipients) }
+    if ($Config.FromAddress) { [void]$cmd.Parameters.AddWithValue('@from_address', $Config.FromAddress) }
+    if ($Config.ReplyTo)     { [void]$cmd.Parameters.AddWithValue('@reply_to', $Config.ReplyTo) }
+    [void]$cmd.Parameters.AddWithValue('@subject', $Subject)
+    $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html
+    [void]$cmd.Parameters.AddWithValue('@body_format', 'HTML')
+    [void]$cmd.Parameters.AddWithValue('@importance', $Importance)
+    if ($Attachment) { [void]$cmd.Parameters.AddWithValue('@file_attachments', $Attachment) }
+    $pMailItemId = $cmd.Parameters.Add('@mailitem_id', [System.Data.SqlDbType]::Int); $pMailItemId.Direction = [System.Data.ParameterDirection]::Output
+    [void]$cmd.ExecuteNonQuery()
+    if ($pMailItemId.Value -is [DBNull] -or $null -eq $pMailItemId.Value) { return (Find-QueuedMail $Connection $Subject) }
+    return [int]$pMailItemId.Value
 }
 
 # =============================================================================
 #  OUTER: prompts + log on as your account (used for SQL connections)
 # =============================================================================
+if ($Phase -eq 'CLEANUP') {
+    Write-Step '=== Cleanup of old Snapshots / Reports / Logs ===' 'Green'
+    $h = if ($Config.CleanupHours -gt 0) { $Config.CleanupHours } else { 48 }
+    Invoke-Cleanup $h $Config.KeepPreWithoutPostDays
+    if (-not $Inner) { Read-Host 'Press Enter to close' }
+    exit 0
+}
 if (-not $Inner) {
-    Write-Step "=== SQL Server PRE / POST change check  (v$ToolVersion) ===" 'Green'
-    if ($script:SettingsUsed) { Write-Step "Settings   : $($script:SettingsUsed)" 'DarkGray' }
-    else { Write-Step "Settings   : built-in defaults (no $(Split-Path $SettingsFile -Leaf) - copy settings.example.psd1 to set yours)" 'DarkGray' }
-    if ($Config.Recipients -like '*@yourcompany.com') { Write-Step "WARNING: Recipients is still the example address ($($Config.Recipients)) - set it in settings.psd1." 'Yellow' }
+    Write-Step '=== SQL Server PRE / POST change check ===' 'Green'
     while ($Phase -notin @('PRE', 'POST', 'HEALTH')) {
         Write-Host '  1 = PRE      snapshot before a change'
         Write-Host '  2 = POST     compare after the change with PRE'
         Write-Host '  3 = HEALTH   health check report only'
-        $Phase = (Read-Host 'Choose 1-3 (or type PRE / POST / HEALTH)').Trim().ToUpperInvariant()
-        $Phase = switch ($Phase) { '1' { 'PRE' } '2' { 'POST' } '3' { 'HEALTH' } 'HC' { 'HEALTH' } default { $Phase } }
+        Write-Host '  4 = CLEANUP  delete old snapshots / reports / logs'
+        $Phase = (Read-Host 'Choose 1-4 (or type PRE / POST / HEALTH / CLEANUP)').Trim().ToUpperInvariant()
+        $Phase = switch ($Phase) { '1' { 'PRE' } '2' { 'POST' } '3' { 'HEALTH' } 'HC' { 'HEALTH' } '4' { 'CLEANUP' } default { $Phase } }
+        if ($Phase -eq 'CLEANUP') {
+            Invoke-Cleanup $(if ($Config.CleanupHours -gt 0) { $Config.CleanupHours } else { 48 }) $Config.KeepPreWithoutPostDays
+            Read-Host 'Press Enter to close'; exit 0
+        }
     }
     if (-not $PSBoundParameters.ContainsKey('Ticket')) {
         $Ticket = if ($Phase -eq 'HEALTH') { Read-Host 'Ticket / label (optional, Enter = DAILY)' }
@@ -943,7 +833,6 @@ if (-not $Inner) {
         if (Start-SecondaryLogonService) {
             $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Inner', '-Phase', $Phase, '-Ticket', $Ticket, '-HandOff', "`"$handOffFile`"")
             if ($SqlFile)   { $argList += @('-SqlFile', "`"$((Resolve-Path $SqlFile).Path)`"") }
-            if ($PSBoundParameters.ContainsKey('SettingsFile')) { $argList += @('-SettingsFile', "`"$((Resolve-Path $SettingsFile).Path)`"") }
             if ($Instances) { $argList += @('-Instances', ($Instances -join ',')) }
             Write-Step "Starting the check as $($cred.UserName) in a new window..." 'Green'
             # No -Wait: with -Credential, Windows PowerShell's -Wait can fail with "Access is denied" AFTER the new
@@ -1032,18 +921,7 @@ try {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     Write-Step "Running as : $me"
     Write-Step "Phase      : $Phase    Ticket: $Ticket"
-    $sqlPath = Get-SqlFilePath
-    $sqlText = [System.IO.File]::ReadAllText($sqlPath)
-    $sqlVersion = if ($sqlText -match '(?m)^--@version\s+(\S+)') { $Matches[1] } else { '(none)' }
-    Write-Step "Version    : Invoke-PrePostCheck $ToolVersion, HC_Snapshot.sql $sqlVersion$(if ($script:SettingsUsed) { ", settings $($script:SettingsUsed)" })"
-    if ($sqlVersion -ne $ToolVersion) {
-        Write-Step "WARNING: HC_Snapshot.sql is version $sqlVersion but this script is $ToolVersion - copy both files from the same version." 'Yellow'
-    }
-    $checkDefs = Get-CheckDefinitions $sqlText
-    $Checks = $checkDefs.Checks
-    foreach ($w in $checkDefs.Warnings) { Write-Step "WARNING (check definitions): $w" 'Yellow' }
-    $checkWarned = @{}
-    if ($Checks.Count -eq 0) { throw "No --@check definitions found in $sqlPath - it is not the HC_Snapshot.sql for this version of the script." }
+    $sqlText = [System.IO.File]::ReadAllText((Get-SqlFilePath))
     $targets = Get-TargetInstances
     if (-not $targets) { throw 'No SQL Server instances found on this VM and servers.txt is empty.' }
     if ($script:RetryErrors) { $targets = @($targets | Where-Object { $script:RetryErrors.ContainsKey([string]$_.Instance) }) }
@@ -1129,8 +1007,7 @@ try {
             }
             $snap = @{
                 meta     = @{ instance = $t.Instance; phase = $Phase; ticket = $Ticket; taken_at = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); taken_by = $row.ConnectedAs; machine = $env:COMPUTERNAME
-                              build = (Get-Val (@(Get-Rows $data 'instance') | Where-Object { (Get-Val $_ 'property_code') -eq 'build' } | Select-Object -First 1) 'value')
-                              tool_version = $ToolVersion; sql_version = $sqlVersion }
+                              build = (Get-Val (@(Get-Rows $data 'instance') | Where-Object { (Get-Val $_ 'property_code') -eq 'build' } | Select-Object -First 1) 'value') }
                 sections = $data.sections
                 columns  = $data.columns
             }
@@ -1152,13 +1029,8 @@ try {
             $issues = @(Get-Rows $snap 'issues')
             $crit = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'CRITICAL' }).Count
             $warn = @($issues | Where-Object { (Get-Val $_ 'severity') -eq 'WARNING' }).Count
-            [void](Test-CheckDefinitions $snap $t.Instance $checkWarned)
-            # Report file: every section. Email body: without email: no sections (data / log file list).
-            # PRE / HEALTH / NO BASELINE already show "Needs attention" at the top, so it is not repeated.
             $fullReport = [string](Get-FullReportHtml $snap)
-            $bodyReport = [string](Get-FullReportHtml $snap -ForEmail)
-            $fullNoIssues = [string](Get-FullReportHtml $snap -Exclude @('issues'))
-            $bodyNoIssues = [string](Get-FullReportHtml $snap -Exclude @('issues') -ForEmail)
+            $bodyReport = [string](Get-FullReportHtml $snap -Exclude @('files'))   # email body: no data/log file list (it is in the report file)
 
             if ($Phase -eq 'HEALTH') {
                 $color = if ($crit -gt 0) { '#f8d7da' } elseif ($warn -gt 0) { '#fff3cd' } else { '#d4edda' }
@@ -1171,8 +1043,8 @@ try {
                     "<h3>Needs attention ($($issues.Count))</h3>"
                     [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
                 ) -join '')
-                $row.FullHtml = $row.ShortHtml + $fullNoIssues
-                $row.BodyHtml = $row.ShortHtml + $bodyNoIssues
+                $row.FullHtml = $row.ShortHtml + ($fullReport -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
+                $row.BodyHtml = $row.ShortHtml + ($bodyReport -replace '^<h3>Needs attention</h3>.*?(?=<h3>)', '')
                 Write-Step $row.Outcome $(if ($row.State -eq 'OK') { 'Green' } else { 'Yellow' })
             }
             elseif ($Phase -eq 'PRE') {
@@ -1186,8 +1058,8 @@ try {
                     "<h3>Needs attention now ($($issues.Count))</h3>"
                     [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
                 ) -join '')
-                $row.FullHtml = $row.ShortHtml + $fullNoIssues
-                $row.BodyHtml = $row.ShortHtml + $bodyNoIssues
+                $row.FullHtml = $row.ShortHtml + $fullReport
+                $row.BodyHtml = $row.ShortHtml + $bodyReport
                 Write-Step $row.Outcome 'Green'
             }
             else {
@@ -1226,8 +1098,7 @@ try {
                         "<tr><td>Ticket</td><td>$(Enc $pre['meta']['ticket'])</td><td>$(Enc $Ticket)</td></tr>"
                         "<tr><td>Taken</td><td>$(Enc $pre['meta']['taken_at'])</td><td>$(Enc $snap.meta.taken_at)</td></tr>"
                         "<tr><td>By</td><td>$(Enc $pre['meta']['taken_by'])</td><td>$(Enc $me)</td></tr>"
-                        "<tr><td>Build</td><td>$(Enc $pre['meta']['build'])</td><td>$(Enc $snap.meta.build)</td></tr>"
-                        "<tr><td>Check version</td><td>$(Enc $(if ($pre['meta'].ContainsKey('tool_version')) { $pre['meta']['tool_version'] } else { 'before 3.0.0' }))</td><td>$(Enc $ToolVersion)</td></tr></table>"
+                        "<tr><td>Build</td><td>$(Enc $pre['meta']['build'])</td><td>$(Enc $snap.meta.build)</td></tr></table>"
                         "<h3>Unexpected differences ($nU)</h3>"
                         [string](ConvertTo-HtmlTable $cmp.Unexpected $diffCols 'background-color:#f8d7da')
                         "<h3>New problems after the change ($nN)</h3>"
@@ -1250,15 +1121,15 @@ try {
                         "<h3>Needs attention now ($($issues.Count))</h3>"
                         [string](ConvertTo-HtmlTable $issues $issueCols '' 'severity')
                     ) -join '')
-                    $row.FullHtml = $row.ShortHtml + $fullNoIssues
-                    $row.BodyHtml = $row.ShortHtml + $bodyNoIssues
+                    $row.FullHtml = $row.ShortHtml + $fullReport
+                    $row.BodyHtml = $row.ShortHtml + $bodyReport
                     Write-Step $row.Outcome 'Yellow'
                 }
             }
 
             if ($Config.PerInstanceReports) {
                 $f = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f $safe, $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
-                [System.IO.File]::WriteAllText($f, ([string]$DbaHtmlHead + $row.FullHtml + '</body></html>'), [System.Text.Encoding]::UTF8)
+                [System.IO.File]::WriteAllText($f, ([string]$HtmlHead + $row.FullHtml + '</body></html>'), [System.Text.Encoding]::UTF8)
             }
         }
         catch {
@@ -1327,8 +1198,7 @@ try {
         '<h3>Summary</h3>'
         [string](ConvertTo-HtmlTable $summaryRows $summaryCols '' 'status')
     ) -join '')
-    $footer = "<div class='footer'>Invoke-PrePostCheck $(Enc $ToolVersion) &nbsp;|&nbsp; HC_Snapshot.sql $(Enc $sqlVersion) &nbsp;|&nbsp; $(Enc $env:COMPUTERNAME) &nbsp;|&nbsp; settings: $(Enc $(if ($script:SettingsUsed) { $script:SettingsUsed } else { 'built-in defaults' }))</div>"
-    $combinedHtml = [string]$DbaHtmlHead + $header + (($summary | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + $footer + '</body></html>'
+    $combinedHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.FullHtml }) -join "<hr style='margin:30px 0'>") + '</body></html>'
     $combinedFile = Join-Path $Config.ReportsFolder ("{0}_{1}_{2}_{3}.html" -f (Get-SafeFileName $env:COMPUTERNAME), $Phase, $Ticket, (Get-Date -Format 'yyyyMMdd_HHmm'))
     [System.IO.File]::WriteAllText($combinedFile, $combinedHtml, [System.Text.Encoding]::UTF8)
     Write-Step "`nCombined report: $combinedFile" 'Green'
@@ -1345,7 +1215,7 @@ try {
         $c = $null
         try {
             $c = (Open-SqlConnection $sender.Instance).Connection
-            $shortHtml = [string]$DbaHtmlHead + $header + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
+            $shortHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { $_.ShortHtml }) -join "<hr style='margin:30px 0'>")
             $sizeBytes = (Get-Item -LiteralPath $combinedFile).Length
             $maxBytes = 0
             try { $maxBytes = [int64](Invoke-Scalar $c "SELECT CAST(paramvalue AS bigint) FROM msdb.dbo.sysmail_configuration WHERE paramname = N'MaxFileSize';") } catch { }
@@ -1358,7 +1228,7 @@ try {
             }
             if ($attach -and -not $mailId) {
                 try {
-                    $body = $shortHtml + "<p style='color:#555'>The full report for every instance is attached: $(Enc (Split-Path $combinedFile -Leaf))</p>" + $footer + '</body></html>'
+                    $body = $shortHtml + "<p style='color:#555'>The full report for every instance is attached: $(Enc (Split-Path $combinedFile -Leaf))</p></body></html>"
                     $mailId = Send-DbMail $c $sender.Profile $subject $body $importance $combinedFile
                     $mailStatus = 'Queued with attachment'
                 }
@@ -1377,8 +1247,8 @@ try {
             }
             if (-not $mailId) {
                 # report in the body - without the data/log file list, which stays in the report file on the VM
-                $bodyHtml = [string]$DbaHtmlHead + $header + (($summary | ForEach-Object { if ($_.BodyHtml) { $_.BodyHtml } else { $_.ShortHtml } }) -join "<hr style='margin:30px 0'>") `
-                          + "<p style='color:#555'>Data &amp; log file details are in the report file on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p>" + $footer + '</body></html>'
+                $bodyHtml = [string]$HtmlHead + $header + (($summary | ForEach-Object { if ($_.BodyHtml) { $_.BodyHtml } else { $_.ShortHtml } }) -join "<hr style='margin:30px 0'>") `
+                          + "<p style='color:#555'>Data &amp; log file details are in the report file on $(Enc $env:COMPUTERNAME): $(Enc $combinedFile)</p></body></html>"
                 $mailId = Send-DbMail $c $sender.Profile $subject $bodyHtml $importance
                 $mailStatus = 'Queued (report in body, file list in the report file)'
             }
@@ -1386,7 +1256,13 @@ try {
 
             Write-Step "Waiting $($Config.MailCheckDelaySec)s to check Database Mail delivery..."
             Start-Sleep -Seconds $Config.MailCheckDelaySec
-            $mailStatus = "$mailStatus - " + (Get-DbMailItemStatus $c $mailId)
+            $q = @"
+SELECT a.sent_status + CASE WHEN a.sent_status = 'failed'
+       THEN ' - ' + ISNULL((SELECT TOP (1) LEFT(l.description, 200) FROM msdb.dbo.sysmail_event_log l WHERE l.mailitem_id = a.mailitem_id ORDER BY l.log_id DESC), '') ELSE '' END
+FROM msdb.dbo.sysmail_allitems AS a WHERE a.mailitem_id = @id;
+"@
+            $st = Invoke-Scalar $c $q @{ '@id' = $mailId }
+            $mailStatus = "$mailStatus - " + $(if ($null -eq $st -or $st -is [DBNull]) { 'status not found' } else { [string]$st })
         }
         catch {
             $mailStatus = 'Send failed: ' + $_.Exception.Message

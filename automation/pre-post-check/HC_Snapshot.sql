@@ -10,9 +10,7 @@
            JSON, compares PRE vs POST and emails the outcome.
  Tags    : [BOX] 2016 SP2 - 2025 / Azure VM   [MI] (services/disks skipped)
  Note    : Can also be run on its own in SSMS to see every section as a grid.
- Version : see the --@version line below (must match Invoke-PrePostCheck.ps1)
 *******************************************************************************/
---@version 3.0.0
 SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET ANSI_PADDING ON; SET ANSI_WARNINGS ON;
 SET ARITHABORT ON; SET CONCAT_NULL_YIELDS_NULL ON; SET NUMERIC_ROUNDABORT OFF;
@@ -441,36 +439,10 @@ SELECT 'WARNING', 'SSRS', rs_database, CAST(failed_executions AS nvarchar(10)) +
 FROM #ssrs_sum WHERE failed_executions > 0;
 
 /*=============================================================================
-  OUTPUT - one result set per section, first column _section = section name.
+  OUTPUT - one result set per section. First column _section = section name.
   Every value is returned as text so PRE / POST compare exactly.
-
-  CHECK DEFINITIONS: the --@check lines above each SELECT are read by
-  Invoke-PrePostCheck.ps1. They are the only place that says how a section is
-  compared and shown, so a new check = one SELECT + its --@check lines.
-    --@check <section>: <title>      title in the report / email
-    --@   key: col, col              identifies a row; rows only in PRE = MISSING, only in POST = NEW
-    --@   compare: col, col          must be the same in PRE and POST (no key = shown only, not compared)
-    --@   expected: col, col         may change; listed under "Expected changes"
-    --@   expected_keys: key, key    rows whose compare columns may change (e.g. the build)
-    --@   ignore_keys: key, key      rows that are never compared (e.g. uptime)
-    --@   drift: col=pct|disk        numeric: pct = size change above FileSizeDriftPct % and FileSizeDriftMinMB MB,
-    --@                              disk = free space change above DiskFreeDriftPct % of the disk
-    --@   report: no                 compared, but not shown in the report
-    --@   email: no                  in the report file, but not in the email body
-    --@   source: powershell         collected by the script, not by this file (no SELECT here)
-  Sections appear in the report in this order. A list can continue on the next
-  --@ line. Lines are plain comments, so the file still runs in SSMS as is.
 =============================================================================*/
---@check issues: Needs attention
--- (compared by the script itself: new problems after the change vs problems that already existed before)
-SELECT N'issues' AS _section, severity, area, item, ISNULL(detail, N'') AS detail
-FROM #issues ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, area, item;
-
---@check instance: Instance
---@   key: property_code
---@   compare: value
---@   expected_keys: build, sp_level, cu, kb, start_time, os_boot_time
---@   ignore_keys: sql_uptime, os_uptime
+-- instance (property_code is the comparison key)
 SELECT N'instance' AS _section, v.property_code, v.property, v.value
 FROM sys.dm_os_sys_info AS i
 CROSS APPLY (VALUES
@@ -498,22 +470,18 @@ CROSS APPLY (VALUES
     (N'memory_model',N'Memory model',           CAST(i.sql_memory_model_desc AS nvarchar(4000)))
 ) AS v(property_code, property, value);
 
---@check services: SQL Server services
---@   key: servicename
---@   compare: status, startup_type, service_account, ifi
---@   expected: last_startup
 SELECT N'services' AS _section, servicename, status_desc AS status, startup_type_desc AS startup_type,
        service_account, ifi, CONVERT(nvarchar(19), last_startup_time, 120) AS last_startup
 FROM #svc ORDER BY servicename;
 
---@check vitals: Vitals
 SELECT N'vitals' AS _section, metric, value, status FROM #vitals ORDER BY seq;
 
---@check databases: Databases & backups
---@   key: name
---@   compare: state, user_access, recovery_model, compat_level, owner_name, is_read_only, page_verify, rcsi,
---@            snapshot_isolation, is_encrypted, broker, trustworthy, query_store, ag_name, ag_role, ag_sync_state
---@   drift: size_mb=pct
+SELECT N'config' AS _section, name, CAST(value_in_use AS nvarchar(100)) AS value_in_use
+FROM sys.configurations ORDER BY name;
+
+SELECT N'traceflags' AS _section, CAST(TraceFlag AS nvarchar(10)) AS trace_flag, CAST(Global AS nvarchar(5)) AS global
+FROM #tf WHERE Global = 1 ORDER BY TraceFlag;
+
 SELECT N'databases' AS _section, d.name, d.state_desc AS state, d.user_access_desc AS user_access,
        d.recovery_model_desc AS recovery_model, CAST(d.compatibility_level AS nvarchar(5)) AS compat_level,
        d.owner_name, CAST(sd.is_read_only AS nvarchar(5)) AS is_read_only, sd.page_verify_option_desc AS page_verify,
@@ -530,10 +498,6 @@ FROM #db AS d
 JOIN sys.databases AS sd ON sd.database_id = d.database_id
 ORDER BY d.database_id;
 
---@check ag_replicas: Always On - replicas (nodes)
---@   key: ag_name, replica_node
---@   compare: primary_replica, role, availability_mode, failover_mode, connected_state, sync_health, readable,
---@            endpoint_url, backup_priority, listeners
 SELECT N'ag_replicas' AS _section, ag_name, replica_node, ISNULL(primary_replica, N'') AS primary_replica, ISNULL(role_desc, N'') AS role,
        availability_mode_desc AS availability_mode, failover_mode_desc AS failover_mode,
        ISNULL(connected_state_desc, N'') AS connected_state, ISNULL(synchronization_health_desc, N'') AS sync_health,
@@ -541,9 +505,6 @@ SELECT N'ag_replicas' AS _section, ag_name, replica_node, ISNULL(primary_replica
        CAST(backup_priority AS nvarchar(5)) AS backup_priority, ISNULL(listeners, N'') AS listeners, status
 FROM #agr ORDER BY ag_name, replica_node;
 
---@check ag_listeners: Always On - listeners (IP / DHCP)
---@   key: ag_name, listener, ip_address
---@   compare: port, subnet_mask, ip_type, network_subnet, ip_state, is_conformant
 -- Listener IPs: static or DHCP, subnet, IP resource state (DNN listeners are not listed here)
 SELECT N'ag_listeners' AS _section, ag.name AS ag_name, l.dns_name AS listener, CAST(l.port AS nvarchar(10)) AS port,
        ISNULL(ip.ip_address, N'') AS ip_address, ISNULL(ip.ip_subnet_mask, N'') AS subnet_mask,
@@ -555,151 +516,24 @@ JOIN sys.availability_groups AS ag ON ag.group_id = l.group_id
 LEFT JOIN sys.availability_group_listener_ip_addresses AS ip ON ip.listener_id = l.listener_id
 ORDER BY ag.name, l.dns_name, ip.ip_address;
 
---@check ag_databases: Always On - databases per replica
---@   key: ag_name, database_name, replica_node
---@   compare: role, sync_state, sync_health, is_suspended
 SELECT N'ag_databases' AS _section, ag_name, database_name, replica_node, role,
        synchronization_state_desc AS sync_state, synchronization_health_desc AS sync_health,
        CAST(is_suspended AS nvarchar(5)) AS is_suspended,
        CAST(send_queue_kb AS nvarchar(30)) AS send_queue_kb, CAST(redo_queue_kb AS nvarchar(30)) AS redo_queue_kb, status
 FROM #agdb ORDER BY ag_name, database_name, replica_node;
 
---@check cluster: Cluster & quorum
---@   key: member_name
---@   compare: quorum_type, quorum_state, member_type, member_state, votes
 SELECT N'cluster' AS _section, member_name, cluster_name, quorum_type_desc AS quorum_type, quorum_state_desc AS quorum_state,
        member_type_desc AS member_type, member_state_desc AS member_state, CAST(number_of_quorum_votes AS nvarchar(5)) AS votes, status
 FROM #cluster ORDER BY member_name;
 
---@check disks: Disk space
---@   key: volume
---@   compare: total_gb
---@   drift: free_gb=disk
 SELECT N'disks' AS _section, volume, ISNULL(label, N'') AS label, CAST(total_gb AS nvarchar(30)) AS total_gb,
        CAST(free_gb AS nvarchar(30)) AS free_gb, CAST(free_pct AS nvarchar(10)) AS free_pct, status
 FROM #disk ORDER BY volume;
 
---@check files: Data & log files
---@   key: database_name, logical_name
---@   compare: type, physical_name, state, growth, max_size
---@   drift: size_mb=pct
---@   email: no
 SELECT N'files' AS _section, database_name, logical_name, type_desc AS type, physical_name, state_desc AS state,
        CAST(size_mb AS nvarchar(30)) AS size_mb, CAST(used_mb AS nvarchar(30)) AS used_mb, growth, max_size, status
 FROM #files ORDER BY database_name, logical_name;
 
---@check job_failures: Failed job steps (24 h)
-SELECT N'job_failures' AS _section, job_name, CONVERT(nvarchar(16), run_time, 120) AS run_time,
-       CAST(step_id AS nvarchar(5)) + N' ' + step_name AS step, message
-FROM #jobs ORDER BY run_time DESC;
-
---@check errorlog: Severe error log entries (24 h)
-SELECT TOP (50) N'errorlog' AS _section, CONVERT(nvarchar(19), LogDate, 120) AS log_time, ProcessInfo AS source, message
-FROM #errlog ORDER BY LogDate DESC;
-
---@check traceflags: Global trace flags
---@   key: trace_flag
-SELECT N'traceflags' AS _section, CAST(TraceFlag AS nvarchar(10)) AS trace_flag, CAST(Global AS nvarchar(5)) AS global
-FROM #tf WHERE Global = 1 ORDER BY TraceFlag;
-
---@check config: sp_configure
---@   key: name
---@   compare: value_in_use
-SELECT N'config' AS _section, name, CAST(value_in_use AS nvarchar(100)) AS value_in_use
-FROM sys.configurations ORDER BY name;
-
---@check linked_servers: Linked servers
---@   key: name
---@   compare: product, provider, data_source
-SELECT N'linked_servers' AS _section, name, ISNULL(product, N'') AS product, ISNULL(provider, N'') AS provider, ISNULL(data_source, N'') AS data_source
-FROM sys.servers WHERE is_linked = 1 ORDER BY name;
-
---@check endpoints: Endpoints
---@   key: name
---@   compare: type, state, port
-SELECT N'endpoints' AS _section, e.name, e.type_desc AS type, e.state_desc AS state, ISNULL(CAST(t.port AS nvarchar(10)), N'') AS port
-FROM sys.endpoints AS e LEFT JOIN sys.tcp_endpoints AS t ON t.endpoint_id = e.endpoint_id
-WHERE e.endpoint_id > 5
-ORDER BY e.name;
-
---@check certificates: Certificates
---@   key: name
---@   compare: thumbprint, expiry
-SELECT N'certificates' AS _section, name, CONVERT(nvarchar(100), thumbprint, 1) AS thumbprint, CONVERT(nvarchar(10), expiry_date, 120) AS expiry
-FROM master.sys.certificates WHERE name NOT LIKE N'##%' ORDER BY name;
-
---@check xe_sessions: XE sessions
---@   key: name
---@   compare: running
-SELECT N'xe_sessions' AS _section, s.name, CASE WHEN r.name IS NULL THEN N'0' ELSE N'1' END AS running
-FROM sys.server_event_sessions AS s LEFT JOIN sys.dm_xe_sessions AS r ON r.name = s.name
-ORDER BY s.name;
-
---@check bi_services: SSIS / SSRS / SSAS services (this VM)
---@   source: powershell
---@   key: name
---@   compare: state, start_mode, account
--- (collected by Invoke-PrePostCheck.ps1 on the VM, not by this file)
-
---@check ssis_catalog: SSIS catalog settings
---@   key: property_name
---@   compare: property_value
---@   expected_keys: SCHEMA_BUILD, SCHEMA_VERSION
-SELECT N'ssis_catalog' AS _section, property_name, ISNULL(property_value, N'') AS property_value FROM #ssis_cat ORDER BY property_name;
-
---@check ssis_projects: SSIS projects
---@   key: folder, project
---@   compare: packages, object_version_lsn, deployed_by
-SELECT N'ssis_projects' AS _section, folder, project, CAST(packages AS nvarchar(10)) AS packages,
-       CAST(object_version_lsn AS nvarchar(30)) AS object_version_lsn, ISNULL(last_deployed, N'') AS last_deployed, ISNULL(deployed_by, N'') AS deployed_by
-FROM #ssis_proj ORDER BY folder, project;
-
---@check ssis_environments: SSIS environments
---@   key: folder, environment
---@   compare: variables
-SELECT N'ssis_environments' AS _section, folder, environment, CAST(variables AS nvarchar(10)) AS variables
-FROM #ssis_env ORDER BY folder, environment;
-
---@check ssis_failures: SSIS failed executions (24 h)
-SELECT N'ssis_failures' AS _section, CAST(execution_id AS nvarchar(30)) AS execution_id, ISNULL(folder, N'') AS folder, ISNULL(project, N'') AS project,
-       ISNULL(package, N'') AS package, ISNULL(start_time, N'') AS start_time, ISNULL(status, N'') AS status
-FROM #ssis_fail ORDER BY execution_id DESC;
-
---@check ssrs_summary: SSRS content (report server databases)
---@   key: rs_database
---@   compare: folders, reports, datasources, datasets, other_items, subscriptions, schedules
-SELECT N'ssrs_summary' AS _section, rs_database, CAST(folders AS nvarchar(10)) AS folders, CAST(reports AS nvarchar(10)) AS reports,
-       CAST(datasources AS nvarchar(10)) AS datasources, CAST(datasets AS nvarchar(10)) AS datasets, CAST(other_items AS nvarchar(10)) AS other_items,
-       CAST(subscriptions AS nvarchar(10)) AS subscriptions, CAST(failing_subscriptions AS nvarchar(10)) AS failing_subscriptions,
-       CAST(schedules AS nvarchar(10)) AS schedules, CAST(failed_executions AS nvarchar(10)) AS failed_executions
-FROM #ssrs_sum ORDER BY rs_database;
-
---@check ssrs_subscriptions: SSRS subscriptions
---@   key: rs_database, subscription_id
---@   compare: report_path, owner, inactive_flags, is_failing
-SELECT N'ssrs_subscriptions' AS _section, rs_database, subscription_id, ISNULL(report_path, N'') AS report_path, ISNULL(owner, N'') AS owner,
-       ISNULL(description, N'') AS description, CAST(ISNULL(inactive_flags, 0) AS nvarchar(10)) AS inactive_flags,
-       ISNULL(last_status, N'') AS last_status, ISNULL(last_run, N'') AS last_run, CAST(is_failing AS nvarchar(5)) AS is_failing
-FROM #ssrs_sub ORDER BY rs_database, report_path;
-
---@check ssas_server: SSAS instances (this VM)
---@   source: powershell
---@   key: ssas_instance
---@   compare: service_state, connected
---@   expected: version
--- (collected by Invoke-PrePostCheck.ps1 on the VM, not by this file)
-
---@check ssas_databases: SSAS databases
---@   source: powershell
---@   key: ssas_instance, database
---@   compare: compatibility_level, type
---@   expected: date_modified
--- (collected by Invoke-PrePostCheck.ps1 on the VM, not by this file)
-
---@check jobs: Agent jobs
---@   key: name
---@   compare: enabled, owner, category
---@   report: no
 SELECT N'jobs' AS _section, j.name, CAST(j.enabled AS nvarchar(5)) AS enabled, SUSER_SNAME(j.owner_sid) AS owner,
        c.name AS category,
        CASE js.last_run_outcome WHEN 0 THEN N'Failed' WHEN 1 THEN N'Succeeded' WHEN 3 THEN N'Canceled' ELSE N'Unknown' END AS last_outcome,
@@ -709,20 +543,62 @@ LEFT JOIN msdb.dbo.sysjobservers AS js ON js.job_id = j.job_id
 LEFT JOIN msdb.dbo.syscategories AS c ON c.category_id = j.category_id
 ORDER BY j.name;
 
---@check logins: Logins
---@   key: name
---@   compare: type, is_disabled, default_database
---@   report: no
 SELECT N'logins' AS _section, name, type_desc AS type, CAST(is_disabled AS nvarchar(5)) AS is_disabled, ISNULL(default_database_name, N'') AS default_database
 FROM sys.server_principals
 WHERE type IN ('S', 'U', 'G', 'E', 'X') AND name NOT LIKE N'##%'
 ORDER BY name;
 
---@check server_roles: Server role members
---@   key: role, member
---@   report: no
 SELECT N'server_roles' AS _section, r.name AS role, m.name AS member
 FROM sys.server_role_members AS rm
 JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
 JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
 ORDER BY r.name, m.name;
+
+SELECT N'linked_servers' AS _section, name, ISNULL(product, N'') AS product, ISNULL(provider, N'') AS provider, ISNULL(data_source, N'') AS data_source
+FROM sys.servers WHERE is_linked = 1 ORDER BY name;
+
+SELECT N'endpoints' AS _section, e.name, e.type_desc AS type, e.state_desc AS state, ISNULL(CAST(t.port AS nvarchar(10)), N'') AS port
+FROM sys.endpoints AS e LEFT JOIN sys.tcp_endpoints AS t ON t.endpoint_id = e.endpoint_id
+WHERE e.endpoint_id > 5
+ORDER BY e.name;
+
+SELECT N'certificates' AS _section, name, CONVERT(nvarchar(100), thumbprint, 1) AS thumbprint, CONVERT(nvarchar(10), expiry_date, 120) AS expiry
+FROM master.sys.certificates WHERE name NOT LIKE N'##%' ORDER BY name;
+
+SELECT N'xe_sessions' AS _section, s.name, CASE WHEN r.name IS NULL THEN N'0' ELSE N'1' END AS running
+FROM sys.server_event_sessions AS s LEFT JOIN sys.dm_xe_sessions AS r ON r.name = s.name
+ORDER BY s.name;
+
+SELECT N'job_failures' AS _section, job_name, CONVERT(nvarchar(16), run_time, 120) AS run_time,
+       CAST(step_id AS nvarchar(5)) + N' ' + step_name AS step, message
+FROM #jobs ORDER BY run_time DESC;
+
+SELECT TOP (50) N'errorlog' AS _section, CONVERT(nvarchar(19), LogDate, 120) AS log_time, ProcessInfo AS source, message
+FROM #errlog ORDER BY LogDate DESC;
+
+SELECT N'ssis_catalog' AS _section, property_name, ISNULL(property_value, N'') AS property_value FROM #ssis_cat ORDER BY property_name;
+
+SELECT N'ssis_projects' AS _section, folder, project, CAST(packages AS nvarchar(10)) AS packages,
+       CAST(object_version_lsn AS nvarchar(30)) AS object_version_lsn, ISNULL(last_deployed, N'') AS last_deployed, ISNULL(deployed_by, N'') AS deployed_by
+FROM #ssis_proj ORDER BY folder, project;
+
+SELECT N'ssis_environments' AS _section, folder, environment, CAST(variables AS nvarchar(10)) AS variables
+FROM #ssis_env ORDER BY folder, environment;
+
+SELECT N'ssis_failures' AS _section, CAST(execution_id AS nvarchar(30)) AS execution_id, ISNULL(folder, N'') AS folder, ISNULL(project, N'') AS project,
+       ISNULL(package, N'') AS package, ISNULL(start_time, N'') AS start_time, ISNULL(status, N'') AS status
+FROM #ssis_fail ORDER BY execution_id DESC;
+
+SELECT N'ssrs_summary' AS _section, rs_database, CAST(folders AS nvarchar(10)) AS folders, CAST(reports AS nvarchar(10)) AS reports,
+       CAST(datasources AS nvarchar(10)) AS datasources, CAST(datasets AS nvarchar(10)) AS datasets, CAST(other_items AS nvarchar(10)) AS other_items,
+       CAST(subscriptions AS nvarchar(10)) AS subscriptions, CAST(failing_subscriptions AS nvarchar(10)) AS failing_subscriptions,
+       CAST(schedules AS nvarchar(10)) AS schedules, CAST(failed_executions AS nvarchar(10)) AS failed_executions
+FROM #ssrs_sum ORDER BY rs_database;
+
+SELECT N'ssrs_subscriptions' AS _section, rs_database, subscription_id, ISNULL(report_path, N'') AS report_path, ISNULL(owner, N'') AS owner,
+       ISNULL(description, N'') AS description, CAST(ISNULL(inactive_flags, 0) AS nvarchar(10)) AS inactive_flags,
+       ISNULL(last_status, N'') AS last_status, ISNULL(last_run, N'') AS last_run, CAST(is_failing AS nvarchar(5)) AS is_failing
+FROM #ssrs_sub ORDER BY rs_database, report_path;
+
+SELECT N'issues' AS _section, severity, area, item, ISNULL(detail, N'') AS detail
+FROM #issues ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END, area, item;
