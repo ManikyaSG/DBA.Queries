@@ -65,7 +65,7 @@ $ToolVersion = '1.0.0'               # shown in the report / email footer; keep 
 $Config = @{
     Recipients            = 'dba-team@yourcompany.com'   # ; separated
     CopyRecipients        = ''
-    FromAddress           = ''                           # optional, e.g. 'SQL Alerts <sqlalerts@yourcompany.com>' ('' = profile's account)
+    FromAddress           = 'noreply@company.com'        # always the sender of the email (the profile's own address is never used)
     ReplyTo               = ''                           # optional reply-to address
     MailProfile           = 'DBA_Mail'                   # preferred; else default / only profile on the instance
     AutoSetupDbMail       = $true    # XPs off -> enable them; no mail profile -> run DbMailSetupFile; then re-check
@@ -812,7 +812,8 @@ function Send-DbMail($Connection, [string]$MailProfileName, [string]$Subject, [s
     [void]$cmd.Parameters.AddWithValue('@profile_name', $MailProfileName)
     [void]$cmd.Parameters.AddWithValue('@recipients', $Config.Recipients)
     if ($Config.CopyRecipients) { [void]$cmd.Parameters.AddWithValue('@copy_recipients', $Config.CopyRecipients) }
-    if ($Config.FromAddress) { [void]$cmd.Parameters.AddWithValue('@from_address', $Config.FromAddress) }
+    $from = if ([string]$Config.FromAddress) { [string]$Config.FromAddress } else { 'noreply@company.com' }   # never the profile's default address
+    [void]$cmd.Parameters.AddWithValue('@from_address', $from)
     if ($Config.ReplyTo)     { [void]$cmd.Parameters.AddWithValue('@reply_to', $Config.ReplyTo) }
     [void]$cmd.Parameters.AddWithValue('@subject', $Subject)
     $pBody = $cmd.Parameters.Add('@body', [System.Data.SqlDbType]::NVarChar, -1); $pBody.Value = $Html

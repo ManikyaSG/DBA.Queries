@@ -21,6 +21,7 @@ Before a change (patching, CU, in-place upgrade, failover test, config change), 
   - 🟡 **`[POST NO BASELINE]`**: no PRE snapshot was found, so it sends the POST report only.
 
 **One report and one email per VM.** All instances on the VM go into a single HTML file, `Reports\<VM>_<PRE|POST>_<ticket>_<time>.html`. It opens with a summary table (one row per instance), followed by each instance's section. A single email is sent through the first instance that has working Database Mail, local instances first:
+- The email is always sent **from `noreply@company.com`** (`FromAddress` in `$Config`), never from the Database Mail profile's own address.
 - The **email body** has the summary plus each instance's differences / new problems.
 - The **full combined report is attached**. If it can't be attached, because it's bigger than Database Mail's `MaxFileSize` or the SQL Server service account can't read the `Reports` folder, the report goes in the email body instead, **without the data / log file list**, which stays in the report file on the VM (its path is given in the email).
 - If Database Mail isn't usable on an instance, the script fixes it there and checks again:
