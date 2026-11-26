@@ -27,7 +27,7 @@ Describe 'Scripts' {
     }
     It 'scripts, SQL and batch files are plain ASCII (Windows PowerShell 5.1 reads BOM-less files as ANSI)' {
         $bad = @()
-        foreach ($f in Get-ChildItem -LiteralPath $AutomationRoot -Recurse -Include *.ps1, *.psd1, *.sql, *.bat) {
+        foreach ($f in Get-ChildItem -LiteralPath $AutomationRoot -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psd1', '.sql', '.bat' }) {
             $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
             $start = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
             for ($i = $start; $i -lt $bytes.Length; $i++) { if ($bytes[$i] -gt 127) { $bad += "$($f.Name) (byte $i)"; break } }

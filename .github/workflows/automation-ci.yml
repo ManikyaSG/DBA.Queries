@@ -31,7 +31,7 @@ jobs:
       run:
         shell: ${{ matrix.shell }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Pester 5 and PSScriptAnalyzer
         run: |
@@ -74,8 +74,9 @@ jobs:
     env:
       SQLCI_SERVER: localhost,1433
       SQLCI_PASSWORD: Ci_${{ github.run_id }}_Sql!x9
+      SQLCI_CONTAINER: sql
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Start SQL Server ${{ matrix.version }} (with SQL Agent)
         run: |
