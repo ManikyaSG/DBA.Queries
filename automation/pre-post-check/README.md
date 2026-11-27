@@ -140,11 +140,13 @@ A separate, menu-driven tool for Always On AGs during maintenance. Start PowerSh
 
 | Option | What it does |
 |---|---|
-| 1 | Records the primaries on one node and fails its AGs over to the best synchronous secondary. |
+| 1 | Takes a VM (or one of its instances), finds every SQL instance on it, records the primaries and fails its AGs over to the best synchronous secondary on another VM. |
 | 2 | Returns the AGs from an option 1 run to their original primaries. |
 | 3 | Read-only AG health check. |
 | 4 | Dry run on/off (prints the T-SQL and reboot commands without running them). |
 | 5 | Rolling reboot of every VM in the cluster (below). |
+
+**Failover safety checks (all options).** A target must be synchronous, connected and healthy, with every AG database joined, synchronized, not suspended and failover-ready. It must also be on the same or a higher SQL build than the primary. The tool warns and asks before a failover that would leave fewer synchronous secondaries than `REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT`, because the new primary would then stop accepting writes. If the `FAILOVER` command errors or times out, the tool checks the replicas to see whether the role changed anyway, and reports *OUTCOME UNKNOWN* (stop and check) when it can't tell. State files are written atomically. The previous copy is kept as `.bak` and is used automatically if the file is damaged.
 
 **Rolling reboot (option 5).** Run it on one of the cluster VMs. The tool:
 1. Finds the cluster nodes, or uses `VMs.txt` if it exists. Then it finds the SQL instances on them and takes a pre-snapshot of every AG primary.

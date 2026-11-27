@@ -6,10 +6,11 @@
     Menu-driven tool for planned maintenance on SQL Server Always On AG nodes
     (Windows patching, SQL CU patching, reboots, etc.).
 
-      1 - Drain a node before activity
-          Records the current primary of every AG on the node, then fails each AG
-          over to the best synchronous secondary. Writes a state file (used by
-          option 2) and a leadership summary .txt.
+      1 - Drain a VM before activity
+          Takes a VM name (or one of its instances), finds every SQL instance on
+          that VM, records the current primary of every AG, then fails each AG the
+          VM is primary for over to the best synchronous secondary on ANOTHER VM.
+          Writes a state file (used by option 2) and a leadership summary .txt.
 
       2 - Fail back after activity
           Reads a state file from option 1 and returns every AG to the primary it
@@ -47,7 +48,18 @@
     How to run
       powershell.exe -ExecutionPolicy Bypass -File .\AG-FailoverTool.ps1
 
-    Baseline scope (deliberately NOT done automatically in v1.0)
+    Failover safety checks (every option)
+      - Target must be synchronous, connected, healthy, every AG database JOINED,
+        SYNCHRONIZED, not suspended and failover-ready, on the same or a higher
+        SQL build than the current primary, and not on the VM being drained.
+      - Warns and asks before a failover that would leave fewer synchronous
+        secondaries than REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT (writes stop).
+      - If the FAILOVER command errors or times out, the replicas are asked whether
+        the role changed anyway: COMPLETED, NOT STARTED, or OUTCOME UNKNOWN (stop).
+      - State files are written atomically (<file>.tmp -> <file>, previous copy kept
+        as <file>.bak, which is used automatically if the file is damaged).
+
+    Baseline scope (deliberately NOT done automatically)
       - No forced failover / data-loss failover.
       - No automatic switch of async replicas to synchronous commit.
       - AGs with CLUSTER_TYPE = NONE / EXTERNAL and distributed AGs are reported and skipped.
@@ -79,7 +91,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # ----------------------------------------------------------------------------
 $Config = @{
-    ToolVersion             = '1.1'
+    ToolVersion             = '1.2'
     ConnectTimeoutSec       = 15     # SQL connection timeout
     QueryTimeoutSec         = 120    # normal query timeout
     FailoverTimeoutSec      = 600    # ALTER AVAILABILITY GROUP ... FAILOVER timeout
@@ -156,6 +168,10 @@ function Get-RootCauseHint {
             foreach ($e in $ex.Errors) { $numbers.Add([int]$e.Number) }
         }
         $ex = $ex.InnerException
+    }
+
+    if ($allText -match 'OUTCOME UNKNOWN') {
+        $hints.Add('The FAILOVER command failed or timed out and the tool could not confirm which replica is primary. Do not retry or reboot yet: run option 3 or check Failover Cluster Manager until exactly one replica shows PRIMARY, then check the cluster log (Get-ClusterLog) and the SQL error log on both servers for the cause.')
     }
 
     foreach ($n in ($numbers | Select-Object -Unique)) {
@@ -359,25 +375,31 @@ ORDER BY ar.replica_server_name;
 }
 
 function Get-AGDatabases {
+    # One row for EVERY AG database on EVERY replica, so a database that is not joined
+    # on a replica shows up as 'NOT JOINED' instead of silently missing.
+    # Run on the PRIMARY: a secondary only has live data for itself ('NO DATA' elsewhere).
     param([string]$Server, [string]$AGName)
     $q = @"
 SELECT  ar.replica_server_name                         AS ReplicaServer,
         adc.database_name                              AS DatabaseName,
-        drs.synchronization_state_desc                 AS SyncState,
+        CASE WHEN drcs.is_database_joined = 0 THEN 'NOT JOINED'
+             WHEN drs.replica_id IS NULL      THEN 'NO DATA'
+             ELSE drs.synchronization_state_desc END   AS SyncState,
         drs.synchronization_health_desc                AS SyncHealth,
         CAST(drs.is_suspended AS bit)                  AS IsSuspended,
         drs.suspend_reason_desc                        AS SuspendReason,
         ISNULL(drs.log_send_queue_size, 0)             AS LogSendQueueKB,
         ISNULL(drs.redo_queue_size, 0)                 AS RedoQueueKB,
         CAST(drcs.is_failover_ready AS bit)            AS IsFailoverReady,
+        CAST(ISNULL(drcs.is_database_joined, 0) AS bit) AS IsJoined,
         drs.last_commit_time                           AS LastCommitTime
-FROM    sys.dm_hadr_database_replica_states drs
-JOIN    sys.availability_replicas ar        ON ar.replica_id = drs.replica_id
-JOIN    sys.availability_groups ag          ON ag.group_id = drs.group_id
-JOIN    sys.availability_databases_cluster adc
-        ON adc.group_database_id = drs.group_database_id AND adc.group_id = drs.group_id
+FROM    sys.availability_groups ag
+JOIN    sys.availability_replicas ar           ON ar.group_id  = ag.group_id
+JOIN    sys.availability_databases_cluster adc ON adc.group_id = ag.group_id
+LEFT JOIN sys.dm_hadr_database_replica_states drs
+        ON drs.replica_id = ar.replica_id AND drs.group_database_id = adc.group_database_id
 LEFT JOIN sys.dm_hadr_database_replica_cluster_states drcs
-        ON drcs.replica_id = drs.replica_id AND drcs.group_database_id = drs.group_database_id
+        ON drcs.replica_id = ar.replica_id AND drcs.group_database_id = adc.group_database_id
 WHERE   ag.name = @AGName
 ORDER BY ar.replica_server_name, adc.database_name;
 "@
@@ -425,7 +447,9 @@ function Write-AGSnapshot {
 # Readiness evaluation
 # ----------------------------------------------------------------------------
 function Get-ReplicaReadiness {
-    param($Replica, $Databases)
+    # -CheckBuild: also require the replica's SQL build to be >= the primary's
+    # (-ReplicaBuild / -PrimaryBuild are [version] or $null when unreachable).
+    param($Replica, $Databases, [switch]$CheckBuild, $ReplicaBuild, $PrimaryBuild)
 
     $reasons = New-Object System.Collections.Generic.List[string]
     $myDbs   = @($Databases | Where-Object { $_.ReplicaServer -eq $Replica.ReplicaServer })
@@ -441,9 +465,25 @@ function Get-ReplicaReadiness {
     }
     if ($Replica.SyncHealth -ne 'HEALTHY') { $reasons.Add("replica synchronization health is $($Replica.SyncHealth)") }
 
+    $buildOk = $true
+    if ($CheckBuild) {
+        if ($null -eq $ReplicaBuild) {
+            $reasons.Add('not reachable from this machine to check its SQL build (the FAILOVER command runs on the target, so it must be reachable)')
+            $buildOk = $false
+        }
+        elseif ($null -ne $PrimaryBuild -and $ReplicaBuild -lt $PrimaryBuild) {
+            $reasons.Add("SQL build $ReplicaBuild is lower than the primary's $PrimaryBuild - failing over to an older build is not supported; patch this replica first")
+            $buildOk = $false
+        }
+    }
+
     $suspended = @($myDbs | Where-Object { $_.IsSuspended -eq $true })
+    $notJoined = @($myDbs | Where-Object { $_.IsJoined -ne $true })
     foreach ($d in $myDbs) {
-        if ($d.IsSuspended -eq $true) {
+        if ($d.IsJoined -ne $true) {
+            $reasons.Add("DB [$($d.DatabaseName)] is NOT JOINED to the AG on this replica - it would be unavailable after failover (restore it WITH NORECOVERY and run ALTER DATABASE [$($d.DatabaseName)] SET HADR AVAILABILITY GROUP = [AG] on the replica, or reseed it)")
+        }
+        elseif ($d.IsSuspended -eq $true) {
             $reasons.Add("DB [$($d.DatabaseName)] data movement is SUSPENDED (reason: $($d.SuspendReason))")
         }
         elseif ($d.SyncState -ne 'SYNCHRONIZED') {
@@ -461,7 +501,9 @@ function Get-ReplicaReadiness {
     $waitable = ($Replica.Role -eq 'SECONDARY') -and
                 ($Replica.AvailabilityMode -eq 'SYNCHRONOUS_COMMIT') -and
                 ($Replica.ConnectedState -eq 'CONNECTED') -and
-                ($suspended.Count -eq 0)
+                ($suspended.Count -eq 0) -and
+                ($notJoined.Count -eq 0) -and
+                $buildOk
 
     [pscustomobject]@{
         Replica      = $Replica.ReplicaServer
@@ -480,6 +522,7 @@ function Find-FailoverTarget {
       -ExcludeReplica : the instance(s) being drained (option 1 / option 5)
       -OnlyReplica    : a fixed target (option 2, the original primary)
       Waits up to SyncWaitSec when the only blocker is transient sync lag.
+      Never picks a replica on a lower SQL build than the current primary.
       Preference: ready > AUTOMATIC failover partner > smallest log send + redo queue.
     #>
     param(
@@ -490,6 +533,10 @@ function Find-FailoverTarget {
     )
     $deadline = (Get-Date).AddSeconds($Config.SyncWaitSec)
     $loggedWait = $false
+    $primaryBuild = $null
+    try { $primaryBuild = [version](Get-ServerInfo -Server $PrimaryServer).ProductVersion }
+    catch { Write-Log -Level WARN -Message "[$AGName] could not read the SQL build of $PrimaryServer : $($_.Exception.Message)" }
+    $builds = @{}
     while ($true) {
         $reps = Get-AGReplicas  -Server $PrimaryServer -AGName $AGName
         $dbs  = Get-AGDatabases -Server $PrimaryServer -AGName $AGName
@@ -503,7 +550,13 @@ function Find-FailoverTarget {
             return [pscustomobject]@{ Target = $null; Candidates = @(); Reason = $why }
         }
 
-        $cands = @($pool | ForEach-Object { Get-ReplicaReadiness -Replica $_ -Databases $dbs })
+        foreach ($r in $pool) {
+            if (-not $builds[$r.ReplicaServer]) {
+                try { $builds[$r.ReplicaServer] = [version](Get-ServerInfo -Server $r.ReplicaServer).ProductVersion }
+                catch { Write-Log -Level DETAIL -Message "[$AGName] $($r.ReplicaServer) not reachable for build check: $($_.Exception.Message)" -NoConsole }
+            }
+        }
+        $cands = @($pool | ForEach-Object { Get-ReplicaReadiness -Replica $_ -Databases $dbs -CheckBuild -ReplicaBuild $builds[$_.ReplicaServer] -PrimaryBuild $primaryBuild })
         $ready = @($cands | Where-Object { $_.Ready } |
                    Sort-Object @{ Expression = { $_.IsAutomatic }; Descending = $true }, @{ Expression = { $_.TotalQueueKB }; Ascending = $true })
 
@@ -532,12 +585,53 @@ function Find-FailoverTarget {
 # ----------------------------------------------------------------------------
 # Failover execution
 # ----------------------------------------------------------------------------
+function Resolve-FailoverOutcome {
+    <#
+      Called when the FAILOVER command errored or the new role could not be confirmed.
+      Asks the target (and the old primary) which role they have now.
+      Returns @{ Outcome = COMPLETED | NOT_STARTED | UNKNOWN; Detail = observed roles }.
+      NOT_STARTED needs two consistent observations so a failover still in progress
+      is not mistaken for one that never started.
+    #>
+    param([string]$AGName, [string]$Target, [string]$FromPrimary)
+    $deadline = (Get-Date).AddSeconds($Config.RoleVerifyWaitSec)
+    $notStartedSeen = 0
+    while ($true) {
+        $tRole = 'UNREACHABLE'; $sRole = 'UNREACHABLE'; $seen = $null
+        try { $tRole = Get-LocalRole -Server $Target -AGName $AGName; $seen = Get-AGPrimary -Server $Target -AGName $AGName } catch { }
+        if ($FromPrimary) { try { $sRole = Get-LocalRole -Server $FromPrimary -AGName $AGName } catch { } }
+        $detail = "$Target=$tRole" + $(if ($FromPrimary) { ", $FromPrimary=$sRole" } else { '' }) + $(if ($seen) { ", primary seen from $Target=$seen" } else { '' })
+
+        if ($tRole -eq 'PRIMARY') { return [pscustomobject]@{ Outcome = 'COMPLETED'; Detail = $detail } }
+        if ($FromPrimary -and $sRole -eq 'PRIMARY' -and $tRole -eq 'SECONDARY') {
+            $notStartedSeen++
+            if ($notStartedSeen -ge 2) { return [pscustomobject]@{ Outcome = 'NOT_STARTED'; Detail = $detail } }
+        }
+        else { $notStartedSeen = 0 }
+
+        if ((Get-Date) -gt $deadline) { return [pscustomobject]@{ Outcome = 'UNKNOWN'; Detail = $detail } }
+        Start-Sleep -Seconds 5
+    }
+}
+
+function Get-FailResult {
+    # Result code for a failed failover: UNKNOWN when the outcome could not be confirmed.
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    if ($ErrorRecord.Exception.Message -like 'OUTCOME UNKNOWN*') { return 'UNKNOWN' }
+    return 'FAILED'
+}
+
 function Invoke-AGFailover {
     <#
       Runs a planned (no data loss) failover. Must be executed on the target.
-      Returns 'FAILED_OVER' or 'DRYRUN'; throws on failure.
+      -FromPrimary: the current primary, used to confirm the outcome after an error.
+      Returns 'FAILED_OVER' or 'DRYRUN'.
+      Throws when the failover did not happen. The message starts with 'OUTCOME UNKNOWN'
+      when the tool cannot tell which replica is primary - callers must then stop.
+      An error from the FAILOVER command (timeout, dropped connection) is not trusted on
+      its own: the replicas are asked whether the role changed anyway.
     #>
-    param([string]$AGName, [string]$Target)
+    param([string]$AGName, [string]$Target, [string]$FromPrimary)
 
     $sql = "ALTER AVAILABILITY GROUP $(Get-QuotedName $AGName) FAILOVER;"
     if ($script:DryRun) {
@@ -547,22 +641,84 @@ function Invoke-AGFailover {
 
     Write-Log -Level STEP -Message "[$AGName] Running on $Target : $sql"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    Invoke-Sql -Server $Target -Query $sql -NonQuery -TimeoutSec $Config.FailoverTimeoutSec
+    try {
+        Invoke-Sql -Server $Target -Query $sql -NonQuery -TimeoutSec $Config.FailoverTimeoutSec
+    }
+    catch {
+        $cmdError = $_
+        $failedSql = $script:LastSql
+        $sw.Stop()
+        Write-Log -Level WARN -Message "[$AGName] The FAILOVER command on $Target returned an error after $([math]::Round($sw.Elapsed.TotalSeconds,1))s: $($cmdError.Exception.Message.Trim()). Checking whether the failover happened anyway..."
+        $o = Resolve-FailoverOutcome -AGName $AGName -Target $Target -FromPrimary $FromPrimary
+        $script:LastSql = $failedSql   # error details must show the FAILOVER command, not the checks
+        if ($o.Outcome -eq 'COMPLETED') {
+            Write-Log -Level WARN -Message "[$AGName] Failover COMPLETED despite the error ($($o.Detail))."
+            return 'FAILED_OVER'
+        }
+        if ($o.Outcome -eq 'NOT_STARTED') {
+            Write-Log -Message "[$AGName] Confirmed the failover did not happen ($($o.Detail))."
+            throw $cmdError
+        }
+        throw "OUTCOME UNKNOWN: the FAILOVER command for [$AGName] on $Target failed ($($cmdError.Exception.Message.Trim())) and the tool could not confirm which replica is primary ($($o.Detail)). Do not retry or reboot until option 3 / Failover Cluster Manager shows a single PRIMARY."
+    }
     $sw.Stop()
 
     # Verify the new role
     $deadline = (Get-Date).AddSeconds($Config.RoleVerifyWaitSec)
+    $role = 'UNKNOWN'
     do {
-        $role = Get-LocalRole -Server $Target -AGName $AGName
+        try { $role = Get-LocalRole -Server $Target -AGName $AGName } catch { $role = 'UNREACHABLE' }
         if ($role -eq 'PRIMARY') { break }
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
 
     if ($role -ne 'PRIMARY') {
-        throw "Failover command completed in $([math]::Round($sw.Elapsed.TotalSeconds,1))s but $Target reports role '$role' for [$AGName] after $($Config.RoleVerifyWaitSec)s. Check the cluster log and SQL error log on $Target."
+        $o = Resolve-FailoverOutcome -AGName $AGName -Target $Target -FromPrimary $FromPrimary
+        if ($o.Outcome -ne 'COMPLETED') {
+            throw "OUTCOME UNKNOWN: the FAILOVER command for [$AGName] completed in $([math]::Round($sw.Elapsed.TotalSeconds,1))s but $Target still does not report PRIMARY ($($o.Detail)). Check Failover Cluster Manager, the cluster log and the SQL error log on $Target before doing anything else."
+        }
     }
     Write-Log -Level SUCCESS -Message "[$AGName] $Target is now PRIMARY (failover took $([math]::Round($sw.Elapsed.TotalSeconds,1))s)."
     return 'FAILED_OVER'
+}
+
+function Get-CommitRisk {
+    <#
+      REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT (SQL 2017+): if fewer synchronous
+      secondaries remain than required, the primary stops accepting writes.
+      Counts the healthy, connected synchronous replicas that stay available after
+      failing over to -Target while the -Drained instances are down.
+      Returns $null when there is no risk, otherwise the explanation.
+    #>
+    param([string]$PrimaryServer, [string]$AGName, [string]$Target, [string[]]$Drained)
+    $q = @"
+DECLARE @req int = 0;
+IF CAST(SERVERPROPERTY('ProductMajorVersion') AS int) >= 14
+    EXEC sys.sp_executesql
+         N'SELECT @r = required_synchronized_secondaries_to_commit FROM sys.availability_groups WHERE name = @n;',
+         N'@r int OUTPUT, @n sysname',
+         @r = @req OUTPUT, @n = @AGName;
+SELECT ISNULL(@req, 0) AS RequiredSecondaries;
+"@
+    $req = [int](@(Invoke-Sql -Server $PrimaryServer -Query $q -Parameters @{ AGName = $AGName })[0].RequiredSecondaries)
+    if ($req -le 0) { return $null }
+
+    $reps = @(Get-AGReplicas -Server $PrimaryServer -AGName $AGName)
+    $left = @($reps | Where-Object {
+            $_.AvailabilityMode -eq 'SYNCHRONOUS_COMMIT' -and $_.ReplicaServer -ne $Target -and
+            $Drained -notcontains $_.ReplicaServer -and $_.ConnectedState -eq 'CONNECTED' -and $_.SyncHealth -eq 'HEALTHY' })
+    if ($left.Count -ge $req) { return $null }
+    $names = if ($left.Count) { ($left | ForEach-Object { $_.ReplicaServer }) -join ', ' } else { 'none' }
+    return "REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = $req, but only $($left.Count) synchronous secondary ($names) stays available after failing over to $Target while $($Drained -join ', ') is down. The new primary will STOP ACCEPTING WRITES until enough secondaries are synchronized. To avoid it: ALTER AVAILABILITY GROUP [$AGName] SET (REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 0) for the activity and set it back afterwards."
+}
+
+function Confirm-CommitRisk {
+    # Logs the risk and asks whether to fail over anyway. Returns $true to continue.
+    param([string]$AGName, [string]$Risk)
+    Write-Log -Level WARN -Message "[$AGName] $Risk"
+    if ($script:DryRun) { Write-Log -Level WARN -Message "[DRY RUN] A live run would ask whether to fail [$AGName] over anyway."; return $true }
+    $a = Read-Choice "[$AGName] [C]ontinue with this failover anyway / [S]kip this AG (it stays on the VM being drained)" @('C', 'S')
+    return ($a -eq 'C')
 }
 
 function Wait-AGResync {
@@ -590,9 +746,33 @@ function Wait-AGResync {
 function Get-SafeName([string]$Name) { $Name -replace '[\\/:*?"<>|]', '_' }
 
 function Save-State {
+    <#
+      Writes the state atomically: the JSON goes to <file>.tmp first and then replaces
+      the real file in one step, keeping the previous version as <file>.bak.
+      A crash or kill mid-write can never leave a half-written state file.
+    #>
     param($State, [string]$Path)
     $State.LastUpdated = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-    $State | ConvertTo-Json -Depth 8 | Set-Content -Path $Path -Encoding UTF8
+    $json = $State | ConvertTo-Json -Depth 8
+    [void](ConvertFrom-Json -InputObject $json)   # never replace a good file with JSON that does not parse
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, "$Path.bak") }
+    else { [System.IO.File]::Move($tmp, $Path) }
+}
+
+function Read-StateFile {
+    # Reads a state file; uses the previous copy (<file>.bak) if the file is damaged.
+    param([string]$Path)
+    try { return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) }
+    catch {
+        $bak = "$Path.bak"
+        if (Test-Path -LiteralPath $bak) {
+            Write-Log -Level WARN -Message "State file $Path is damaged ($($_.Exception.Message)); using the previous copy $bak (it may miss the last step)."
+            return (Get-Content -LiteralPath $bak -Raw | ConvertFrom-Json)
+        }
+        throw
+    }
 }
 
 function Confirm-Action([string]$Prompt) {
@@ -621,7 +801,8 @@ function Write-DrainSummary {
     [void]$sb.AppendLine('=====================================================================================')
     [void]$sb.AppendLine(' SQL SERVER ALWAYS ON - AG FAILOVER SUMMARY (NODE DRAIN BEFORE MAINTENANCE)')
     [void]$sb.AppendLine('=====================================================================================')
-    [void]$sb.AppendLine(" Node drained     : $($State.Node)")
+    [void]$sb.AppendLine(" VM drained       : $($State.Node)")
+    [void]$sb.AppendLine(" SQL instances    : $(if ($State.Instances) { @($State.Instances) -join ', ' } else { $State.Node })")
     [void]$sb.AppendLine(" SQL version      : $($State.NodeVersion)")
     [void]$sb.AppendLine(" Started          : $($State.CreatedAt)")
     [void]$sb.AppendLine(" Completed        : $($State.DrainCompletedAt)")
@@ -706,80 +887,124 @@ function Add-FailbackSummary {
 # ----------------------------------------------------------------------------
 # Option 1 - drain a node
 # ----------------------------------------------------------------------------
-function Invoke-DrainNode {
-    Write-Log -Level STEP -Message '===== OPTION 1: Drain node before activity ====='
-    $nodeInput = (Read-Host 'Enter the SQL instance to drain (e.g. SQLVM01 or SQLVM01\INST)').Trim()
-    if (-not $nodeInput) { Write-Log -Level WARN -Message 'No server entered.'; return }
-
-    try {
-        $info = Get-ServerInfo -Server $nodeInput
-    }
+function Get-VMInstances {
+    <#
+      Resolves what the operator typed (a VM name or one of its instances) to the VM
+      and every SQL instance on it, by following the AG replicas from that instance.
+      Returns @{ VM; Instances } or $null.
+    #>
+    param([string]$InputName)
+    $seedInfo = $null
+    try { $seedInfo = Get-ServerInfo -Server $InputName }
     catch {
-        Write-ErrorDetail -ErrorRecord $_ -Step 'Connect to node to drain' -Server $nodeInput
-        return
-    }
-    $node = $info.ServerName
-    Write-Log -Message "Connected to $node (version $($info.ProductVersion) $($info.UpdateLevel))."
-
-    if ($info.IsHadrEnabled -ne 1) {
-        Write-Log -Level ERROR -Message "Always On is not enabled on $node (IsHadrEnabled=$($info.IsHadrEnabled)). Nothing to drain."
-        return
-    }
-    if ($info.HadrManagerStatus -ne 1) {
-        Write-Log -Level WARN -Message "HadrManagerStatus on $node is $($info.HadrManagerStatus) (1 = started). The AG manager may not be healthy."
-    }
-
-    try { $ags = Get-AGList -Server $node -MajorVersion $info.MajorVersion }
-    catch { Write-ErrorDetail -ErrorRecord $_ -Step 'List AGs on node' -Server $node; return }
-
-    if ($ags.Count -eq 0) { Write-Log -Level WARN -Message "$node is not part of any availability group."; return }
-
-    # ---- Build the plan -----------------------------------------------------
-    $entries = New-Object System.Collections.Generic.List[object]
-    foreach ($ag in $ags) {
-        $e = [pscustomobject]@{
-            AGName           = $ag.AGName
-            ClusterType      = $ag.ClusterType
-            OriginalPrimary  = $ag.PrimaryReplica
-            PlannedTarget    = $null
-            FailedOverTo     = $null
-            Result           = 'PENDING'
-            Reason           = $null
-            FailoverTime     = $null
-            PostFailoverSync = $null
-            FailbackFrom     = $null
-            FailbackResult   = $null
-            FailbackReason   = $null
-            FailbackTime     = $null
-        }
-        if ($ag.LocalRole -ne 'PRIMARY') {
-            $e.Result = 'NOT_PRIMARY_HERE'
-            $e.Reason = "$node is $($ag.LocalRole) for this AG"
-        }
-        elseif ($ag.IsDistributed -eq $true) {
-            $e.Result = 'SKIPPED'
-            $e.Reason = 'Distributed AG - needs its own failover procedure (not in baseline)'
-        }
-        elseif ($ag.ClusterType -ne 'WSFC') {
-            $e.Result = 'SKIPPED'
-            $e.Reason = "CLUSTER_TYPE = $($ag.ClusterType) - planned FAILOVER is not supported; needs demote + forced failover (not in baseline)"
+        $vmPart = $InputName.Split('\')[0]
+        if ($vmPart -eq $env:COMPUTERNAME -and @(Get-LocalSqlInstances).Count -gt 0) {
+            Write-Log -Level DETAIL -Message "No instance answered as '$InputName'; using the SQL services running on this VM." -NoConsole
         }
         else {
-            try {
-                $pick = Find-FailoverTarget -PrimaryServer $node -AGName $ag.AGName -ExcludeReplica $node
-                if ($pick.Target) { $e.PlannedTarget = $pick.Target }
-                else { $e.Result = 'SKIPPED'; $e.Reason = $pick.Reason }
-            }
-            catch {
-                Write-ErrorDetail -ErrorRecord $_ -Step 'Evaluate failover target' -Server $node -AGName $ag.AGName
-                Write-AGSnapshot -Server $node -AGName $ag.AGName
-                $e.Result = 'FAILED'; $e.Reason = "Target evaluation error: $($_.Exception.Message)"
-            }
+            Write-ErrorDetail -ErrorRecord $_ -Step "Connect to $InputName" -Server $InputName
+            if (-not $InputName.Contains('\')) { Write-Log -Level WARN -Message "If $InputName has only named instances, enter one as $InputName\<instance>; the other instances on the VM are found automatically." }
+            return $null
         }
-        $entries.Add($e)
     }
+    $vm = if ($seedInfo) { $seedInfo.PhysicalName } else { $env:COMPUTERNAME }
+    $seeds = @()
+    if ($seedInfo) { $seeds += $seedInfo.ServerName }
+    if ($vm -eq $env:COMPUTERNAME) { $seeds += @(Get-LocalSqlInstances) }
+    Write-Log -Message "Finding every SQL instance on $vm (following the AG replicas)..."
+    $topo  = Get-RollingTopology -Seeds $seeds -Probes @($vm)
+    $insts = @($topo.Instances | Where-Object { $_.VM -eq $vm } | ForEach-Object { $_.Instance } | Sort-Object -Unique)
+    if ($insts.Count -eq 0) { Write-Log -Level ERROR -Message "No SQL instance found on $vm."; return $null }
+    return [pscustomobject]@{ VM = $vm; Instances = $insts }
+}
 
-    Write-Log -Level STEP -Message "Plan for $node :`n$(Format-Rows ($entries | Select-Object AGName, ClusterType, OriginalPrimary, PlannedTarget, Result, Reason))"
+function Invoke-DrainNode {
+    Write-Log -Level STEP -Message '===== OPTION 1: Drain a VM before activity ====='
+    $nodeInput = (Read-Host 'Enter the VM to drain (e.g. SQLVM01), or one of its instances (SQLVM01\INST)').Trim()
+    if (-not $nodeInput) { Write-Log -Level WARN -Message 'No server entered.'; return }
+
+    $found = Get-VMInstances -InputName $nodeInput
+    if (-not $found) { return }
+    $node     = $found.VM
+    $instOnVM = @($found.Instances)
+    Write-Log -Message "VM $node has $($instOnVM.Count) SQL instance(s): $($instOnVM -join ', '). No AG will be failed over to any of them."
+
+    # ---- Build the plan (one entry per AG; the primary instance wins) -------------
+    $plan     = [ordered]@{}
+    $versions = @()
+    foreach ($inst in $instOnVM) {
+        try {
+            $info = Get-ServerInfo -Server $inst
+            $versions += "$inst = $($info.ProductVersion) $($info.UpdateLevel)"
+            if ($info.IsHadrEnabled -ne 1) { Write-Log -Level WARN -Message "Always On is not enabled on $inst - nothing to drain there."; continue }
+            if ($info.HadrManagerStatus -ne 1) { Write-Log -Level WARN -Message "HadrManagerStatus on $inst is $($info.HadrManagerStatus) (1 = started). The AG manager may not be healthy." }
+            $ags = @(Get-AGList -Server $inst -MajorVersion $info.MajorVersion)
+        }
+        catch {
+            Write-ErrorDetail -ErrorRecord $_ -Step 'List AGs on instance' -Server $inst
+            $versions += "$inst = unreachable"
+            $plan["(instance $inst)"] = [pscustomobject]@{
+                AGName = "(AGs on $inst)"; Instance = $inst; ClusterType = $null; OriginalPrimary = $null; PlannedTarget = $null; CommitRisk = $null
+                FailedOverTo = $null; Result = 'FAILED'; Reason = "Instance unreachable - its AGs could not be checked: $($_.Exception.Message)"
+                FailoverTime = $null; PostFailoverSync = $null; FailbackFrom = $null; FailbackResult = $null; FailbackReason = $null; FailbackTime = $null
+            }
+            continue
+        }
+
+        foreach ($ag in $ags) {
+            if ($plan.Contains($ag.AGName) -and $ag.LocalRole -ne 'PRIMARY') { continue }
+            $e = [pscustomobject]@{
+                AGName           = $ag.AGName
+                Instance         = $inst
+                ClusterType      = $ag.ClusterType
+                OriginalPrimary  = $ag.PrimaryReplica
+                PlannedTarget    = $null
+                CommitRisk       = $null
+                FailedOverTo     = $null
+                Result           = 'PENDING'
+                Reason           = $null
+                FailoverTime     = $null
+                PostFailoverSync = $null
+                FailbackFrom     = $null
+                FailbackResult   = $null
+                FailbackReason   = $null
+                FailbackTime     = $null
+            }
+            if ($ag.LocalRole -ne 'PRIMARY') {
+                $e.Result = 'NOT_PRIMARY_HERE'
+                $e.Reason = "$inst is $($ag.LocalRole) for this AG"
+            }
+            elseif ($ag.IsDistributed -eq $true) {
+                $e.Result = 'SKIPPED'
+                $e.Reason = 'Distributed AG - needs its own failover procedure (not in baseline)'
+            }
+            elseif ($ag.ClusterType -ne 'WSFC') {
+                $e.Result = 'SKIPPED'
+                $e.Reason = "CLUSTER_TYPE = $($ag.ClusterType) - planned FAILOVER is not supported; needs demote + forced failover (not in baseline)"
+            }
+            else {
+                try {
+                    $pick = Find-FailoverTarget -PrimaryServer $inst -AGName $ag.AGName -ExcludeReplica $instOnVM
+                    if ($pick.Target) {
+                        $e.PlannedTarget = $pick.Target
+                        $e.CommitRisk    = Get-CommitRisk -PrimaryServer $inst -AGName $ag.AGName -Target $pick.Target -Drained $instOnVM
+                    }
+                    else { $e.Result = 'SKIPPED'; $e.Reason = $pick.Reason }
+                }
+                catch {
+                    Write-ErrorDetail -ErrorRecord $_ -Step 'Evaluate failover target' -Server $inst -AGName $ag.AGName
+                    Write-AGSnapshot -Server $inst -AGName $ag.AGName
+                    $e.Result = 'FAILED'; $e.Reason = "Target evaluation error: $($_.Exception.Message)"
+                }
+            }
+            $plan[$ag.AGName] = $e
+        }
+    }
+    $entries = @($plan.Values)
+    if ($entries.Count -eq 0) { Write-Log -Level WARN -Message "$node is not part of any availability group."; return }
+
+    Write-Log -Level STEP -Message "Plan for $node :`n$(Format-Rows ($entries | Select-Object AGName, Instance, ClusterType, OriginalPrimary, PlannedTarget, @{n='WriteRisk';e={ if ($_.CommitRisk) { 'YES - see below' } else { '' } }}, Result, Reason))"
+    foreach ($e in @($entries | Where-Object { $_.CommitRisk })) { Write-Log -Level WARN -Message "[$($e.AGName)] $($e.CommitRisk)" }
 
     $toMove = @($entries | Where-Object { $_.PlannedTarget -and $_.Result -eq 'PENDING' })
     if ($toMove.Count -eq 0) { Write-Log -Level WARN -Message "No AG will be failed over from $node." }
@@ -795,7 +1020,8 @@ function Invoke-DrainNode {
         ToolVersion      = $Config.ToolVersion
         Mode             = $mode
         Node             = $node
-        NodeVersion      = "$($info.ProductVersion) $($info.UpdateLevel)"
+        Instances        = $instOnVM
+        NodeVersion      = ($versions -join '; ')
         Status           = 'DRAIN_STARTED'
         CreatedAt        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         CreatedBy        = $script:RunAs
@@ -805,7 +1031,7 @@ function Invoke-DrainNode {
         LogFile          = $script:LogFile
         StateFile        = $statePath
         SummaryFile      = $summary
-        AGs              = $entries.ToArray()
+        AGs              = $entries
     }
 
     if ($toMove.Count -gt 0) {
@@ -823,7 +1049,7 @@ function Invoke-DrainNode {
         $pick = $null
         try {
             # Re-check right before acting; state can change between plan and execution.
-            $pick = Find-FailoverTarget -PrimaryServer $node -AGName $e.AGName -ExcludeReplica $node
+            $pick = Find-FailoverTarget -PrimaryServer $e.Instance -AGName $e.AGName -ExcludeReplica $instOnVM
             if (-not $pick.Target) {
                 $e.Result = 'SKIPPED'; $e.Reason = "At execution time: $($pick.Reason)"
                 Write-Log -Level WARN -Message "[$($e.AGName)] skipped: $($e.Reason)"
@@ -832,7 +1058,12 @@ function Invoke-DrainNode {
             if ($pick.Target -ne $e.PlannedTarget) {
                 Write-Log -Level WARN -Message "[$($e.AGName)] best target changed from $($e.PlannedTarget) to $($pick.Target)."
             }
-            $e.Result       = Invoke-AGFailover -AGName $e.AGName -Target $pick.Target
+            $risk = Get-CommitRisk -PrimaryServer $e.Instance -AGName $e.AGName -Target $pick.Target -Drained $instOnVM
+            if ($risk -and -not (Confirm-CommitRisk -AGName $e.AGName -Risk $risk)) {
+                $e.Result = 'SKIPPED'; $e.Reason = "Skipped by operator: $risk"
+                continue
+            }
+            $e.Result       = Invoke-AGFailover -AGName $e.AGName -Target $pick.Target -FromPrimary $e.Instance
             $e.FailedOverTo = $pick.Target
             $e.FailoverTime = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
             if ($e.Result -eq 'FAILED_OVER') {
@@ -841,17 +1072,18 @@ function Invoke-DrainNode {
             else { $e.PostFailoverSync = 'n/a (dry run)' }
         }
         catch {
-            $e.Result = 'FAILED'
+            $e.Result = Get-FailResult -ErrorRecord $_
             $e.Reason = $_.Exception.Message
-            Write-ErrorDetail -ErrorRecord $_ -Step 'Fail over AG (drain)' -Server $(if ($pick) { $pick.Target } else { $node }) -AGName $e.AGName
-            Write-AGSnapshot -Server $node -AGName $e.AGName
+            if ($e.Result -eq 'UNKNOWN' -and $pick) { $e.FailedOverTo = $pick.Target }
+            Write-ErrorDetail -ErrorRecord $_ -Step 'Fail over AG (drain)' -Server $(if ($pick) { $pick.Target } else { $e.Instance }) -AGName $e.AGName
+            Write-AGSnapshot -Server $e.Instance -AGName $e.AGName
         }
         finally {
             try { Save-State -State $state -Path $statePath } catch { Write-Log -Level WARN -Message "Could not update state file: $($_.Exception.Message)" }
         }
     }
 
-    $failed = @($entries | Where-Object { $_.Result -in @('FAILED', 'SKIPPED') })
+    $failed = @($entries | Where-Object { $_.Result -in @('FAILED', 'SKIPPED', 'UNKNOWN') })
     $state.Status           = if ($failed.Count -eq 0) { 'DRAINED' } else { 'PARTIALLY_DRAINED' }
     $state.DrainCompletedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     try {
@@ -860,9 +1092,11 @@ function Invoke-DrainNode {
     }
     catch { Write-ErrorDetail -ErrorRecord $_ -Step 'Write state/summary file' -Server $node }
 
-    Write-Log -Level STEP -Message "Result for $node :`n$(Format-Rows ($entries | Select-Object AGName, OriginalPrimary, FailedOverTo, Result, Reason))"
+    Write-Log -Level STEP -Message "Result for $node :`n$(Format-Rows ($entries | Select-Object AGName, Instance, OriginalPrimary, FailedOverTo, Result, Reason))"
     Write-Log -Level SUCCESS -Message "Summary written to $summary"
-    if ($failed.Count -gt 0) { Write-Log -Level WARN -Message "$($failed.Count) AG(s) are still on $node or could not be evaluated. Do NOT reboot until they are handled." }
+    $unknown = @($entries | Where-Object { $_.Result -eq 'UNKNOWN' })
+    if ($unknown.Count -gt 0) { Write-Log -Level ERROR -Message "OUTCOME UNKNOWN for: $(($unknown | ForEach-Object { $_.AGName }) -join ', '). Check which replica is primary (option 3) before anything else." }
+    if ($failed.Count -gt 0) { Write-Log -Level WARN -Message "$($failed.Count) AG(s) are still on $node, in an unknown state, or could not be evaluated. Do NOT reboot until they are handled." }
 }
 
 # ----------------------------------------------------------------------------
@@ -872,11 +1106,11 @@ function Invoke-Failback {
     Write-Log -Level STEP -Message '===== OPTION 2: Fail back to original primaries ====='
     $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
 
-    $files = @(Get-ChildItem -Path $script:StateDir -Filter 'AGState_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $files = @(Get-ChildItem -Path $script:StateDir -Filter 'AGState_*.json' -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq '.json' } | Sort-Object LastWriteTime -Descending)
     $choices = New-Object System.Collections.Generic.List[object]
     foreach ($f in $files) {
         try {
-            $s = Get-Content -Path $f.FullName -Raw | ConvertFrom-Json
+            $s = Read-StateFile -Path $f.FullName
             if ($s.Status -eq 'RESTORED') { continue }
             $choices.Add([pscustomobject]@{ File = $f.FullName; State = $s })
         }
@@ -887,7 +1121,7 @@ function Invoke-Failback {
     Write-Host ''
     for ($i = 0; $i -lt $choices.Count; $i++) {
         $s = $choices[$i].State
-        $n = @($s.AGs | Where-Object { $_.Result -in @('FAILED_OVER', 'DRYRUN') }).Count
+        $n = @($s.AGs | Where-Object { $_.Result -in @('FAILED_OVER', 'DRYRUN', 'UNKNOWN') }).Count
         Write-Host ('  {0}. Node {1} | drained {2} | {3} | {4} AG(s) moved | status {5}' -f ($i + 1), $s.Node, $s.CreatedAt, $s.Mode, $n, $s.Status)
     }
     $sel = Read-Host "Select the activity to fail back (1-$($choices.Count))"
@@ -898,7 +1132,7 @@ function Invoke-Failback {
     $state     = $choices[$idx - 1].State
     Write-Log -Message "Using state file $statePath (node $($state.Node), drained $($state.CreatedAt))."
 
-    $eligible = @('FAILED_OVER')
+    $eligible = @('FAILED_OVER', 'UNKNOWN')   # UNKNOWN: may have moved; the current primary is checked below
     if ($script:DryRun) { $eligible += 'DRYRUN' }
     $work = @($state.AGs | Where-Object { $_.Result -in $eligible })
     if ($work.Count -eq 0) { Write-Log -Level WARN -Message 'No AGs in this state file were failed over, nothing to fail back.'; return }
@@ -1009,7 +1243,7 @@ function Invoke-Failback {
                         Write-Log -Level ERROR -Message "[$($ag.AGName)] not failing back: $($pick.Reason)"
                         break
                     }
-                    $ag.FailbackResult = Invoke-AGFailover -AGName $ag.AGName -Target $ag.OriginalPrimary
+                    $ag.FailbackResult = Invoke-AGFailover -AGName $ag.AGName -Target $ag.OriginalPrimary -FromPrimary $p.Current
                     if ($ag.FailbackResult -eq 'FAILED_OVER') { $ag.FailbackResult = 'FAILED_BACK' }
                     $ag.FailbackTime   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
                     $ag.FailbackReason = Wait-AGResync -PrimaryServer $ag.OriginalPrimary -AGName $ag.AGName
@@ -1017,7 +1251,7 @@ function Invoke-Failback {
             }
         }
         catch {
-            $ag.FailbackResult = 'FAILED'
+            $ag.FailbackResult = Get-FailResult -ErrorRecord $_
             $ag.FailbackReason = $_.Exception.Message
             Write-ErrorDetail -ErrorRecord $_ -Step 'Fail back AG' -Server $ag.OriginalPrimary -AGName $ag.AGName
             Write-AGSnapshot -Server $(if ($p.Current) { $p.Current } else { $ag.OriginalPrimary }) -AGName $ag.AGName
@@ -1089,6 +1323,7 @@ function Invoke-HealthCheck {
             }
             foreach ($d in $dbs) {
                 $rep = $reps | Where-Object { $_.ReplicaServer -eq $d.ReplicaServer } | Select-Object -First 1
+                if ($d.IsJoined -ne $true) { $issues.Add("$($d.ReplicaServer)/$($d.DatabaseName) is NOT JOINED to the AG on that replica - it would be unavailable there after a failover"); continue }
                 if ($d.IsSuspended) { $issues.Add("$($d.ReplicaServer)/$($d.DatabaseName) data movement SUSPENDED ($($d.SuspendReason)) - resume with ALTER DATABASE [$($d.DatabaseName)] SET HADR RESUME on that replica after fixing the cause") }
                 elseif ($rep -and $rep.Role -eq 'SECONDARY' -and $rep.AvailabilityMode -eq 'SYNCHRONOUS_COMMIT' -and $d.SyncState -ne 'SYNCHRONIZED') { $issues.Add("$($d.ReplicaServer)/$($d.DatabaseName) is $($d.SyncState) on a synchronous replica") }
                 if (([double]$d.LogSendQueueKB + [double]$d.RedoQueueKB) -gt $Config.QueueWarnKB) { $issues.Add("$($d.ReplicaServer)/$($d.DatabaseName) has $([math]::Round(([double]$d.LogSendQueueKB + [double]$d.RedoQueueKB)/1024,1)) MB queued") }
@@ -1285,13 +1520,13 @@ function Invoke-ReturnAG {
             Write-Log -Level ERROR -Message "[$AGName] not returned to $OriginalPrimary : $($pick.Reason)"
             return $res
         }
-        $r = Invoke-AGFailover -AGName $AGName -Target $OriginalPrimary
+        $r = Invoke-AGFailover -AGName $AGName -Target $OriginalPrimary -FromPrimary $CurrentPrimary
         $res.Result = if ($r -eq 'FAILED_OVER') { 'RETURNED' } else { $r }
         $res.Time   = ConvertTo-Stamp (Get-Date)
         if ($r -eq 'FAILED_OVER') { $res.Note = Wait-AGResync -PrimaryServer $OriginalPrimary -AGName $AGName }
     }
     catch {
-        $res.Result = 'FAILED'; $res.Note = $_.Exception.Message
+        $res.Result = Get-FailResult -ErrorRecord $_; $res.Note = $_.Exception.Message
         Write-ErrorDetail -ErrorRecord $_ -Step 'Return AG to original primary' -Server $OriginalPrimary -AGName $AGName
         Write-AGSnapshot -Server $(if ($CurrentPrimary) { $CurrentPrimary } else { $OriginalPrimary }) -AGName $AGName
     }
@@ -1408,14 +1643,21 @@ function Invoke-RollingDrain {
                     Write-Log -Level ERROR -Message "[$($ag.AGName)] cannot be moved off $($VM.VM): $($pick.Reason)"
                 }
                 else {
+                    $risk = Get-CommitRisk -PrimaryServer $inst -AGName $ag.AGName -Target $pick.Target -Drained $InstOnVM
+                    if ($risk -and -not (Confirm-CommitRisk -AGName $ag.AGName -Risk $risk)) {
+                        $move.Result = 'SKIPPED'; $move.Note = 'Skipped by operator: commit-requirement risk'; $complete = $false
+                        Add-Item -Object $VM -Property 'Moves' -Item $move
+                        Save-Rolling -Run $Run
+                        continue
+                    }
                     $move.To     = $pick.Target
-                    $move.Result = Invoke-AGFailover -AGName $ag.AGName -Target $pick.Target
+                    $move.Result = Invoke-AGFailover -AGName $ag.AGName -Target $pick.Target -FromPrimary $inst
                     $move.Time   = ConvertTo-Stamp (Get-Date)
                     if ($move.Result -eq 'FAILED_OVER') { $move.Note = Wait-AGResync -PrimaryServer $pick.Target -AGName $ag.AGName }
                 }
             }
             catch {
-                $move.Result = 'FAILED'; $move.Note = $_.Exception.Message; $complete = $false
+                $move.Result = Get-FailResult -ErrorRecord $_; $move.Note = $_.Exception.Message; $complete = $false
                 Write-ErrorDetail -ErrorRecord $_ -Step "Drain $($VM.VM)" -Server $(if ($pick -and $pick.Target) { $pick.Target } else { $inst }) -AGName $ag.AGName
                 Write-AGSnapshot -Server $inst -AGName $ag.AGName
             }
@@ -2003,9 +2245,9 @@ function Invoke-RollingReboot {
 
     # ---- resume an unfinished run? ---------------------------------------------------
     $pending = $null
-    foreach ($f in @(Get-ChildItem -Path $script:StateDir -Filter 'Rolling_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)) {
+    foreach ($f in @(Get-ChildItem -Path $script:StateDir -Filter 'Rolling_*.json' -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq '.json' } | Sort-Object LastWriteTime -Descending)) {
         try {
-            $s = Get-Content -Path $f.FullName -Raw | ConvertFrom-Json
+            $s = Read-StateFile -Path $f.FullName
             if ($s.Status -in @('IN_PROGRESS', 'AWAITING_LOCAL_REBOOT')) { $pending = $s; break }
         }
         catch { Write-Log -Level WARN -Message "Unreadable rolling state file skipped: $($f.Name)" }
@@ -2105,7 +2347,7 @@ while ($true) {
     Write-Host "  SQL Always On AG Failover Tool v$($Config.ToolVersion)   Run as: $($script:RunAs)" -ForegroundColor Cyan
     if ($script:DryRun) { Write-Host '  *** DRY RUN MODE - no changes will be made ***' -ForegroundColor Yellow }
     Write-Host '=============================================================' -ForegroundColor Cyan
-    Write-Host '  1. Before activity  - record primaries and drain node (fail over AGs)'
+    Write-Host '  1. Before activity  - record primaries and drain a VM (fail over its AGs)'
     Write-Host '  2. After activity   - fail AGs back to original primaries'
     Write-Host '  3. AG health check  (read-only)'
     Write-Host "  4. Toggle dry run   (currently: $(if($script:DryRun){'ON'}else{'OFF'}))"
