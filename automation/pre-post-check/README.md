@@ -2,6 +2,11 @@
 
 > **Files:** `Run-PrePostCheck.bat` (double-click), `Invoke-PrePostCheck.ps1`, `HC_Snapshot.sql`, and your own `settings.psd1` (recipients, mail profile, ...; start from `settings.example.psd1`). Keep them together in a folder on the VM, for example `C:\DBA\PrePostCheck`. Always copy `Invoke-PrePostCheck.ps1` and `HC_Snapshot.sql` together: both carry a version number, shown in the report and email footer, and the run warns if they differ.
 
+More documents in [`docs/`](docs/):
+
+- [Leadership overview](docs/Leadership-Overview.md): what the tool does and why, what leadership gets, controls, benefits and next steps.
+- [SOP and technical guide](docs/SOP-Technical-Guide.md): the team's standard procedure, KT and how-to, with prompts, results, troubleshooting and a code map.
+
 Double-click `Run-PrePostCheck.bat` and choose:
 
 | # | Choice | What it does |
