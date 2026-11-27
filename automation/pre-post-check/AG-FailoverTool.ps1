@@ -58,6 +58,14 @@
         the role changed anyway: COMPLETED, NOT STARTED, or OUTCOME UNKNOWN (stop).
       - State files are written atomically (<file>.tmp -> <file>, previous copy kept
         as <file>.bak, which is used automatically if the file is damaged).
+      - Pre-flight before any change: every replica reachable with VIEW SERVER STATE
+        and ALTER ANY AVAILABILITY GROUP, no other AGFailoverTool session active on
+        them, and (draining) every other cluster node and the witness UP with quorum
+        surviving the loss of the VM.
+      - After each failover, every AG listener is tested (MultiSubnetFailover, no
+        pooling) until it reaches the new primary.
+      - While a VM is drained its AUTOMATIC replicas are set to MANUAL failover, so the
+        cluster cannot move an AG onto it mid-maintenance; failback restores them.
 
     Baseline scope (deliberately NOT done automatically)
       - No forced failover / data-loss failover.
@@ -91,7 +99,7 @@ $ErrorActionPreference = 'Stop'
 # Configuration
 # ----------------------------------------------------------------------------
 $Config = @{
-    ToolVersion             = '1.2'
+    ToolVersion             = '1.3'
     ConnectTimeoutSec       = 15     # SQL connection timeout
     QueryTimeoutSec         = 120    # normal query timeout
     FailoverTimeoutSec      = 600    # ALTER AVAILABILITY GROUP ... FAILOVER timeout
@@ -100,6 +108,8 @@ $Config = @{
     RoleVerifyWaitSec       = 60     # max wait for the new role to show PRIMARY
     PollIntervalSec         = 5
     QueueWarnKB             = 102400 # warn when log send + redo queue exceeds this (100 MB)
+    ListenerWaitSec         = 90     # max wait for an AG listener to reach the new primary (DNS / Azure LB probe / DNN)
+    ConcurrencyWindowMin    = 15     # another AGFailoverTool session active within this many minutes blocks a run
     RebootDownTimeoutSec    = 600    # option 5: time for a VM to go down after the reboot command
     RebootUpTimeoutSec      = 3600   # option 5: time for SQL to come back after the reboot (patches can be slow)
     RebootSyncWaitSec       = 1800   # option 5: time for the rebooted VM's replicas to re-sync
@@ -282,11 +292,13 @@ function Invoke-Sql {
         [Parameter(Mandatory)][string]$Query,
         [hashtable]$Parameters = @{},
         [int]$TimeoutSec = $Config.QueryTimeoutSec,
-        [switch]$NonQuery
+        [switch]$NonQuery,
+        [string]$ConnectionOptions   # extra connection-string settings, e.g. 'MultiSubnetFailover=True;Pooling=False'
     )
     $script:LastSql = @{ Server = $Server; Query = $Query; Parameters = $Parameters }
     $cs = "Server=$Server;Database=master;Integrated Security=SSPI;Application Name=AGFailoverTool;" +
           "Connect Timeout=$($Config.ConnectTimeoutSec);TrustServerCertificate=True"
+    if ($ConnectionOptions) { $cs += ";$ConnectionOptions" }
     $conn = $null
     try {
         $conn = New-Object System.Data.SqlClient.SqlConnection $cs
@@ -721,6 +733,272 @@ function Confirm-CommitRisk {
     return ($a -eq 'C')
 }
 
+function Set-Prop {
+    # Sets a property, adding it first when the object does not have it (e.g. state files from older versions).
+    param($Object, [string]$Name, $Value)
+    if ($Object.PSObject.Properties[$Name]) { $Object.$Name = $Value }
+    else { $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
+}
+
+# ----------------------------------------------------------------------------
+# Pre-flight checks (run before any change)
+# ----------------------------------------------------------------------------
+function Test-Preflight {
+    # Every server reachable as the current account, with the permissions the tool needs.
+    param([string[]]$Servers)
+    $q = @"
+SELECT  CAST(IS_SRVROLEMEMBER('sysadmin') AS int)                                AS IsSysadmin,
+        CAST(HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE') AS int)            AS ViewServerState,
+        CAST(HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY AVAILABILITY GROUP') AS int) AS AlterAnyAG;
+"@
+    $out = @()
+    foreach ($s in $Servers) {
+        try {
+            $r = @(Invoke-Sql -Server $s -Query $q)[0]
+            if ($r.IsSysadmin -eq 1) { continue }
+            if ($r.ViewServerState -ne 1) { $out += "$s : $($script:RunAs) lacks VIEW SERVER STATE (needed to read the AG state)." }
+            if ($r.AlterAnyAG -ne 1) { $out += "$s : $($script:RunAs) lacks ALTER ANY AVAILABILITY GROUP (needed for FAILOVER and MODIFY REPLICA). This is fine only if CONTROL or ALTER is granted on each AG." }
+        }
+        catch { $out += "$s : not reachable as $($script:RunAs) - $($_.Exception.Message.Trim())" }
+    }
+    return $out
+}
+
+function Get-OtherToolSessions {
+    <#
+      Finds AGFailoverTool sessions from OTHER processes that were active in the last
+      ConcurrencyWindowMin minutes (or are running a command right now), so two people
+      cannot fail over / fail back the same AGs at the same time.
+    #>
+    param([string[]]$Servers)
+    $q = @"
+SELECT  s.login_name AS LoginName, s.host_name AS HostName, s.host_process_id AS HostPid,
+        MAX(s.last_request_end_time) AS LastActivity, MAX(r.command) AS Command
+FROM    sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id
+WHERE   s.program_name = N'AGFailoverTool'
+  AND   s.session_id <> @@SPID
+  AND   NOT (s.host_name = @MyHost AND s.host_process_id = @MyPid)
+  AND  (r.session_id IS NOT NULL OR s.last_request_end_time > DATEADD(MINUTE, -@Minutes, GETDATE()))
+GROUP BY s.login_name, s.host_name, s.host_process_id;
+"@
+    $out = @()
+    foreach ($s in $Servers) {
+        try {
+            foreach ($x in @(Invoke-Sql -Server $s -Query $q -Parameters @{ MyHost = $env:COMPUTERNAME; MyPid = $PID; Minutes = $Config.ConcurrencyWindowMin })) {
+                $out += "$s : another AGFailoverTool is active - $($x.LoginName) on $($x.HostName) (process $($x.HostPid)), last activity $($x.LastActivity)$(if ($x.Command) { ", running $($x.Command) now" }). Agree with that person before continuing."
+            }
+        }
+        catch { }   # reachability is reported by Test-Preflight
+    }
+    return $out
+}
+
+function Get-ClusterIssues {
+    # Every other cluster node and the witness UP, and quorum survives losing -VMName.
+    param([string]$VMName, [string[]]$QueryServers)
+    $issues = @()
+    $members = @()
+    foreach ($srv in $QueryServers) {
+        try { $members = @(Get-ClusterMembers -Server $srv); if ($members.Count -gt 0) { break } }
+        catch { Write-Log -Level DETAIL -Message "Cluster membership not readable from $srv : $($_.Exception.Message)" -NoConsole }
+    }
+    if ($members.Count -eq 0) { return @('Could not read cluster membership / quorum from any instance.') }
+
+    $nodes = @($members | Where-Object { $_.MemberType -eq 'CLUSTER_NODE' })
+    $down  = @($nodes | Where-Object { $_.MemberName -ne $VMName -and $_.MemberState -ne 'UP' })
+    if ($down.Count -gt 0) { $issues += "Other cluster node(s) not UP: $(($down | ForEach-Object { "$($_.MemberName)=$($_.MemberState)" }) -join ', '). Taking $VMName down now could take the cluster down." }
+    $witnessDown = @($members | Where-Object { $_.MemberType -ne 'CLUSTER_NODE' -and $_.MemberState -ne 'UP' })
+    if ($witnessDown.Count -gt 0) { $issues += "Quorum witness not UP: $(($witnessDown | ForEach-Object { "$($_.MemberName) ($($_.MemberType))=$($_.MemberState)" }) -join ', ')." }
+
+    $me = @($nodes | Where-Object { $_.MemberName -eq $VMName })
+    if ($me.Count -gt 0) {
+        $total = [double](($members | Measure-Object -Property Votes -Sum).Sum)
+        $up    = [double](($members | Where-Object { $_.MemberState -eq 'UP' } | Measure-Object -Property Votes -Sum).Sum)
+        $mine  = [double](($me | Measure-Object -Property Votes -Sum).Sum)
+        if ($total -gt 0 -and ($up - $mine) -le ($total / 2)) {
+            $issues += "Quorum risk: $($up - $mine) of $total votes would remain while $VMName is down (more than half needed). Check node votes and the cloud witness."
+        }
+    }
+    else { Write-Log -Level WARN -Message "$VMName is not listed as a node of the cluster - quorum impact not checked." }
+    return $issues
+}
+
+function Invoke-PreChecks {
+    <#
+      Runs before any change. Checks every server is reachable with the needed permissions,
+      that no other AGFailoverTool session is working on them, and (with -VMName) that the
+      cluster can lose that VM. Returns $true to go ahead; asks before overriding problems.
+    #>
+    param([string[]]$Servers, [string]$VMName, [string]$Activity)
+    $list = @($Servers | Where-Object { $_ } | Select-Object -Unique)
+    Write-Log -Level STEP -Message "Pre-flight checks before $Activity on: $($list -join ', ')"
+    $problems = @()
+    $problems += @(Test-Preflight -Servers $list)
+    $problems += @(Get-OtherToolSessions -Servers $list)
+    if ($VMName) {
+        $order = @(@($list | Where-Object { $_.Split('\')[0] -ne $VMName }) + @($list | Where-Object { $_.Split('\')[0] -eq $VMName }))
+        $problems += @(Get-ClusterIssues -VMName $VMName -QueryServers $order)
+    }
+    $problems = @($problems | Where-Object { $_ })
+    if ($problems.Count -eq 0) { Write-Log -Level SUCCESS -Message 'Pre-flight checks passed.'; return $true }
+
+    Write-Log -Level ERROR -Message "Pre-flight checks before $Activity found problems:`n  - $($problems -join "`n  - ")"
+    if ($script:DryRun) { Write-Log -Level WARN -Message '[DRY RUN] A live run would stop here and ask whether to override.'; return $true }
+    $a = Read-Choice '[O]verride and continue anyway / [C]ancel (nothing has been changed)' @('O', 'C')
+    if ($a -eq 'O') { Write-Log -Level WARN -Message "Operator overrode the pre-flight checks before $Activity."; return $true }
+    return $false
+}
+
+# ----------------------------------------------------------------------------
+# Listener check after failover
+# ----------------------------------------------------------------------------
+function Get-AGListeners {
+    param([string]$Server, [string]$AGName)
+    $q = @"
+SELECT l.dns_name AS DnsName, l.port AS Port
+FROM   sys.availability_group_listeners l
+JOIN   sys.availability_groups ag ON ag.group_id = l.group_id
+WHERE  ag.name = @AGName;
+"@
+    return @(Invoke-Sql -Server $Server -Query $q -Parameters @{ AGName = $AGName })
+}
+
+function Test-AGListener {
+    <#
+      Connects through every listener of the AG (MultiSubnetFailover, no connection
+      pooling, so an old pooled connection cannot fake a pass) and checks it reaches
+      -ExpectedPrimary. Waits up to ListenerWaitSec for DNS / the Azure load balancer
+      probe / the DNN to follow. Returns a one-line result for the summary.
+    #>
+    param([string]$AGName, [string]$ExpectedPrimary)
+    if ($script:DryRun) { return 'n/a (dry run)' }
+    $savedSql = $script:LastSql
+    try {
+        try { $ls = @(Get-AGListeners -Server $ExpectedPrimary -AGName $AGName) }
+        catch { return "not checked: $($_.Exception.Message.Trim())" }
+        if ($ls.Count -eq 0) { return 'no listener' }
+
+        $parts = foreach ($l in $ls) {
+            $addr = if ($l.Port) { "tcp:$($l.DnsName),$($l.Port)" } else { "tcp:$($l.DnsName)" }
+            $deadline = (Get-Date).AddSeconds($Config.ListenerWaitSec)
+            $ok = $false; $last = $null
+            while ($true) {
+                try {
+                    $name = @(Invoke-Sql -Server $addr -Query 'SELECT @@SERVERNAME AS ServerName;' -TimeoutSec 15 -ConnectionOptions 'MultiSubnetFailover=True;Pooling=False')[0].ServerName
+                    if ($name -eq $ExpectedPrimary) { $ok = $true; break }
+                    $last = "reaches $name"
+                }
+                catch { $last = "connection failed: $($_.Exception.Message.Trim())" }
+                if ((Get-Date) -gt $deadline) { break }
+                Start-Sleep -Seconds 5
+            }
+            if ($ok) {
+                Write-Log -Level SUCCESS -Message "[$AGName] Listener $addr reaches the new primary $ExpectedPrimary."
+                "$($l.DnsName) OK"
+            }
+            else {
+                Write-Log -Level WARN -Message "[$AGName] Listener $addr does NOT reach the new primary $ExpectedPrimary after $($Config.ListenerWaitSec)s ($last). Applications using the listener are affected. On Azure check the internal load balancer health probe and the cluster IP resource ProbePort, or the DNN resource; check DNS for the listener name."
+                "$($l.DnsName) Listener check FAILED ($last)"
+            }
+        }
+        return (@($parts) -join '; ')
+    }
+    finally { $script:LastSql = $savedSql }
+}
+
+# ----------------------------------------------------------------------------
+# Automatic failover control during maintenance
+# ----------------------------------------------------------------------------
+function Set-ReplicasManual {
+    <#
+      For each AG, switches the replicas of -Instances that have AUTOMATIC failover to
+      MANUAL, so the cluster cannot fail an AG over to the VM while it is under maintenance.
+      Runs on each AG's current primary (found through -ProbeServers). A replica that is
+      still primary is left alone. Returns records for Restore-FailoverModes.
+    #>
+    param([string[]]$AGNames, [string[]]$Instances, [string[]]$ProbeServers)
+    $changed = @()
+    foreach ($ag in @($AGNames | Where-Object { $_ } | Select-Object -Unique)) {
+        $primary = $null
+        foreach ($srv in $ProbeServers) {
+            try { $primary = Get-AGPrimary -Server $srv -AGName $ag; if ($primary) { break } } catch { }
+        }
+        if (-not $primary) { Write-Log -Level WARN -Message "[$ag] current primary not found - failover mode not changed."; continue }
+        try {
+            foreach ($r in @(Get-AGReplicas -Server $primary -AGName $ag | Where-Object { $Instances -contains $_.ReplicaServer -and $_.FailoverMode -eq 'AUTOMATIC' })) {
+                if ($r.ReplicaServer -eq $primary) {
+                    Write-Log -Level WARN -Message "[$ag] $($r.ReplicaServer) is still primary - its failover mode is left AUTOMATIC."
+                    continue
+                }
+                $sql = "ALTER AVAILABILITY GROUP $(Get-QuotedName $ag) MODIFY REPLICA ON N'$($r.ReplicaServer -replace "'", "''")' WITH (FAILOVER_MODE = MANUAL);"
+                if ($script:DryRun) { Write-Log -Level WARN -Message "[DRY RUN] Would run on $primary : $sql" }
+                else {
+                    Write-Log -Level STEP -Message "[$ag] Running on $primary : $sql"
+                    Invoke-Sql -Server $primary -Query $sql -NonQuery
+                }
+                $changed += [pscustomobject]@{
+                    AGName = $ag; Replica = $r.ReplicaServer; OriginalMode = 'AUTOMATIC'
+                    ChangedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); DryRun = [bool]$script:DryRun
+                    Restored = $false; RestoreNote = $null
+                }
+            }
+        }
+        catch { Write-ErrorDetail -ErrorRecord $_ -Step 'Set failover mode to MANUAL' -Server $primary -AGName $ag }
+    }
+    return $changed
+}
+
+function Restore-FailoverModes {
+    # Sets back AUTOMATIC failover for the replicas Set-ReplicasManual changed. Returns the number of failures.
+    param($Records, [string[]]$ProbeServers)
+    $failures = 0
+    foreach ($rec in @($Records | Where-Object { $_ -and -not $_.Restored })) {
+        if ($rec.DryRun -and -not $script:DryRun) { $rec.Restored = $true; $rec.RestoreNote = 'dry-run record, nothing was changed'; continue }
+        $sql = "ALTER AVAILABILITY GROUP $(Get-QuotedName $rec.AGName) MODIFY REPLICA ON N'$($rec.Replica -replace "'", "''")' WITH (FAILOVER_MODE = AUTOMATIC);"
+        $primary = $null
+        foreach ($srv in @(@($rec.Replica) + @($ProbeServers))) {
+            try { $primary = Get-AGPrimary -Server $srv -AGName $rec.AGName; if ($primary) { break } } catch { }
+        }
+        if (-not $primary) {
+            $failures++; $rec.RestoreNote = 'current primary not found'
+            Write-Log -Level ERROR -Message "[$($rec.AGName)] could not find the primary to set $($rec.Replica) back to AUTOMATIC failover. Run on the primary: $sql"
+            continue
+        }
+        try {
+            if ($script:DryRun) { Write-Log -Level WARN -Message "[DRY RUN] Would run on $primary : $sql"; $rec.RestoreNote = 'dry run' }
+            else {
+                Write-Log -Level STEP -Message "[$($rec.AGName)] Running on $primary : $sql"
+                Invoke-Sql -Server $primary -Query $sql -NonQuery
+                $rec.RestoreNote = "restored on $primary at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            }
+            $rec.Restored = $true
+        }
+        catch {
+            $failures++; $rec.RestoreNote = $_.Exception.Message
+            Write-ErrorDetail -ErrorRecord $_ -Step 'Restore AUTOMATIC failover mode' -Server $primary -AGName $rec.AGName
+            Write-Log -Level ERROR -Message "[$($rec.AGName)] $($rec.Replica) is still MANUAL failover. Fix the cause (it must be SYNCHRONOUS_COMMIT; at most 3 replicas can be AUTOMATIC) and run on the primary: $sql"
+        }
+    }
+    return $failures
+}
+
+function Get-AutoFailoverStatus {
+    # Is automatic failover still possible for the AG while -Excluded instances are out?
+    param([string]$Primary, [string]$AGName, [string[]]$Excluded)
+    if ($script:DryRun) { return 'n/a (dry run)' }
+    try {
+        $reps = @(Get-AGReplicas -Server $Primary -AGName $AGName)
+        $p = $reps | Where-Object { $_.Role -eq 'PRIMARY' } | Select-Object -First 1
+        if (-not $p) { return 'UNKNOWN' }
+        if ($p.FailoverMode -ne 'AUTOMATIC') { return 'NO (primary replica is MANUAL)' }
+        $partners = @($reps | Where-Object { $_.Role -ne 'PRIMARY' -and $_.FailoverMode -eq 'AUTOMATIC' -and $_.AvailabilityMode -eq 'SYNCHRONOUS_COMMIT' -and $Excluded -notcontains $_.ReplicaServer })
+        if ($partners.Count -gt 0) { return "YES ($(($partners | ForEach-Object { $_.ReplicaServer }) -join ', '))" }
+        return 'NO - no automatic failover partner during the activity'
+    }
+    catch { return "UNKNOWN ($($_.Exception.Message.Trim()))" }
+}
+
 function Wait-AGResync {
     # Informational: waits for the synchronous secondaries to re-sync after a failover.
     param([string]$PrimaryServer, [string]$AGName)
@@ -817,7 +1095,8 @@ function Write-DrainSummary {
                                       @{n = 'Failed Over To'; e = { if ($_.FailedOverTo) { $_.FailedOverTo } else { '-' } } },
                                       @{n = 'Result'; e = { $_.Result } },
                                       @{n = 'Time'; e = { $_.FailoverTime } },
-                                      @{n = 'Sync After Failover'; e = { $_.PostFailoverSync } }
+                                      @{n = 'Listener'; e = { $_.ListenerCheck } },
+                                      @{n = 'Auto Failover During Activity'; e = { $_.AutoFailover } }
         [void]$sb.AppendLine((Format-Rows $tbl))
     }
     else { [void]$sb.AppendLine(" None - $($State.Node) was not primary for any AG.") }
@@ -827,11 +1106,22 @@ function Write-DrainSummary {
         [void]$sb.AppendLine(" AGs where $($State.Node) is a secondary (no failover needed): " + (($secondary | ForEach-Object { "$($_.AGName) (primary: $($_.OriginalPrimary))" }) -join ', '))
     }
 
+    $modes = @($State.FailoverModes | Where-Object { $_ })
+    [void]$sb.AppendLine('')
+    if ($modes.Count -gt 0) {
+        [void]$sb.AppendLine(" Failover mode set to MANUAL for the activity (option 2 restores AUTOMATIC): " + (($modes | ForEach-Object { "$($_.AGName) on $($_.Replica)" }) -join ', '))
+    }
+    else { [void]$sb.AppendLine(' Failover mode changes: none (no AUTOMATIC replicas on this VM).') }
+
     $issues = @($moved | Where-Object { $_.Result -notin @('FAILED_OVER', 'DRYRUN') })
+    $notes  = @()
+    foreach ($e in @($State.AGs | Where-Object { $_.ListenerCheck -match 'FAILED' })) { $notes += "$($e.AGName): $($e.ListenerCheck)" }
+    foreach ($e in @($State.AGs | Where-Object { $_.AutoFailover -like 'NO*' })) { $notes += "$($e.AGName): automatic failover during the activity - $($e.AutoFailover)" }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine(' Issues / notes')
-    if ($issues.Count -eq 0) { [void]$sb.AppendLine('  - None') }
+    if ($issues.Count -eq 0 -and $notes.Count -eq 0) { [void]$sb.AppendLine('  - None') }
     foreach ($i in $issues) { [void]$sb.AppendLine("  - $($i.AGName): $($i.Result) - $($i.Reason)") }
+    foreach ($n in $notes) { [void]$sb.AppendLine("  - $n") }
 
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine(' Next step : after maintenance, run option 2 to return the AGs to their original primaries.')
@@ -870,14 +1160,24 @@ function Add-FailbackSummary {
                                          @{n = 'Moved From'; e = { $_.FailbackFrom } },
                                          @{n = 'Returned To'; e = { $_.OriginalPrimary } },
                                          @{n = 'Result'; e = { $_.FailbackResult } },
-                                         @{n = 'Time'; e = { $_.FailbackTime } }
+                                         @{n = 'Time'; e = { $_.FailbackTime } },
+                                         @{n = 'Listener'; e = { $_.FailbackListener } }
         [void]$sb.AppendLine((Format-Rows $tbl))
     }
+    $modes = @($State.FailoverModes | Where-Object { $_ })
+    if ($modes.Count -gt 0) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine(" AUTOMATIC failover restored: $(@($modes | Where-Object { $_.Restored }).Count) of $($modes.Count) replica(s)")
+    }
     $issues = @($relevant | Where-Object { $_.FailbackResult -notin @('FAILED_BACK', 'ALREADY_PRIMARY', 'DRYRUN') })
+    $notes  = @()
+    foreach ($e in @($relevant | Where-Object { $_.FailbackListener -match 'FAILED' })) { $notes += "$($e.AGName): $($e.FailbackListener)" }
+    foreach ($m in @($modes | Where-Object { -not $_.Restored })) { $notes += "$($m.AGName): $($m.Replica) is still MANUAL failover - $($m.RestoreNote)" }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine(' Issues / notes')
-    if ($issues.Count -eq 0) { [void]$sb.AppendLine('  - None') }
+    if ($issues.Count -eq 0 -and $notes.Count -eq 0) { [void]$sb.AppendLine('  - None') }
     foreach ($i in $issues) { [void]$sb.AppendLine("  - $($i.AGName): $($i.FailbackResult) - $($i.FailbackReason)") }
+    foreach ($n in $notes) { [void]$sb.AppendLine("  - $n") }
     [void]$sb.AppendLine(" Detail log: $($script:LogFile)")
     [void]$sb.AppendLine('=====================================================================================')
 
@@ -946,7 +1246,8 @@ function Invoke-DrainNode {
             $plan["(instance $inst)"] = [pscustomobject]@{
                 AGName = "(AGs on $inst)"; Instance = $inst; ClusterType = $null; OriginalPrimary = $null; PlannedTarget = $null; CommitRisk = $null
                 FailedOverTo = $null; Result = 'FAILED'; Reason = "Instance unreachable - its AGs could not be checked: $($_.Exception.Message)"
-                FailoverTime = $null; PostFailoverSync = $null; FailbackFrom = $null; FailbackResult = $null; FailbackReason = $null; FailbackTime = $null
+                FailoverTime = $null; PostFailoverSync = $null; ListenerCheck = $null; AutoFailover = $null
+                FailbackFrom = $null; FailbackResult = $null; FailbackReason = $null; FailbackTime = $null; FailbackListener = $null
             }
             continue
         }
@@ -965,10 +1266,13 @@ function Invoke-DrainNode {
                 Reason           = $null
                 FailoverTime     = $null
                 PostFailoverSync = $null
+                ListenerCheck    = $null
+                AutoFailover     = $null
                 FailbackFrom     = $null
                 FailbackResult   = $null
                 FailbackReason   = $null
                 FailbackTime     = $null
+                FailbackListener = $null
             }
             if ($ag.LocalRole -ne 'PRIMARY') {
                 $e.Result = 'NOT_PRIMARY_HERE'
@@ -1009,6 +1313,18 @@ function Invoke-DrainNode {
     $toMove = @($entries | Where-Object { $_.PlannedTarget -and $_.Result -eq 'PENDING' })
     if ($toMove.Count -eq 0) { Write-Log -Level WARN -Message "No AG will be failed over from $node." }
 
+    # ---- Pre-flight: permissions on every replica, no other operator, cluster can lose the VM
+    $allServers = @($instOnVM)
+    foreach ($e in @($entries | Where-Object { $_.OriginalPrimary -and $_.ClusterType -eq 'WSFC' -and $_.Reason -notlike 'Distributed AG*' })) {
+        try { $allServers += @(Get-AGReplicas -Server $e.OriginalPrimary -AGName $e.AGName | ForEach-Object { $_.ReplicaServer }) }
+        catch { $allServers += $e.OriginalPrimary }
+    }
+    $allServers = @($allServers | Where-Object { $_ } | Select-Object -Unique)
+    if (-not (Invoke-PreChecks -Servers $allServers -VMName $node -Activity "draining $node")) {
+        Write-Log -Level WARN -Message 'Cancelled at the pre-flight checks. No changes made.'
+        return
+    }
+
     # ---- Record state BEFORE any change -------------------------------------
     $mode       = if ($script:DryRun) { 'DRYRUN' } else { 'LIVE' }
     $tag        = if ($script:DryRun) { '_DRYRUN' } else { '' }
@@ -1031,6 +1347,7 @@ function Invoke-DrainNode {
         LogFile          = $script:LogFile
         StateFile        = $statePath
         SummaryFile      = $summary
+        FailoverModes    = @()
         AGs              = $entries
     }
 
@@ -1068,8 +1385,9 @@ function Invoke-DrainNode {
             $e.FailoverTime = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
             if ($e.Result -eq 'FAILED_OVER') {
                 $e.PostFailoverSync = Wait-AGResync -PrimaryServer $pick.Target -AGName $e.AGName
+                $e.ListenerCheck    = Test-AGListener -AGName $e.AGName -ExpectedPrimary $pick.Target
             }
-            else { $e.PostFailoverSync = 'n/a (dry run)' }
+            else { $e.PostFailoverSync = 'n/a (dry run)'; $e.ListenerCheck = 'n/a (dry run)' }
         }
         catch {
             $e.Result = Get-FailResult -ErrorRecord $_
@@ -1081,6 +1399,16 @@ function Invoke-DrainNode {
         finally {
             try { Save-State -State $state -Path $statePath } catch { Write-Log -Level WARN -Message "Could not update state file: $($_.Exception.Message)" }
         }
+    }
+
+    # ---- Keep the cluster from failing AGs over to the VM while it is out --------
+    $modeAGs = @($entries | Where-Object { $_.ClusterType -eq 'WSFC' -and $_.OriginalPrimary -and $_.Reason -notlike 'Distributed AG*' } | ForEach-Object { $_.AGName })
+    $state.FailoverModes = @(Set-ReplicasManual -AGNames $modeAGs -Instances $instOnVM -ProbeServers $allServers)
+    if (@($state.FailoverModes).Count -gt 0) { Write-Log -Message "$(@($state.FailoverModes).Count) replica(s) on $node set to MANUAL failover for the activity; option 2 sets them back to AUTOMATIC." }
+    foreach ($e in @($entries | Where-Object { $_.Result -in @('FAILED_OVER', 'DRYRUN', 'NOT_PRIMARY_HERE') })) {
+        $p = if ($e.Result -eq 'NOT_PRIMARY_HERE') { $e.OriginalPrimary } else { $e.FailedOverTo }
+        $e.AutoFailover = Get-AutoFailoverStatus -Primary $p -AGName $e.AGName -Excluded $instOnVM
+        if ($e.AutoFailover -like 'NO*') { Write-Log -Level WARN -Message "[$($e.AGName)] automatic failover is not available during the activity: $($e.AutoFailover)." }
     }
 
     $failed = @($entries | Where-Object { $_.Result -in @('FAILED', 'SKIPPED', 'UNKNOWN') })
@@ -1135,7 +1463,8 @@ function Invoke-Failback {
     $eligible = @('FAILED_OVER', 'UNKNOWN')   # UNKNOWN: may have moved; the current primary is checked below
     if ($script:DryRun) { $eligible += 'DRYRUN' }
     $work = @($state.AGs | Where-Object { $_.Result -in $eligible })
-    if ($work.Count -eq 0) { Write-Log -Level WARN -Message 'No AGs in this state file were failed over, nothing to fail back.'; return }
+    $pendingModes = @($state.FailoverModes | Where-Object { $_ -and -not $_.Restored })
+    if ($work.Count -eq 0 -and $pendingModes.Count -eq 0) { Write-Log -Level WARN -Message 'No AGs in this state file were failed over and no failover modes to restore - nothing to do.'; return }
 
     # ---- Evaluate ------------------------------------------------------------
     $plan = New-Object System.Collections.Generic.List[object]
@@ -1197,8 +1526,20 @@ function Invoke-Failback {
         if (-not $resume) { Write-Log -Level WARN -Message 'User chose not to resume. AGs with suspended databases will be skipped.' }
     }
 
-    if ($actionable.Count -gt 0) {
-        if (-not (Confirm-Action "About to fail back $($actionable.Count) AG(s) to their original primaries$(if($script:DryRun){' [DRY RUN]'}).")) {
+    $srv = @()
+    foreach ($p in $plan) { $srv += @($p.Entry.OriginalPrimary, $p.Entry.FailedOverTo, $p.Current) }
+    $srv += @($pendingModes | ForEach-Object { $_.Replica })
+    $srv = @($srv | Where-Object { $_ } | Select-Object -Unique)
+
+    if ($actionable.Count -gt 0 -or $pendingModes.Count -gt 0) {
+        if (-not (Invoke-PreChecks -Servers $srv -Activity 'failback')) {
+            Write-Log -Level WARN -Message 'Cancelled at the pre-flight checks. No changes made.'
+            return
+        }
+        $what = @()
+        if ($actionable.Count -gt 0) { $what += "fail back $($actionable.Count) AG(s) to their original primaries" }
+        if ($pendingModes.Count -gt 0) { $what += "set $($pendingModes.Count) replica(s) back to AUTOMATIC failover" }
+        if (-not (Confirm-Action "About to $($what -join ' and ')$(if($script:DryRun){' [DRY RUN]'}).")) {
             Write-Log -Level WARN -Message 'Cancelled by user. No changes made.'
             return
         }
@@ -1247,6 +1588,7 @@ function Invoke-Failback {
                     if ($ag.FailbackResult -eq 'FAILED_OVER') { $ag.FailbackResult = 'FAILED_BACK' }
                     $ag.FailbackTime   = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
                     $ag.FailbackReason = Wait-AGResync -PrimaryServer $ag.OriginalPrimary -AGName $ag.AGName
+                    Set-Prop -Object $ag -Name 'FailbackListener' -Value $(if ($ag.FailbackResult -eq 'FAILED_BACK') { Test-AGListener -AGName $ag.AGName -ExpectedPrimary $ag.OriginalPrimary } else { 'n/a (dry run)' })
                 }
             }
         }
@@ -1261,9 +1603,16 @@ function Invoke-Failback {
         }
     }
 
+    # ---- Put AUTOMATIC failover back --------------------------------------------
+    $modeFailures = 0
+    if ($pendingModes.Count -gt 0) {
+        $modeFailures = Restore-FailoverModes -Records $pendingModes -ProbeServers $srv
+        if ($modeFailures -eq 0) { Write-Log -Level SUCCESS -Message "AUTOMATIC failover restored on $($pendingModes.Count) replica(s)." }
+    }
+
     $done = @($work | Where-Object { $_.FailbackResult -in @('FAILED_BACK', 'ALREADY_PRIMARY') })
     if (-not $script:DryRun) {
-        $state.Status = if ($done.Count -eq $work.Count) { 'RESTORED' } else { 'PARTIALLY_RESTORED' }
+        $state.Status = if ($done.Count -eq $work.Count -and $modeFailures -eq 0) { 'RESTORED' } else { 'PARTIALLY_RESTORED' }
     }
     try {
         Save-State -State $state -Path $statePath
@@ -1523,7 +1872,7 @@ function Invoke-ReturnAG {
         $r = Invoke-AGFailover -AGName $AGName -Target $OriginalPrimary -FromPrimary $CurrentPrimary
         $res.Result = if ($r -eq 'FAILED_OVER') { 'RETURNED' } else { $r }
         $res.Time   = ConvertTo-Stamp (Get-Date)
-        if ($r -eq 'FAILED_OVER') { $res.Note = Wait-AGResync -PrimaryServer $OriginalPrimary -AGName $AGName }
+        if ($r -eq 'FAILED_OVER') { $res.Note = "$(Wait-AGResync -PrimaryServer $OriginalPrimary -AGName $AGName); listener: $(Test-AGListener -AGName $AGName -ExpectedPrimary $OriginalPrimary)" }
     }
     catch {
         $res.Result = Get-FailResult -ErrorRecord $_; $res.Note = $_.Exception.Message
@@ -1571,30 +1920,8 @@ function Test-RollingGates {
     param($Run, $VM, [string[]]$InstOnVM)
     $issues = New-Object System.Collections.Generic.List[string]
 
-    $members = $null
-    $probeOrder = @(@($Run.Instances | Where-Object { $_.VM -ne $VM.VM }) + @($Run.Instances | Where-Object { $_.VM -eq $VM.VM }))
-    foreach ($i in $probeOrder) {
-        try { $members = @(Get-ClusterMembers -Server $i.Instance); if ($members.Count -gt 0) { break } }
-        catch { Write-Log -Level DETAIL -Message "Cluster membership not readable from $($i.Instance): $($_.Exception.Message)" -NoConsole }
-    }
-    if ($members -and $members.Count -gt 0) {
-        $nodes = @($members | Where-Object { $_.MemberType -eq 'CLUSTER_NODE' })
-        $down  = @($nodes | Where-Object { $_.MemberName -ne $VM.VM -and $_.MemberState -ne 'UP' })
-        if ($down.Count -gt 0) { $issues.Add("Other cluster node(s) not UP: $(($down | ForEach-Object { "$($_.MemberName)=$($_.MemberState)" }) -join ', '). Rebooting $($VM.VM) now could take the cluster down.") }
-        $witnessDown = @($members | Where-Object { $_.MemberType -ne 'CLUSTER_NODE' -and $_.MemberState -ne 'UP' })
-        if ($witnessDown.Count -gt 0) { $issues.Add("Quorum witness not UP: $(($witnessDown | ForEach-Object { "$($_.MemberName) ($($_.MemberType))=$($_.MemberState)" }) -join ', ').") }
-
-        $me = @($nodes | Where-Object { $_.MemberName -eq $VM.VM })
-        if ($me.Count -gt 0) {
-            $total = [double](($members | Measure-Object -Property Votes -Sum).Sum)
-            $up    = [double](($members | Where-Object { $_.MemberState -eq 'UP' } | Measure-Object -Property Votes -Sum).Sum)
-            $mine  = [double](($me | Measure-Object -Property Votes -Sum).Sum)
-            if ($total -gt 0 -and ($up - $mine) -le ($total / 2)) {
-                $issues.Add("Quorum risk: $($up - $mine) of $total votes would remain while $($VM.VM) is down (more than half needed). Check node votes and the cloud witness.")
-            }
-        }
-    }
-    else { $issues.Add('Could not read cluster membership / quorum from any instance.') }
+    $probeOrder = @(@($Run.Instances | Where-Object { $_.VM -ne $VM.VM }) + @($Run.Instances | Where-Object { $_.VM -eq $VM.VM }) | ForEach-Object { $_.Instance })
+    foreach ($i in @(Get-ClusterIssues -VMName $VM.VM -QueryServers $probeOrder)) { $issues.Add($i) }
 
     foreach ($ag in @($Run.AGs | Where-Object { -not $_.Handled -and -not $_.IsDistributed })) {
         $p = Get-CurrentPrimary -AG $ag
@@ -1653,7 +1980,7 @@ function Invoke-RollingDrain {
                     $move.To     = $pick.Target
                     $move.Result = Invoke-AGFailover -AGName $ag.AGName -Target $pick.Target -FromPrimary $inst
                     $move.Time   = ConvertTo-Stamp (Get-Date)
-                    if ($move.Result -eq 'FAILED_OVER') { $move.Note = Wait-AGResync -PrimaryServer $pick.Target -AGName $ag.AGName }
+                    if ($move.Result -eq 'FAILED_OVER') { $move.Note = "$(Wait-AGResync -PrimaryServer $pick.Target -AGName $ag.AGName); listener: $(Test-AGListener -AGName $ag.AGName -ExpectedPrimary $pick.Target)" }
                 }
             }
             catch {
@@ -1849,6 +2176,11 @@ function Invoke-RollingReturnStep {
         if ($r.Result -notin @('RETURNED', 'ALREADY_PRIMARY')) { $problems++ }
         Save-Rolling -Run $Run
     }
+    if ($VM.PSObject.Properties['FailoverModes'] -and @($VM.FailoverModes | Where-Object { $_ }).Count -gt 0) {
+        $f = Restore-FailoverModes -Records $VM.FailoverModes -ProbeServers @($Run.Instances | ForEach-Object { $_.Instance })
+        if ($f -gt 0) { $problems += $f; Add-VMNote -VM $VM -Note "$f replica(s) could not be set back to AUTOMATIC failover" }
+        Save-Rolling -Run $Run
+    }
     return $problems
 }
 
@@ -1883,6 +2215,8 @@ function Invoke-RollingVM {
         }
         $VM.DrainedAt = ConvertTo-Stamp (Get-Date)
         Write-Log -Level SUCCESS -Message "$($VM.VM) holds no primaries now."
+        $modeAGs = @($Run.AGs | Where-Object { $agR = @($_.Replicas); $_.Handled -and @($instOnVM | Where-Object { $agR -contains $_ }).Count -gt 0 } | ForEach-Object { $_.AGName })
+        Set-Prop -Object $VM -Name 'FailoverModes' -Value @(Set-ReplicasManual -AGNames $modeAGs -Instances $instOnVM -ProbeServers @($Run.Instances | ForEach-Object { $_.Instance }))
 
         if ($VM.IsLocal) {
             if ($script:DryRun) {
@@ -2100,6 +2434,7 @@ function Write-RollingSummary {
     foreach ($v in $vms) {
         if ($v.Status -in @('SKIPPED', 'COMPLETED_WITH_ISSUES') -and $v.Notes) { $issues.Add("$($v.VM): $($v.Notes)") }
         foreach ($m in @($v.Moves | Where-Object { $_ -and $_.Result -notin @('FAILED_OVER', 'DRYRUN') })) { $issues.Add("$($v.VM) / $($m.AGName): move $($m.Result) - $($m.Note)") }
+        foreach ($m in @(@($v.Moves) + @($v.Returns) | Where-Object { $_ -and $_.Note -match 'Listener check FAILED' })) { $issues.Add("$($v.VM) / $($m.AGName): $($m.Note)") }
         foreach ($r in @($v.Returns | Where-Object { $_ -and $_.Result -notin @('RETURNED', 'ALREADY_PRIMARY', 'DRYRUN') })) { $issues.Add("$($v.VM) / $($r.AGName): return $($r.Result) - $($r.Note)") }
     }
     foreach ($a in @($handled | Where-Object { $_.FinalResult -eq 'NOT_BALANCED' })) { $issues.Add("$($a.AGName): still on $($a.FinalPrimary), expected $($a.OriginalPrimary) - $($a.FinalNote)") }
@@ -2192,6 +2527,11 @@ function New-RollingRun {
     foreach ($v in $vmObjs) { if (@($v.Instances).Count -eq 0) { Write-Log -Level WARN -Message "No SQL instance found on $($v.VM). It will be rebooted without AG handling. If it has a named instance, add a line '$($v.VM)\<instance>' to VMs.txt." } }
     foreach ($a in @($agSnap | Where-Object { -not $_.Handled -and -not $_.IsDistributed })) { Write-Log -Level WARN -Message "AG [$($a.AGName)] is not managed by the tool: $($a.Note)" }
 
+    if (-not (Invoke-PreChecks -Servers @($insts | ForEach-Object { $_.Instance }) -Activity 'the rolling reboot')) {
+        Write-Log -Level WARN -Message 'Cancelled at the pre-flight checks. No changes made.'
+        return $null
+    }
+
     $windowEnd = $null
     $we = (Read-Host 'Maintenance window end time (HH:mm, 24h; blank = no limit)').Trim()
     if ($we) {
@@ -2263,6 +2603,11 @@ function Invoke-RollingReboot {
             $script:DryRun = ($run.Mode -eq 'DRYRUN')
             if (@($run.LogFiles) -notcontains $script:LogFile) { Add-Item -Object $run -Property 'LogFiles' -Item $script:LogFile }
             Write-Log -Message "Resuming rolling run from $($run.StateFile) (dry run: $($script:DryRun))."
+            if (-not (Invoke-PreChecks -Servers @($run.Instances | ForEach-Object { $_.Instance }) -Activity 'resuming the rolling reboot')) {
+                Write-Log -Level WARN -Message 'Resume cancelled at the pre-flight checks. The run stays paused.'
+                $script:DryRun = $savedDryRun
+                return
+            }
         }
         else {
             $pending.Status = 'ABANDONED'
