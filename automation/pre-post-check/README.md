@@ -133,23 +133,3 @@ For the SSIS / SSRS / SSAS sections it also needs:
 Every run first deletes files older than **48 hours** from `Reports\` and `Logs\`, and from `Snapshots\` once a ticket has its **POST**. A PRE still waiting for its POST is kept for **7 days**, so a change done later can still be compared. Change this with `CleanupHours` (`0` turns it off) and `KeepPreWithoutPostDays` in `settings.psd1`.
 
 There is no separate CLEANUP option. If a Task Scheduler job runs `Run-PrePostCheck.bat -Phase CLEANUP`, remove it: it now stops with a message.
-
-## AG failover tool (`AG-FailoverTool.ps1`)
-
-A separate, menu-driven tool for moving Always On AGs off a VM before maintenance and back afterwards, rebooting a whole cluster one VM at a time, and rebalancing AGs to their preferred primaries. Every change is a planned, no-data-loss failover with safety checks before and after. **Full instructions: [AG-FailoverTool-Guide.md](AG-FailoverTool-Guide.md).**
-
-| File | Purpose |
-|---|---|
-| `AG-FailoverTool.ps1` | Launcher. Run this: `powershell.exe -ExecutionPolicy Bypass -File .\AG-FailoverTool.ps1` |
-| `AGFailoverTool.psm1` | All the logic. Settings are in `$Config` at the top. |
-| `Tests\AGFailoverTool.Tests.ps1` | Pester 5 tests with mocked SQL calls (`Invoke-Pester .\Tests`). |
-| `VMs.txt`, `PreferredPrimaries.txt` | Optional inputs for option 5 (reboot order) and option 6 (preferred primaries). |
-
-| Option | What it does |
-|---|---|
-| 1 | Drain a VM: record the primaries and fail its AGs over to the best synchronous secondary on another VM. |
-| 2 | Fail the AGs from an option 1 run back to their original primaries. |
-| 3 | Read-only AG health check. |
-| 4 | Dry run on/off. |
-| 5 | Rolling reboot of every VM in the cluster, with skip, resume and a final rebalance. |
-| 6 | Rebalance AGs to `PreferredPrimaries.txt`. No state file needed. |
