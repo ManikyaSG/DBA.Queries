@@ -2,6 +2,11 @@
 
 A separate, menu-driven tool for moving Always On AGs off a VM before maintenance and back afterwards, rebooting a whole cluster one VM at a time, and rebalancing AGs to their preferred primaries. Every change is a planned, no-data-loss failover with safety checks before and after. **Full instructions: [AG-FailoverTool-Guide.md](AG-FailoverTool-Guide.md).**
 
+More documents in [`docs/`](docs/):
+
+- [Leadership overview](docs/Leadership-Overview.md): what the tool does and why, the safety checks, benefits and the rollout plan.
+- [SOP and technical guide](docs/SOP-Technical-Guide.md): the team's standard procedure, KT and how-to, with prompts, troubleshooting and a code map.
+
 | File | Purpose |
 |---|---|
 | `AG-FailoverTool.ps1` | Launcher. Run this: `powershell.exe -ExecutionPolicy Bypass -File .\AG-FailoverTool.ps1` |
