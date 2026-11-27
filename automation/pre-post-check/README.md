@@ -136,29 +136,20 @@ There is no separate CLEANUP option. If a Task Scheduler job runs `Run-PrePostCh
 
 ## AG failover tool (`AG-FailoverTool.ps1`)
 
-A separate, menu-driven tool for Always On AGs during maintenance. Start PowerShell with "Run as different user" (your SQL account) and run `powershell.exe -ExecutionPolicy Bypass -File .\AG-FailoverTool.ps1`.
+A separate, menu-driven tool for moving Always On AGs off a VM before maintenance and back afterwards, rebooting a whole cluster one VM at a time, and rebalancing AGs to their preferred primaries. Every change is a planned, no-data-loss failover with safety checks before and after. **Full instructions: [AG-FailoverTool-Guide.md](AG-FailoverTool-Guide.md).**
+
+| File | Purpose |
+|---|---|
+| `AG-FailoverTool.ps1` | Launcher. Run this: `powershell.exe -ExecutionPolicy Bypass -File .\AG-FailoverTool.ps1` |
+| `AGFailoverTool.psm1` | All the logic. Settings are in `$Config` at the top. |
+| `Tests\AGFailoverTool.Tests.ps1` | Pester 5 tests with mocked SQL calls (`Invoke-Pester .\Tests`). |
+| `VMs.txt`, `PreferredPrimaries.txt` | Optional inputs for option 5 (reboot order) and option 6 (preferred primaries). |
 
 | Option | What it does |
 |---|---|
-| 1 | Takes a VM (or one of its instances), finds every SQL instance on it, records the primaries and fails its AGs over to the best synchronous secondary on another VM. |
-| 2 | Returns the AGs from an option 1 run to their original primaries. |
+| 1 | Drain a VM: record the primaries and fail its AGs over to the best synchronous secondary on another VM. |
+| 2 | Fail the AGs from an option 1 run back to their original primaries. |
 | 3 | Read-only AG health check. |
-| 4 | Dry run on/off (prints the T-SQL and reboot commands without running them). |
-| 5 | Rolling reboot of every VM in the cluster (below). |
-
-**Failover safety checks (all options).** A target must be synchronous, connected and healthy, with every AG database joined, synchronized, not suspended and failover-ready. It must also be on the same or a higher SQL build than the primary. The tool warns and asks before a failover that would leave fewer synchronous secondaries than `REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT`, because the new primary would then stop accepting writes. If the `FAILOVER` command errors or times out, the tool checks the replicas to see whether the role changed anyway, and reports *OUTCOME UNKNOWN* (stop and check) when it can't tell. State files are written atomically. The previous copy is kept as `.bak` and is used automatically if the file is damaged.
-
-**Before any change** the tool checks a few more things. Every replica must be reachable with `VIEW SERVER STATE` and `ALTER ANY AVAILABILITY GROUP`. No other operator's AGFailoverTool may be active on them in the last 15 minutes. When draining, every other cluster node and the witness must be UP, and quorum must survive losing the VM. Any problem is listed and you choose *Override* or *Cancel*. **After each failover** every AG listener is tested until it reaches the new primary (useful for the Azure load balancer probe or DNN). **During the activity** the drained VM's replicas are switched from AUTOMATIC to MANUAL failover, so the cluster can't move an AG onto the VM mid-maintenance, and the summary shows whether automatic failover is still available. Option 2, and option 5 after each VM, switches them back to AUTOMATIC.
-
-**Rolling reboot (option 5).** Run it on one of the cluster VMs. The tool:
-1. Finds the cluster nodes, or uses `VMs.txt` if it exists. Then it finds the SQL instances on them and takes a pre-snapshot of every AG primary.
-2. Works through one VM at a time. Before each VM you choose to continue, skip it (for example when the maintenance window is over), run the rest without asking, skip all remaining VMs, or quit.
-3. For each VM:
-   - checks that the other nodes and the quorum witness are up and quorum survives losing this VM
-   - fails over every AG primary on it
-   - runs `shutdown /r /t 0`
-   - waits for SQL to restart and the replicas to re-sync
-   - returns that VM's AGs
-4. Drains the VM it runs on last and stops for you to reboot that VM manually. After the reboot, run option 5 again and choose *Resume*. The tool returns that VM's AGs and rebalances every AG to the pre-snapshot layout.
-
-`VMs.txt` (optional, next to the script) lists one VM per line in reboot order. Lines starting with `#` are ignored, and `VMNAME\INSTANCE` adds a named instance on that VM. The reboot runs `shutdown /r /t 0 /m \\VM` as your account, which must be local admin on the VMs. If it isn't, enter a Windows admin credential at the start and the reboot runs through WinRM. Progress is saved after every step, so a run that stops for any reason resumes with option 5. Output goes to `Logs\` (detailed errors with likely cause), `State\` (snapshots) and `Summary\` (leadership summary).
+| 4 | Dry run on/off. |
+| 5 | Rolling reboot of every VM in the cluster, with skip, resume and a final rebalance. |
+| 6 | Rebalance AGs to `PreferredPrimaries.txt`. No state file needed. |
